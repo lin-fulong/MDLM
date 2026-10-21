@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and secrets
+.venv/
+venv/
+.env
+.env.*
+
+# IDE and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Original model weights
+model/models/*
+!model/models/.gitkeep
+
+# Dataset files
+data/datasets/*
+!data/datasets/.gitkeep
+
+# Experiment runs and generated intermediate data
+runs/*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+

@@ -1,0 +1,10 @@
+# Python 3.10 baseline. Direct dependencies for the first LLaDA-compatible implementation.
+# Select the PyTorch CPU/CUDA wheel for the target machine before installing this file.
+torch==2.5.1
+transformers==4.38.2
+accelerate==0.34.2
+numpy==1.26.4
+scipy==1.13.1
+safetensors==0.4.5
+tqdm==4.67.1
+
