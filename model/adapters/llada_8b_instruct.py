@@ -1,12 +1,14 @@
-"""P0 data alignment, masked input and read-only FFN capture for local LLaDA."""
+"""LLaDA P0 alignment/capture and P1 autonomous denoising."""
 
 from __future__ import annotations
 
+import hashlib
+import math
 from pathlib import Path
 from typing import Any
 
 from data.validation.alignment import align_edit_prompt
-from model.base import EditTarget, ForwardCapture, MaskedEditInput, ModelAdapter, TargetWeightSnapshot
+from model.base import DenoiseTrace, EditTarget, ForwardCapture, MaskedEditInput, ModelAdapter, TargetWeightSnapshot
 
 
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "LLaDA-8B-Instruct"
@@ -187,7 +189,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
             input_ids = torch.tensor([model_input.input_ids], dtype=torch.long, device=device)
             attention_mask = torch.tensor([model_input.attention_mask], dtype=torch.long, device=device)
             with torch.inference_mode():
-                logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+                logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True).logits
             if logits.ndim != 3 or logits.shape[1] != len(model_input.input_ids):
                 raise ValueError("unexpected LLaDA logits shape")
             mask_logits = logits[0, list(model_input.mask_positions)].detach().clone()
@@ -203,3 +205,67 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         finally:
             for handle in handles:
                 handle.remove()
+
+    def sample_denoise(
+        self, model: Any, model_input: MaskedEditInput, *, steps: int, temperature: float, seed: int
+    ) -> DenoiseTrace:
+        """Reveal only existing answer masks, choosing the most confident positions."""
+        import torch
+
+        mask_count = len(model_input.mask_positions)
+        if type(steps) is not int or not 1 <= steps <= mask_count:
+            raise ValueError("denoising steps must be between 1 and the answer mask count")
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be finite and nonnegative")
+
+        generator = None
+        current_ids = list(model_input.input_ids)
+        remaining = list(model_input.mask_positions)
+        states: list[MaskedEditInput] = []
+        logit_digests: list[str] = []
+        reveals: list[tuple[tuple[int, int], ...]] = []
+        blocked_ids = sorted(set(self.tokenizer.all_special_ids) | {self.mask_token_id})
+
+        for step in range(steps):
+            # 公式（1）的候选状态必须是每次前向之前的独立快照。
+            current = MaskedEditInput(
+                tuple(current_ids), model_input.attention_mask, tuple(remaining), model_input.subject_last_position
+            )
+            states.append(current)
+            raw_logits = self.forward_with_capture(model, current).mask_logits
+            # 保存原始 mask logits 摘要，供磁盘轨迹重放时逐次前向核对。
+            raw_bytes = raw_logits.cpu().contiguous().view(torch.uint8).numpy().tobytes()
+            header = f"{raw_logits.dtype}:{tuple(raw_logits.shape)}:".encode("ascii")
+            logit_digests.append(hashlib.sha256(header + raw_bytes).hexdigest())
+            logits = raw_logits.float().clone()
+            logits[:, [token for token in blocked_ids if 0 <= token < logits.shape[-1]]] = -torch.inf
+            if not torch.isfinite(logits).any(dim=-1).all():
+                raise ValueError("no finite non-special token can be sampled")
+            probabilities = torch.softmax(logits / temperature if temperature else logits, dim=-1)
+            if not torch.isfinite(probabilities).all():
+                raise ValueError("nonfinite sampling probabilities")
+            if temperature:
+                if generator is None:
+                    generator = torch.Generator(device=logits.device)
+                    generator.manual_seed(seed)
+                predicted = torch.multinomial(probabilities, 1, generator=generator).squeeze(1)
+            else:
+                predicted = logits.argmax(dim=-1)
+            confidence = probabilities.gather(1, predicted[:, None]).squeeze(1)
+
+            count = mask_count // steps + (step < mask_count % steps)
+            ranked = sorted(range(len(remaining)), key=lambda i: (-float(confidence[i]), remaining[i]))
+            selected = sorted(ranked[:count])
+            revealed = tuple((remaining[i], int(predicted[i])) for i in selected)
+            for position, token_id in revealed:
+                current_ids[position] = token_id
+            reveals.append(revealed)
+            selected_set = set(selected)
+            remaining = [position for i, position in enumerate(remaining) if i not in selected_set]
+
+        return DenoiseTrace(
+            tuple(states),
+            tuple(logit_digests),
+            tuple(reveals),
+            MaskedEditInput(tuple(current_ids), model_input.attention_mask, (), model_input.subject_last_position),
+        )

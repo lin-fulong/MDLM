@@ -1,6 +1,6 @@
 # MDLM 扩散知识编辑项目
 
-本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。已开始实现 P0 数据契约与 LLaDA 适配接口，真实模型前向仍待验收；开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)。
+本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。P0 数据契约与 LLaDA 适配代码、P1 固定状态与监督代码已编写并完成本轮代码审查；真实模型前向和 P1 状态产物仍待验收。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，修复记录见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
 
 ## 基础扩散模型
 
@@ -51,11 +51,13 @@ python -c "import torch, transformers, accelerate, numpy, scipy, safetensors, tq
 
 `tests/fixtures/p0_case_example.json` 是 `0.3-proposal` 结构的人工示例，`quality_control.status=example_only`，不能进入正式实验。`split=gold` 表示开发联调；同一案例中 `prompts.edit` 是编辑输入，其他 `used_for_edit=false` 的探针是开发验证题。独立测试案例使用 `split=test`。正式数据的质量和划分应在算法运行前完成审核。
 
-不依赖模型环境的接口检查：
+轻量回归检查（不加载下载的 8B 权重）：
 
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+2026-10-22 本轮检查：使用 WSL `mdlm` 环境（`/home/chi/miniconda3/envs/mdlm/bin/python`），25 项测试全部通过，包含 4 项小型 CPU 适配器测试。另外，本地 LLaDA tokenizer 的人工中文、英文及字节拆分主体对齐通过。该结果与真实 8B 前向验收分别记录。
 
 算法运行时直接读取预先审核的数据，不检查文件后缀、空数据集、字段质量、重复 ID、答案字面泄漏或跨划分泄漏。需要检查案例结构、字段用途及重复 `case_id` 时，在项目根目录手动运行独立工具：
 
@@ -76,6 +78,28 @@ python -m util.smoke_p0_llada tests/fixtures/p0_case_example.json --layer 0 --fo
 `--layer 0` 仅为 P0 冒烟检查，不代表正式编辑目标层已确定。短答案 mask 数量来自真实 tokenizer 的编辑答案；`generation_profile` 只供后续自由回答使用。模型前向只接收 mask 输入，目标 token 和评价参考不传入模型输入。本地 LLaDA `config.json` 记录 `transformers_version=4.46.3`，而 `requirement.txt` 暂列 `4.38.2`；需以真实加载和前向检查确定可用版本，再冻结环境。
 
 手动运行 `schema.py` 时会拒绝旧答案与新答案别名冲突、编辑问题直接包含目标答案等情况。适配器准备输入时仍会检查答案 token 中的特殊 token 和问题区预置模型 mask，以保证 mask 位置和模型前向计算正确。正式实验不得把 `example_only` 当作正式案例。
+
+## P1 固定去噪状态与监督
+
+`configs/p1_example_only.json` 仅展示配置字段，指向人工构造的 `example_only` 案例和未冻结的模型/层选择，不能作为正式实验配置。正式运行前须替换为独立审核的案例清单，冻结 `baseline_id`、模型与 tokenizer 修订、事实顺序、目标层、采样步数和温度，并完成 P0 真实模型验收。
+
+配置中的 `facts` 每项选择一个 `case_id` 和对应的编辑 `probe_id`；每项计为公式（2）的一个事实。`steps=null` 表示每个答案 token 揭示一步；每次前向只揭示当前 mask 中置信度最高的预定数量，已揭示 token 不再掩码。`temperature=0` 使用确定性贪心 token；正温度使用独立的事实种子采样。采样器只接收 mask 输入，目标答案留在监督侧。
+
+准备好真实运行环境后，在项目根目录运行：
+
+```bash
+python -m util.collect_denoise_states configs/p1_run.json
+```
+
+一次运行在 `runs/<run_id>/round_<n>/p1/` 写入 `manifest.json`、`trajectories.jsonl`、`collection_report.json`、`fixed_states.jsonl` 和 `coverage_report.json`。原始轨迹保存每次前向前的完整 token、attention mask、剩余 mask、隐式位置及 mask logits 摘要；终态单独保存。重放逐次比对输入、揭示 token 与 logits 摘要。筛选按公式（1）区分兼容、冲突和终态，并按公式（2）（3）给兼容状态的每个剩余 mask 赋权。`coverage_report.json` 的 `formula_checks_passed` 只说明状态覆盖与权重核对通过；真实模型验收仍须查看重放记录及 P0 报告。若采集已完成但筛选尚未生成，可单独运行：
+
+```bash
+python -m util.filter_compatible_states runs/my_run/round_0/p1
+```
+
+当前产物版本是 `p1.1`：筛选入口核对配置、轨迹与采集报告摘要及事实/探针顺序，避免误用其他运行的产物。logits 摘要保留原始精度，重放按配置种子抽样。采集或筛选失败会记录原因；监督核验失败时不会生成固定监督文件。重新运行使用新的 `run_id`，旧版调试产物需要重新采集。这些是算法状态和产物核对，不调用数据集质量检查。
+
+本轮执行了语法检查、人工轨迹逻辑测试、小型 CPU 模型测试及本地 tokenizer 检查；没有加载 8B 权重或运行 GPU 实验，尚无真实 P1 运行产物。
 
 依赖选择参考：[LLaDA 官方仓库](https://github.com/ML-GSAI/LLaDA/blob/main/README.md)、[PyTorch 官方历史版本安装页](https://docs.pytorch.org/get-started/previous-versions/)、[EasyEdit 当前依赖清单](https://github.com/zjunlp/EasyEdit/blob/main/requirements.txt)、[Safetensors 文档](https://huggingface.co/docs/safetensors/index)。
 

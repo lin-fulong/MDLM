@@ -22,12 +22,12 @@ class TokenAlignment:
 
 
 def align_edit_prompt(tokenizer: Any, rendered_prompt: str, subject: str, answer: str) -> TokenAlignment:
-    """Require a unique subject and a stable token boundary before the answer."""
+    """Locate tokens covering the unique subject and a stable answer boundary."""
     if not all(isinstance(value, str) and value for value in (rendered_prompt, subject, answer)):
         raise AlignmentError("rendered prompt, subject and answer must be nonempty strings")
-    if rendered_prompt.count(subject) != 1:
+    start = rendered_prompt.find(subject)
+    if start < 0 or rendered_prompt.find(subject, start + 1) != -1:
         raise AlignmentError("subject must occur exactly once in the rendered edit prompt")
-    start = rendered_prompt.index(subject)
     end = start + len(subject)
     try:
         encoded = tokenizer(rendered_prompt, add_special_tokens=False, return_offsets_mapping=True)
@@ -38,15 +38,18 @@ def align_edit_prompt(tokenizer: Any, rendered_prompt: str, subject: str, answer
         raise AlignmentError("tokenizer must provide exact offset_mapping for rendered prompt") from exc
     if len(offsets) != len(prompt_ids):
         raise AlignmentError("offset count differs from prompt token count")
-    positions = tuple(i for i, (left, right) in enumerate(offsets) if right > start and left < end)
+    positions = tuple(i for i, (left, right) in enumerate(offsets) if right > left and right > start and left < end)
     cursor = start
+    previous_left = -1
     for position in positions:
         left, right = offsets[position]
-        if left != cursor or right <= left or right > end:
-            raise AlignmentError("subject does not align to contiguous whole tokens")
-        cursor = right
-    if not positions or cursor != end:
-        raise AlignmentError("subject does not align to contiguous whole tokens")
+        # 字节级 token 可共享字符偏移，也可包含主体边缘的空格；核对覆盖范围即可。
+        if left > cursor or left < previous_left or left < 0 or right > len(rendered_prompt):
+            raise AlignmentError("subject token offsets have a gap or invalid order")
+        cursor = max(cursor, min(right, end))
+        previous_left = left
+    if not positions or cursor != end or positions != tuple(range(positions[0], positions[-1] + 1)):
+        raise AlignmentError("subject is not fully covered by contiguous tokens")
     if full_ids[: len(prompt_ids)] != prompt_ids:
         raise AlignmentError("answer changes prompt tokenization; no stable mask boundary")
     answer_ids = full_ids[len(prompt_ids) :]

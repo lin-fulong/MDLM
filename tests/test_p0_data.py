@@ -106,8 +106,45 @@ class P0DataTests(unittest.TestCase):
         self.assertTrue(evaluation_inputs(self.case)[0]["example_only"])
 
     def test_alignment_rejects_ambiguous_subject(self):
-        with self.assertRaises(AlignmentError):
-            align_edit_prompt(CharacterTokenizer(), "林舟问林舟", "林舟", "海岚市")
+        for prompt, subject in (("林舟问林舟", "林舟"), ("哈哈哈", "哈哈")):
+            with self.subTest(subject=subject), self.assertRaises(AlignmentError):
+                align_edit_prompt(CharacterTokenizer(), prompt, subject, "海岚市")
+
+    def test_alignment_accepts_overlapping_byte_token_offsets(self):
+        class ByteSplitTokenizer(CharacterTokenizer):
+            def __call__(self, text, **kwargs):
+                output = super().__call__(text, **kwargs)
+                output["input_ids"][1:2] = [9001, 9002]
+                if "offset_mapping" in output:
+                    output["offset_mapping"][1:2] = [(1, 2), (1, 2)]
+                return output
+
+        aligned = align_edit_prompt(ByteSplitTokenizer(), "林舟问：", "林舟", "海岚市")
+        self.assertEqual(aligned.subject_positions, (0, 1, 2))
+        self.assertEqual(aligned.subject_last_position, 2)
+
+    def test_alignment_accepts_subject_token_with_leading_space(self):
+        class SpaceMergedTokenizer(CharacterTokenizer):
+            def __call__(self, text, **kwargs):
+                output = {"input_ids": [9001, *map(ord, text[6:])]}
+                if kwargs.get("return_offsets_mapping"):
+                    output["offset_mapping"] = [(0, 6), *[(i, i + 1) for i in range(6, len(text))]]
+                return output
+
+        aligned = align_edit_prompt(SpaceMergedTokenizer(), " Alice?", "Alice", "Paris")
+        self.assertEqual(aligned.subject_positions, (0,))
+        self.assertEqual(aligned.answer_ids, tuple(map(ord, "Paris")))
+
+    def test_alignment_rejects_gap_in_subject_offsets(self):
+        class GappedTokenizer(CharacterTokenizer):
+            def __call__(self, text, **kwargs):
+                output = super().__call__(text, **kwargs)
+                if "offset_mapping" in output:
+                    output["offset_mapping"][1] = (2, 2)
+                return output
+
+        with self.assertRaisesRegex(AlignmentError, "subject"):
+            align_edit_prompt(GappedTokenizer(), "林舟问：", "林舟", "海岚市")
 
     def test_alignment_rejects_special_target_and_prompt_mask(self):
         tokenizer = CharacterTokenizer()
