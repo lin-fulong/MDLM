@@ -1,0 +1,43 @@
+{
+  "case_id": "constructed_birth_city_0001",
+  "schema_version": "0.3-proposal",
+  "split": "gold",
+  "edit_direction": "counterfactual",
+  "language": "zh",
+  "fact_core": {
+    "subject": "林舟",
+    "relation": "birth_city",
+    "relation_text": "出生城市",
+    "old_object": "青榆市",
+    "new_object": "海岚市",
+    "new_object_aliases": ["海岚市"],
+    "edit_type": "counterfactual",
+    "domain": "constructed"
+  },
+  "truth_scope": {
+    "public_fact": false,
+    "dataset_internal": true,
+    "constructed_fact": true,
+    "counterfactual": true,
+    "privacy_sensitive": false
+  },
+  "source": {
+    "source_dataset": "constructed_gold",
+    "source_id": "0001",
+    "source_version": "v1",
+    "annotation_method": "human_verified"
+  },
+  "prompts": {
+    "edit": [{"probe_id": "birth_edit", "prompt": "林舟的出生城市是哪座？", "answer": "海岚市", "used_for_edit": true}],
+    "paraphrase": [{"probe_id": "birth_test", "prompt": "请用完整句子说明林舟出生在哪座城市。", "answer": "海岚市", "answer_aliases": ["海岚市"], "used_for_edit": false, "reference_type": "short_answer", "target_proposition": "林舟的出生城市是海岚市。"}],
+    "cloze": [],
+    "free_form_qa": [],
+    "portability": []
+  },
+  "generation_profile": {"mode": "free_response", "window_policy_id": "free_window64_v1"},
+  "trajectory_probes": [],
+  "kg_consequence": {"expected_ripples": [], "preserve_edges": [], "forbidden_leakage": []},
+  "locality": {"same_subject": [], "same_relation": [], "semantic_neighbor": [], "unrelated": []},
+  "quality_control": {"status": "example_only"},
+  "metadata": {"note": "结构示例，不是可直接发布的完整样本"}
+}
