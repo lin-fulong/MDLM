@@ -68,6 +68,16 @@ class SecondMomentAccumulator:
         if not bool(torch.isfinite(stored_values).all()):
             raise ValueError("weighted activations exceed the accumulation precision")
         self.matrix.addmm_(stored_values.T, stored_values)
+        if positive_count:
+            # 公式（5）的外积严格对称；BLAS 两侧可能采用不同归约顺序。
+            # 分块复用上三角结果，保持同一外积定义/权重，不平均或重缩放 C。
+            for start in range(0, self.width, 256):
+                end = min(self.width, start + 256)
+                if start:
+                    self.matrix[start:end, :start].copy_(self.matrix[:start, start:end].T)
+                block = self.matrix[start:end, start:end]
+                lower = torch.tril_indices(end - start, end - start, offset=-1)
+                block[lower[0], lower[1]] = block[lower[1], lower[0]]
         projected = weighted_values @ self.projection_vectors
         direct = weighted_values[:, self.direct_indices]
         for row, projection in zip(direct, projected):

@@ -176,6 +176,30 @@ class SecondMomentTests(unittest.TestCase):
                     accumulator.add(values[start:start + batch_size], weights[start:start + batch_size])
                 self.assertTrue(accumulator.diagnose(accumulator.matrix)["all_checks_passed"])
 
+    def test_single_thread_batch_preserves_exact_outer_product_symmetry(self):
+        threads = torch.get_num_threads()
+        self.addCleanup(torch.set_num_threads, threads)
+        torch.set_num_threads(1)
+        generator = torch.Generator().manual_seed(32)
+        values = torch.randn(3000, 32, generator=generator, dtype=torch.float64) * 1000
+        weights = torch.linspace(0.1, 2, len(values)).tolist()
+        accumulator = SecondMomentAccumulator(32, accumulation_dtype="float32")
+        accumulator.add(values, weights)
+        self.assertTrue(torch.equal(accumulator.matrix, accumulator.matrix.T))
+        self.assertTrue(accumulator.diagnose(accumulator.matrix)["all_checks_passed"])
+
+    def test_symmetry_copy_handles_more_than_one_row_block(self):
+        generator = torch.Generator().manual_seed(8)
+        values = torch.randn(7, 270, generator=generator, dtype=torch.float64)
+        accumulator = SecondMomentAccumulator(270)
+        accumulator.add(values[:3], [0.5, 0.0, 2.0])
+        accumulator.add(values[3:], [0.1, 0.3, 0.4, 0.8])
+        expected = sum(weight * torch.outer(row, row) for row, weight in zip(
+            values, [0.5, 0.0, 2.0, 0.1, 0.3, 0.4, 0.8]))
+        torch.testing.assert_close(accumulator.matrix, expected, rtol=1e-12, atol=1e-12)
+        self.assertTrue(torch.equal(accumulator.matrix, accumulator.matrix.T))
+        self.assertTrue(accumulator.diagnose(accumulator.matrix)["all_checks_passed"])
+
     def test_extreme_finite_corruption_produces_serializable_failure_report(self):
         accumulator = SecondMomentAccumulator(1)
         accumulator.add(torch.tensor([[1e204]], dtype=torch.float64), [1e-100])

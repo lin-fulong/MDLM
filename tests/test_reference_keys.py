@@ -253,6 +253,17 @@ class ReferenceKeyTests(unittest.TestCase):
         keys = load_file(str(self.output_dir / "keys.safetensors"))
         self.assertTrue(all(value.dtype == torch.float64 for value in keys.values()))
 
+    def test_saved_k_dtype_is_checked_even_when_values_are_equal(self):
+        original = load_file
+
+        def changed_dtype(*args, **kwargs):
+            return {name: value.double() for name, value in original(*args, **kwargs).items()}
+
+        with patch("safetensors.torch.load_file", side_effect=changed_dtype):
+            with self.assertRaisesRegex(ValueError, "round-trip"):
+                self.extract()
+        self.assert_failed_publication("save_and_reload")
+
     def assert_failed_publication(self, phase):
         manifest = json.loads((self.output_dir / "manifest.json").read_text(encoding="utf-8"))
         report = json.loads((self.output_dir / "qa_report.json").read_text(encoding="utf-8"))

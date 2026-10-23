@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,8 +16,9 @@ except ImportError:
 
 from tests import test_keep_statistics_pipeline as keep_tests
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
-from MDLM.contracts import file_sha256
-from util.validate_matrix_artifacts import validate_run
+from MDLM.contracts import KeepStatisticsConfig, config_digest, file_sha256
+from model.base import ForwardCapture
+from util.validate_matrix_artifacts import check_matrix, validate_run
 
 
 @unittest.skipIf(torch is None, "PyTorch and safetensors are required for P2 bundle tests")
@@ -134,6 +136,46 @@ class MatrixArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "artifact digest differs"):
                 self.validate()
         self.assertEqual(json.loads((self.output / "manifest.json").read_text())["status"], "failed")
+
+    def test_key_replay_does_not_hide_double_precision_differences(self):
+        path = self.root / "reference_keys/manifest.json"
+        record = json.loads(path.read_text())
+        record["settings"].update(replay_atol=0.0, replay_rtol=0.0)
+        record["settings_sha256"] = config_digest(record["settings"])
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.change_json(self.root / "keep_statistics/manifest.json", lambda row: row["key_files_sha256"].update(
+            {str(path): file_sha256(path)}))
+        original = LLaDA8BInstructAdapter.forward_with_capture
+
+        def changed(adapter, model, model_input):
+            result = original(adapter, model, model_input)
+            values = {name: value.double() for name, value in result.module_inputs.items()}
+            value = next(iter(values.values()))
+            index = value.abs().argmax()
+            value[index] += value[index].abs() * 1e-9  # 小于 float32 舍入间隔，超过冻结的零容差。
+            return ForwardCapture(result.mask_logits, values)
+
+        with patch.object(LLaDA8BInstructAdapter, "forward_with_capture", new=changed):
+            with self.assertRaisesRegex(ValueError, "K replay differs"):
+                self.validate()
+
+
+@unittest.skipIf(torch is None, "PyTorch and safetensors are required for matrix numeric tests")
+class MatrixNumericTests(unittest.TestCase):
+    def test_finite_large_projected_moment_does_not_overflow_symmetrization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            key_path, keep_path = root / "k.safetensors", root / "c.safetensors"
+            save_file({"layer": torch.ones(1, 1, dtype=torch.float64)}, str(key_path))
+            save_file({"layer": torch.full((1, 1), 1e308, dtype=torch.float64)}, str(keep_path))
+            expected = {"vectors": torch.ones(1, 1, dtype=torch.float64), "indices": torch.tensor([0]),
+                        "direct": torch.full((1, 1), 1e308, dtype=torch.float64),
+                        "projection": torch.full((1, 1), 1e308, dtype=torch.float64),
+                        "trace": 1e308, "vector_count": 1}
+            report = check_matrix("layer", keep_path, key_path, 1, 1, "torch.float64", "float64",
+                                  KeepStatisticsConfig("constructed_large_moment"), expected)
+            self.assertEqual(report["projected_eigenvalue_min"], 1e308)
+            json.dumps(report, allow_nan=False)
 
 
 if __name__ == "__main__":

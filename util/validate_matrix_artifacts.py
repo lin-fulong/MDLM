@@ -146,8 +146,9 @@ def check_matrix(name: str, path: Path, key_path: Path, width: int, count: int,
                 f"C direct outer-product block differs at {name}")
         projection_error = float((projection - expected["projection"]).abs().max())
         require(projection_error <= bound, f"C projected second moment differs at {name}")
-        eigen_min = float(torch.linalg.eigvalsh((projection + projection.T) * 0.5).min())
-        require(eigen_min >= -bound, f"C projected PSD check failed at {name}")
+        # 先乘 1/2 再相加，避免有限二阶矩在对称化中间值上溢。
+        eigen_min = float(torch.linalg.eigvalsh(projection * 0.5 + projection.T * 0.5).min())
+        require(math.isfinite(eigen_min) and eigen_min >= -bound, f"C projected PSD check failed at {name}")
         return {"shape": [width, width], "storage_dtype": keep_dtype, "finite": True,
                 "symmetric": True, "symmetry_max_diff": symmetry_max, "trace": trace,
                 "replayed_trace": scale, "direct_outer_product_max_diff": float(
@@ -251,7 +252,8 @@ def validate_run(p1_dir: str | Path) -> dict:
                 require(tuple(stored.shape) == (descriptions[name]["in_features"], len(trajectories))
                         and str(stored.dtype) == keys["layers"][name]["storage_dtype"]
                         and bool(torch.isfinite(stored).all())
-                        and torch.allclose(value.float(), stored[:, index].float(),
+                        # 不降为 float32，否则会掩盖超过冻结容差的 float64 差异。
+                        and torch.allclose(value.double(), stored[:, index].double(),
                                            atol=key_settings.replay_atol, rtol=key_settings.replay_rtol),
                         f"K replay differs at {name}, column {index}")
         del saved_keys

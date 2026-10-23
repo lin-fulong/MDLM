@@ -187,7 +187,8 @@ def extract_run(p1_dir: str | Path, settings: ReferenceKeyConfig | None = None) 
         save_file(keys, str(tensor_path), metadata={"artifact_version": REFERENCE_KEYS_VERSION,
                                                    "p1_config_sha256": config.digest()})
         saved = load_file(str(tensor_path), device="cpu")
-        if set(saved) != set(keys) or any(not torch.equal(saved[name], value) for name, value in keys.items()):
+        if set(saved) != set(keys) or any(saved[name].dtype != value.dtype
+                or not torch.equal(saved[name], value) for name, value in keys.items()):
             raise ValueError("saved reference keys did not round-trip exactly")
         if any(file_sha256(p1_dir / name) != digest for name, digest in source_hashes.items()):
             raise ValueError("P1 artifacts changed during key extraction")
