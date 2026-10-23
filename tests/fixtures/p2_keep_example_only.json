@@ -1,0 +1,25 @@
+{
+  "recipe_id": "constructed_keep_two_inputs_v1",
+  "purpose": "keep_statistics",
+  "example_only": true,
+  "mask_policy_id": "append_explicit_mask_window_v1",
+  "position_policy_id": "last_prompt_token_and_first_mask_v1",
+  "weight_policy_id": "explicit_per_position_no_normalization_v1",
+  "note": "独立构造的保持统计联调输入；不是编辑事实、开发验收题或独立测试题，不能作为正式保持实验配方。",
+  "inputs": [
+    {
+      "input_id": "constructed_keep_library",
+      "prompt": "松岭馆每周三举行读书活动。请简述它的活动安排。",
+      "mask_count": 2,
+      "weights": [0.5, 1.5],
+      "source": {"source_dataset": "constructed_keep_smoke", "source_id": "library"}
+    },
+    {
+      "input_id": "constructed_keep_bridge",
+      "prompt": "白杉桥连接湖岸的两条步道。请简述它的用途。",
+      "mask_count": 3,
+      "weights": [0.0, 2.0],
+      "source": {"source_dataset": "constructed_keep_smoke", "source_id": "bridge"}
+    }
+  ]
+}
