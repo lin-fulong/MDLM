@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--layer", type=int, required=True, help="one explicitly chosen FFN layer")
     parser.add_argument("--forward", action="store_true", help="load 8B weights and run two replay-checked forwards")
+    parser.add_argument("--output", type=Path, help="also save the JSON report to this path")
     args = parser.parse_args()
     cases = load_cases(args.case_file)
     adapter = LLaDA8BInstructAdapter.from_local_tokenizer(model_path=args.model_path, target_layers=(args.layer,))
@@ -30,6 +31,8 @@ def main() -> None:
                 "probe_id": probe["probe_id"],
                 "purpose": case_purpose(case),
                 "mask_count": len(model_input.mask_positions),
+                "full_mask_input": len(model_input.mask_positions) == len(target.token_ids)
+                and all(model_input.input_ids[pos] == adapter.mask_token_id for pos in model_input.mask_positions),
                 "subject_last_position": model_input.subject_last_position,
                 "target_token_count": len(target.token_ids),
                 "real_forward": False,
@@ -50,6 +53,8 @@ def main() -> None:
                 row["target_modules"] = module_info
                 row["ffn_input_shapes"] = {name: list(value.shape) for name, value in result.module_inputs.items()}
             results.append(row)
+    if args.output is not None:
+        args.output.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(results, ensure_ascii=False, indent=2))
 
 

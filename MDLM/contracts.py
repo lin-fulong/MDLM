@@ -25,6 +25,28 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def local_model_identity(model_path: str | Path) -> dict:
+    """Identify a local safetensors model, its Python implementation and tokenizer."""
+    model_path = Path(model_path)
+    weights = sorted(model_path.glob("*.safetensors"))
+    if not weights:
+        raise FileNotFoundError(f"no safetensors weights found in {model_path}")
+    model_files = [model_path / "config.json", *sorted(model_path.glob("*.py")), *weights]
+    index = model_path / "model.safetensors.index.json"
+    if index.exists():
+        model_files.append(index)
+    tokenizer_files = [model_path / "tokenizer.json", model_path / "tokenizer_config.json",
+                       model_path / "special_tokens_map.json"]
+    model_hashes = {path.name: file_sha256(path) for path in model_files}
+    tokenizer_hashes = {path.name: file_sha256(path) for path in tokenizer_files}
+    return {
+        "model_files_sha256": model_hashes,
+        "tokenizer_files_sha256": tokenizer_hashes,
+        "model_revision": "local-files-sha256:" + config_digest(model_hashes),
+        "tokenizer_revision": "local-files-sha256:" + config_digest(tokenizer_hashes),
+    }
+
+
 @dataclass(frozen=True)
 class FactSelection:
     """One edit probe represents one fact in the formula (2) denominator N."""
