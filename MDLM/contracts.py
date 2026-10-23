@@ -1,4 +1,4 @@
-"""Versioned P1/P2 run choices; dataset quality is checked separately."""
+"""Versioned run choices; dataset quality is checked separately."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ REFERENCE_KEYS_VERSION = "p2.keys.1"
 KEEP_INPUTS_VERSION = "p2.keep_inputs.1"
 KEEP_STATISTICS_VERSION = "p2.keep_statistics.1"
 MATRIX_BUNDLE_VERSION = "p2.matrix_bundle.1"
+WRITEBACK_FACTOR_VERSION = "p3.writeback_factor.2"
 
 
 def config_digest(values: dict) -> str:
@@ -201,6 +202,62 @@ class KeepStatisticsConfig:
             self.projection_count, self.direct_block_size, self.chunk_size
         )):
             raise ValueError("keep projection, direct block and chunk sizes must be positive integers")
+
+    def as_record(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WritebackConfig:
+    """Freeze formula (9) ridge coefficients and numerical choices before solving."""
+
+    ridge_by_layer: dict[str, float]
+    compute_dtype: str = "float64"
+    storage_dtype: str = "float32"
+    device: str = "cpu"
+    solver: str = "cholesky"
+    failure_policy: str = "stop"
+    symmetry_atol: float = 1e-7
+    symmetry_rtol: float = 1e-6
+    residual_tolerance: float = 1e-8
+    stored_residual_tolerance: float = 1e-5
+    residual_epsilon: float = 1e-12
+    chunk_size: int = 256
+    allow_example_only: bool = False
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "WritebackConfig":
+        with Path(path).open(encoding="utf-8") as stream:
+            config = cls(**json.load(stream))
+        config.check()
+        return config
+
+    def check(self) -> None:
+        if not isinstance(self.ridge_by_layer, dict) or not self.ridge_by_layer or any(
+            not isinstance(name, str) or not name or isinstance(value, bool)
+            or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+            for name, value in self.ridge_by_layer.items()
+        ):
+            raise ValueError("one explicit finite positive ridge is required per target layer")
+        if any(dtype not in ("float32", "float64") for dtype in (self.compute_dtype, self.storage_dtype)):
+            raise ValueError("writeback compute/storage dtype must be float32 or float64")
+        if self.solver != "cholesky" or self.failure_policy != "stop":
+            raise ValueError("writeback supports only frozen cholesky with stop-on-failure")
+        if not isinstance(self.device, str) or (self.device != "cpu" and self.device != "cuda" and not (
+            self.device.startswith("cuda:") and self.device[5:].isdigit()
+        )):
+            raise ValueError("writeback device must be cpu, cuda or cuda:<index>")
+        for name in ("symmetry_atol", "symmetry_rtol", "residual_tolerance",
+                     "stored_residual_tolerance", "residual_epsilon"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"writeback {name} must be finite and nonnegative")
+        if self.residual_epsilon == 0:
+            raise ValueError("writeback residual_epsilon must be positive")
+        if type(self.chunk_size) is not int or self.chunk_size < 1:
+            raise ValueError("writeback chunk_size must be a positive integer")
+        if type(self.allow_example_only) is not bool:
+            raise ValueError("allow_example_only must be boolean")
 
     def as_record(self) -> dict:
         return asdict(self)

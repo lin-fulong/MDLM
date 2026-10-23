@@ -1,6 +1,6 @@
 # MDLM 扩散知识编辑项目
 
-本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。P0 数据与 LLaDA 适配、P1 固定状态与监督、P2 的 K/C 提取及统一产物验收已实现；真实 LLaDA 的单编辑案例和独立构造保持输入已通过技术验收。正式数据、正式保持统计配方、多事实/多层验收及后续编辑仍待完成。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
+本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。P0 模型与数据接口、P1 固定状态与监督、P2 的 K/C 提取和统一验收、P3 固定 Q 求解已实现，并取得真实 LLaDA 单案例的技术验收证据。正式数据、保持配方、多事实/多层验收和 P4～P6 编辑闭环仍待完成。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
 
 ## 基础扩散模型
 
@@ -141,7 +141,7 @@ K 产物写入同轮的 `matrices/reference_keys/`：`keys.safetensors` 以完�
 
 2026-10-22 已完成 K 的代码审核：公式（4）的计算逻辑符合方案；修复 P1 覆盖报告的重放事实数、logits 重放数和示例数未与采集报告交叉核对的问题。修复不改变 K 数值计算，也不新增输入数据质量校验。已有真实 P1 产物通过新检查；本次审核未重跑 8B，沿用下方已保存的单案例实机证据。
 
-K、下节的 C 及 P2 统一产物验收已实现；P3～P5 尚未实现。
+K、下节的 C、P2 统一验收和 P3 固定 Q 求解已实现；P4～P6 尚未实现。
 
 2026-10-22 实机证据：`runs/example_only_p2_keys_20261022_review2/round_0/p2_keys_acceptance_report.json` 为 `passed`。第 0 层 K 为 `[12288, 1]`，原始捕获为 bfloat16、存储为 float32；初态 logits 与 P1 一致，重复捕获最大绝对差为 0，文件摘要与保存读取通过。P1 的 3 个前向前状态中保留 1 个兼容初态、诊断记录 2 个冲突状态，权重和为 1。首次运行 `review1` 的挂载盘重命名后即时读取失败已修复，失败报告原样保留。`runs/` 由 `.gitignore` 排除，仅本机保留实验产物。
 
@@ -206,6 +206,40 @@ python -m unittest tests.test_matrix_artifacts tests.test_p2_keep_smoke -v
 2026-10-22 已复用上述真实 P1/K 运行执行 C。`runs/example_only_p2_keys_20261022_review2/round_0/p2_keep_acceptance_report.json` 为 `passed`：第 0 层 C 为 `[12288,12288]`，捕获 bfloat16、累计 float64、保存 float32；4 个保持位置中 3 个正权重、1 个零权重，总量 4。共 5 次真实前向，P1 初态 logits 一致，保持输入重复捕获差值均为 0；对称差为 0，trace 为约 12.093753，数值诊断及磁盘往返全部通过。
 
 2026-10-23 对 `runs/example_only_p2_keep_20261023T063109Z_9628d2ee/round_0/` 的真实 P1/K/C 产物执行 P2-03，`matrices/validation/qa_report.json` 为 `complete`。额外 3 次真实前向通过 K 初态和两条保持输入重放；第 0 层 C 的对称差为 0，独立外积块最大差约 `7.28e-12`，独立投影二阶矩最大差约 `3.62e-11`。验收报告明确 `example_only=true`、`p2_stage_complete=false`、`full_spectrum_checked=false`。正式保持配方、多事实/多层运行与正式验收仍待完成。
+
+## P3 固定写回因子 Q：公式（6）～（9）
+
+`MDLM/writeback.py` 按冻结的逐层正则系数构造 `H = C + K Kᵀ + λ I`，用 Cholesky 解 `H X = K`，返回固定的 `Q = Xᵀ`。Q 的形状是 `[事实数, FFN 输入维度]`。不显式求逆、不修改 C 的尺度、不自动加 jitter 或增大 λ；分解失败、非有限值或残差超限均停止并保留诊断。
+
+`WritebackConfig` 冻结各层 λ、计算/保存精度、设备和容差。示例配置 `configs/p3_writeback_example_only.json` 仅对应第 0 层，λ 为 `0.01`，CPU float64 求解、float32 保存；这是技术联调选择，正式实验需提前冻结自己的参数。计算结果和保存精度结果均用原始 K/C 核对 `HX=K` 与 `QH=Kᵀ` 的相对残差，使用相同的冻结容差；缩放范数及分块 hypot 避免平方和上溢/下溢，保存后再核对 dtype 与数值。
+
+激活 `mdlm` 后，已有同轮 P1/K/C 和完整 `matrices/validation/` 时，用一条命令完成 P3 求解与验收：
+
+```bash
+python -u -m util.smoke_p3_writeback --p1-dir runs/your_run/round_0/p1
+```
+
+自定义逐层配置的直接入口为：
+
+```bash
+python -u -m util.solve_writeback_factor runs/your_run/round_0/p1 --config configs/your_p3_config.json
+```
+
+P3 只读取已验收的状态和矩阵产物，不加载 8B 权重，不执行模型前向。`ridge_by_layer` 必须与 P2 目标层完整对应；示例矩阵需要配置明确 `allow_example_only=true`。正式输入要求 P2 阶段完成；示例输出仍保持 `example_only=true`、`p3_stage_complete=false`。已有成功或失败目录不覆盖，重复实验应在新运行目录执行。
+
+产物位于 `matrices/writeback_factors/`：逐层 `q_layer_<n>.safetensors`、版本 `p3.writeback_factor.2` 的 `manifest.json` 和 `qa_report.json`。记录同轮来源摘要、事实顺序、模型基准、λ、dtype、H 尺度、Cholesky 诊断、计算/保存后的线性系统与转置正规方程残差、耗时、进程内存峰值及失败原因。Q 在后续 P4 中固定；当前尚未优化 R 或写回模型权重。版本 1 的历史产物保持原样，其报告没有新增的转置正规方程证据。
+
+2026-10-23 复用 `runs/example_only_p2_keep_20261023T063109Z_9628d2ee/round_0/` 的真实 P2 产物，P3 报告 `p3_writeback_acceptance_report.json` 为 passed。第 0 层 Q 为 `[1,12288]`，λ=`0.01`，求解相对残差约 `8.78e-16`，float32 保存后约 `1.81e-9`，磁盘往返一致。16 CPU 线程下求解约 3.37 秒，进程峰值约 4.53 GiB；该资源记录仅代表本机本次运行。结果仍为人工案例技术验收。
+
+P3 本轮代码审核修复了近似对称 C 仅通过 `HX=K` 却违反 `QH=Kᵀ`、极小范数平方和下溢导致误接收，以及 H 行视图延长大矩阵存储生命周期的问题；不改变 λ、公式或原有容差。新增 8 项回归，P3 共 32 项、全套 132 项通过。对同一真实 K/C 重算后，Q 与旧文件逐元素及 dtype 一致；额外正规方程残差约 `8.80e-16`，float32 后约 `1.81e-9`。独立审核报告 `round_0/p3_writeback_review_report.json` 为 passed，原产物保留；本轮进程峰值约 3.40 GiB，该资源比较仅适用于本机本次记录。
+
+轻量测试命令：
+
+```bash
+python -m unittest tests.test_writeback_math tests.test_writeback_pipeline -v
+```
+
+阅读顺序：`WritebackConfig` 与示例配置 → `solve_writeback_factor/relative_residual` → 数学测试 → `load_matrix_bundle/solve_run` → P3 冒烟入口与流水线测试。小例验证 `RQ` 满足公式（7）及公式（6）的唯一最小值；`QK` 一般不等于单位阵。
 
 依赖选择参考：[LLaDA 官方仓库](https://github.com/ML-GSAI/LLaDA/blob/main/README.md)、[PyTorch 官方历史版本安装页](https://docs.pytorch.org/get-started/previous-versions/)、[EasyEdit 当前依赖清单](https://github.com/zjunlp/EasyEdit/blob/main/requirements.txt)、[Safetensors 文档](https://huggingface.co/docs/safetensors/index)。
 
