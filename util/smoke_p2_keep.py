@@ -18,6 +18,7 @@ from model.adapters.llada_8b_instruct import DEFAULT_MODEL_PATH, LLaDA8BInstruct
 from util.accept_p0_p1_single_case import PROJECT_ROOT
 from util.extract_keep_statistics import extract_run
 from util.extract_reference_keys import write_json
+from util.validate_matrix_artifacts import validate_run
 
 
 def freeze_example_inputs(p1_dir: Path, fixture_file: Path, output_path: Path) -> dict:
@@ -93,9 +94,10 @@ def main() -> None:
             raise FileExistsError("existing experiment will not be overwritten")
     run_root = p1_dir.parent
     frozen_path, report_path = run_root / "keep_inputs.json", run_root / "p2_keep_acceptance_report.json"
-    if any(path.exists() for path in (frozen_path, report_path, run_root / "matrices/keep_statistics")):
+    if any(path.exists() for path in (frozen_path, report_path, run_root / "matrices/keep_statistics",
+                                      run_root / "matrices/validation")):
         raise FileExistsError("existing keep statistics experiment will not be overwritten")
-    stage_order = ["P0", "P1", "P2_K", "P2_C"] if args.p1_dir is None else ["P2_C"]
+    stage_order = ["P0", "P1", "P2_K", "P2_C", "P2_QA"] if args.p1_dir is None else ["P2_C", "P2_QA"]
     report = {"status": "running", "phase": "upstream_P0_P1_K", "example_only": True,
               "scope": "real_model_stage_checks", "stage_order": stage_order,
               "formal_dataset_acceptance": False, "p2_stage_complete": False}
@@ -129,8 +131,15 @@ def main() -> None:
         result = extract_run(p1_dir, frozen_path, settings)
         if result["status"] != "complete" or not result["example_only"]:
             raise ValueError("example C extraction did not pass")
+        report["phase"] = "matrix_artifact_validation"
+        write_json(report_path, report)
+        validation = validate_run(p1_dir)
+        if validation["status"] != "complete" or not validation["example_only"]:
+            raise ValueError("example P2 matrix bundle did not pass")
         report.update({"status": "passed", "phase": "complete", "keep_statistics": result,
-                       "manifest_sha256": file_sha256(Path(result["output_dir"]) / "manifest.json")})
+                       "manifest_sha256": file_sha256(Path(result["output_dir"]) / "manifest.json"),
+                       "matrix_validation": validation,
+                       "p2_stage_complete": validation["p2_stage_complete"]})
     except Exception as error:
         report.update({"status": "failed", "failure": str(error)})
         if run_root.exists():

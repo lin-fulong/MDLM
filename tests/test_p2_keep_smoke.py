@@ -43,6 +43,11 @@ class KeepSmokeTests(unittest.TestCase):
         (directory / "manifest.json").write_text('{"status": "complete"}', encoding="utf-8")
         return {"status": "complete", "example_only": True, "output_dir": str(directory)}
 
+    def fake_validate(self, p1_dir):
+        self.assertEqual(p1_dir, self.p1_dir)
+        return {"status": "complete", "example_only": True, "p2_stage_complete": False,
+                "report": str(p1_dir.parent / "matrices/validation/qa_report.json")}
+
     def test_freezer_records_explicit_masks_positions_and_unscaled_weights(self):
         adapter = SimpleNamespace(
             tokenizer=SimpleNamespace(apply_chat_template=lambda *args, **kwargs: [4, 3, 2]),
@@ -69,13 +74,14 @@ class KeepSmokeTests(unittest.TestCase):
         with patch.object(sys, "argv", self.arguments), patch("sys.stdout", new_callable=io.StringIO), \
                 patch.object(smoke_p2_keep.subprocess, "run") as upstream, \
                 patch.object(smoke_p2_keep, "freeze_example_inputs", side_effect=self.fake_freeze), \
-                patch.object(smoke_p2_keep, "extract_run", side_effect=self.fake_extract):
+                patch.object(smoke_p2_keep, "extract_run", side_effect=self.fake_extract), \
+                patch.object(smoke_p2_keep, "validate_run", side_effect=self.fake_validate):
             smoke_p2_keep.main()
         upstream.assert_not_called()
         root = self.p1_dir.parent
         report = json.loads((root / "p2_keep_acceptance_report.json").read_text(encoding="utf-8"))
         self.assertEqual(report["status"], "passed")
-        self.assertEqual(report["stage_order"], ["P2_C"])
+        self.assertEqual(report["stage_order"], ["P2_C", "P2_QA"])
         self.assertNotIn("upstream_reports", report)
         self.assertFalse(report["p2_stage_complete"])
         self.assertFalse(report["formal_dataset_acceptance"])
@@ -122,17 +128,22 @@ class KeepSmokeTests(unittest.TestCase):
             order.append("C")
             return self.fake_extract(*args)
 
+        def validate(*args):
+            order.append("P2_QA")
+            return self.fake_validate(*args)
+
         arguments = ["smoke_p2_keep", "--layer", "0", "--run-id", "fresh_keep",
                      "--output-root", str(self.root / "runs"), "--config", str(self.config_path)]
         with patch.object(sys, "argv", arguments), patch("sys.stdout", new_callable=io.StringIO), \
                 patch.object(smoke_p2_keep.subprocess, "run", side_effect=upstream), \
                 patch.object(smoke_p2_keep, "freeze_example_inputs", side_effect=freeze), \
-                patch.object(smoke_p2_keep, "extract_run", side_effect=extract):
+                patch.object(smoke_p2_keep, "extract_run", side_effect=extract), \
+                patch.object(smoke_p2_keep, "validate_run", side_effect=validate):
             smoke_p2_keep.main()
-        self.assertEqual(order, ["P0_P1_K", "freeze_keep", "C"])
+        self.assertEqual(order, ["P0_P1_K", "freeze_keep", "C", "P2_QA"])
         root = self.p1_dir.parent
         report = json.loads((root / "p2_keep_acceptance_report.json").read_text(encoding="utf-8"))
-        self.assertEqual(report["stage_order"], ["P0", "P1", "P2_K", "P2_C"])
+        self.assertEqual(report["stage_order"], ["P0", "P1", "P2_K", "P2_C", "P2_QA"])
         for stage, filename in (("P0_P1", "acceptance_report.json"), ("P2_K", "p2_keys_acceptance_report.json")):
             self.assertEqual(report["upstream_reports"][stage]["sha256"], file_sha256(root / filename))
 
@@ -163,6 +174,17 @@ class KeepSmokeTests(unittest.TestCase):
         report = json.loads((self.p1_dir.parent / "p2_keep_acceptance_report.json").read_text())
         self.assertEqual((report["status"], report["phase"]), ("failed", "keep_statistics"))
         self.assertNotIn("manifest_sha256", report)
+
+    def test_matrix_validation_failure_is_recorded_without_claiming_acceptance(self):
+        with patch.object(sys, "argv", self.arguments), patch("sys.stdout", new_callable=io.StringIO), \
+                patch.object(smoke_p2_keep, "freeze_example_inputs", side_effect=self.fake_freeze), \
+                patch.object(smoke_p2_keep, "extract_run", side_effect=self.fake_extract), \
+                patch.object(smoke_p2_keep, "validate_run", side_effect=ValueError("artificial P2 QA failure")):
+            with self.assertRaisesRegex(ValueError, "P2 QA failure"):
+                smoke_p2_keep.main()
+        report = json.loads((self.p1_dir.parent / "p2_keep_acceptance_report.json").read_text())
+        self.assertEqual((report["status"], report["phase"]), ("failed", "matrix_artifact_validation"))
+        self.assertFalse(report["p2_stage_complete"])
 
     def test_existing_keep_inputs_are_preserved_without_starting_experiment(self):
         path = self.p1_dir.parent / "keep_inputs.json"

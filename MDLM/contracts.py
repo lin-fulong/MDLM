@@ -13,6 +13,7 @@ P1_ARTIFACT_VERSION = "p1.1"
 REFERENCE_KEYS_VERSION = "p2.keys.1"
 KEEP_INPUTS_VERSION = "p2.keep_inputs.1"
 KEEP_STATISTICS_VERSION = "p2.keep_statistics.1"
+MATRIX_BUNDLE_VERSION = "p2.matrix_bundle.1"
 
 
 def config_digest(values: dict) -> str:
