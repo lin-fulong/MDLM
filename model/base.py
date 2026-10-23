@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import hashlib
 from typing import Any
+
+
+def tensor_sha256(tensor: Any) -> str:
+    """Digest the original dtype, shape and bytes without reducing precision."""
+    import torch
+
+    raw_bytes = tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+    header = f"{tensor.dtype}:{tuple(tensor.shape)}:".encode("ascii")
+    return hashlib.sha256(header + raw_bytes).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -13,6 +23,15 @@ class MaskedEditInput:
     attention_mask: tuple[int, ...]
     mask_positions: tuple[int, ...]
     subject_last_position: int
+
+
+@dataclass(frozen=True)
+class KeepModelInput:
+    """Frozen preservation context, independent of edit subjects and targets."""
+
+    input_ids: tuple[int, ...]
+    attention_mask: tuple[int, ...]
+    mask_positions: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -59,6 +78,12 @@ class ModelAdapter(ABC):
     @abstractmethod
     def forward_with_capture(self, model: Any, model_input: MaskedEditInput) -> ForwardCapture:
         raise NotImplementedError
+
+    def forward_keep_with_capture(
+        self, model: Any, model_input: KeepModelInput, capture_positions: tuple[int, ...]
+    ) -> ForwardCapture:
+        """Return each selected module's actual inputs as [position, input feature]."""
+        raise NotImplementedError("preservation-input capture is unavailable for this model adapter")
 
     @abstractmethod
     def snapshot_target_weights(self, model: Any) -> TargetWeightSnapshot:

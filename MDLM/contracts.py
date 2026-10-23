@@ -1,4 +1,4 @@
-"""Versioned inputs for P1 state collection; dataset quality is checked separately."""
+"""Versioned P1/P2 run choices; dataset quality is checked separately."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ from pathlib import Path
 
 
 P1_ARTIFACT_VERSION = "p1.1"
+REFERENCE_KEYS_VERSION = "p2.keys.1"
+KEEP_INPUTS_VERSION = "p2.keep_inputs.1"
+KEEP_STATISTICS_VERSION = "p2.keep_statistics.1"
 
 
 def config_digest(values: dict) -> str:
@@ -81,6 +84,11 @@ class P1RunConfig:
     def from_file(cls, path: str | Path) -> "P1RunConfig":
         with Path(path).open(encoding="utf-8") as stream:
             values = json.load(stream)
+        return cls.from_record(values)
+
+    @classmethod
+    def from_record(cls, values: dict) -> "P1RunConfig":
+        values = dict(values)
         values["facts"] = tuple(FactSelection(**item) for item in values["facts"])
         values["target_layers"] = tuple(values["target_layers"])
         config = cls(**values)
@@ -127,3 +135,71 @@ class P1RunConfig:
         # 每个事实使用独立随机流，改变处理顺序不会改变其采样种子。
         key = f"{self.seed}:{fact.case_id}:{fact.probe_id}".encode("utf-8")
         return int.from_bytes(hashlib.sha256(key).digest()[:8], "big") % (2**63)
+
+
+@dataclass(frozen=True)
+class ReferenceKeyConfig:
+    """Formula (4) storage and repeat-capture tolerances, fixed before extraction."""
+
+    storage_dtype: str = "float32"
+    replay_atol: float = 1e-2
+    replay_rtol: float = 1e-3
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "ReferenceKeyConfig":
+        with Path(path).open(encoding="utf-8") as stream:
+            config = cls(**json.load(stream))
+        config.check()
+        return config
+
+    def check(self) -> None:
+        if self.storage_dtype not in ("float32", "float64"):
+            raise ValueError("reference key storage_dtype must be float32 or float64")
+        if any(not math.isfinite(value) or value < 0 for value in (self.replay_atol, self.replay_rtol)):
+            raise ValueError("reference key replay tolerances must be finite and nonnegative")
+
+    def as_record(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class KeepStatisticsConfig:
+    """Explicit formula (5) recipe identity and numerical choices; no implicit scale."""
+
+    recipe_id: str
+    accumulation_dtype: str = "float64"
+    storage_dtype: str = "float32"
+    replay_atol: float = 1e-2
+    replay_rtol: float = 1e-3
+    check_atol: float = 1e-6
+    check_rtol: float = 1e-5
+    qa_seed: int = 2026
+    projection_count: int = 8
+    direct_block_size: int = 16
+    chunk_size: int = 512
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "KeepStatisticsConfig":
+        with Path(path).open(encoding="utf-8") as stream:
+            config = cls(**json.load(stream))
+        config.check()
+        return config
+
+    def check(self) -> None:
+        if not self.recipe_id:
+            raise ValueError("keep recipe_id must be explicitly identified")
+        if any(dtype not in ("float32", "float64") for dtype in (self.accumulation_dtype, self.storage_dtype)):
+            raise ValueError("keep accumulation/storage dtype must be float32 or float64")
+        if any(not math.isfinite(value) or value < 0 for value in (
+            self.replay_atol, self.replay_rtol, self.check_atol, self.check_rtol
+        )):
+            raise ValueError("keep replay/check tolerances must be finite and nonnegative")
+        if type(self.qa_seed) is not int or self.qa_seed < 0:
+            raise ValueError("keep qa_seed must be a nonnegative integer")
+        if any(type(value) is not int or value < 1 for value in (
+            self.projection_count, self.direct_block_size, self.chunk_size
+        )):
+            raise ValueError("keep projection, direct block and chunk sizes must be positive integers")
+
+    def as_record(self) -> dict:
+        return asdict(self)
