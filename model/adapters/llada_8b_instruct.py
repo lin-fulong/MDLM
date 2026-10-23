@@ -50,6 +50,13 @@ class LLaDA8BInstructAdapter(ModelAdapter):
 
     def prepare_edit_input(self, case: dict, probe_id: str) -> tuple[MaskedEditInput, EditTarget]:
         probe = next(p for p in case["prompts"]["edit"] if p["probe_id"] == probe_id)
+        return self._prepare_short_answer(case, probe)
+
+    def prepare_development_input(self, case: dict, probe_id: str) -> tuple[MaskedEditInput, EditTarget]:
+        probe = next(p for group in case["prompts"].values() for p in group if p["probe_id"] == probe_id)
+        return self._prepare_short_answer(case, probe)
+
+    def _prepare_short_answer(self, case: dict, probe: dict) -> tuple[MaskedEditInput, EditTarget]:
         rendered = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": probe["prompt"]}], tokenize=False, add_generation_prompt=True
         )
@@ -68,7 +75,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
                 mask_positions=positions,
                 subject_last_position=alignment.subject_last_position,
             ),
-            EditTarget(case["case_id"], probe_id, alignment.answer_ids),
+            EditTarget(case["case_id"], probe["probe_id"], alignment.answer_ids),
         )
 
     def target_module_names(self) -> tuple[str, ...]:

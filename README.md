@@ -1,6 +1,6 @@
 # MDLM 扩散知识编辑项目
 
-本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。P0 模型与数据接口、P1 固定状态与监督、P2 的 K/C 提取和统一验收、P3 固定 Q、P4 真实候选前向与 R 联合优化已实现，并取得真实 LLaDA 单案例的技术验收证据。正式数据、保持配方、多事实/多层验收和 P5/P6 编辑闭环仍待完成。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
+本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。P0～P4 核心实现和真实单案例技术证据已完成；P5 实际合并、开发门槛及回退代码已实现。正式数据、保持配方、多事实/多层阶段验收和 P6 独立生成评价待完成。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
 
 ## 基础扩散模型
 
@@ -141,7 +141,7 @@ K 产物写入同轮的 `matrices/reference_keys/`：`keys.safetensors` 以完�
 
 2026-10-22 已完成 K 的代码审核：公式（4）的计算逻辑符合方案；修复 P1 覆盖报告的重放事实数、logits 重放数和示例数未与采集报告交叉核对的问题。修复不改变 K 数值计算，也不新增输入数据质量校验。已有真实 P1 产物通过新检查；本次审核未重跑 8B，沿用下方已保存的单案例实机证据。
 
-K、下节的 C、P2 统一验收、P3 固定 Q 和 P4 残差联合优化已实现；P5/P6 尚未实现。
+K、下节的 C、P2 统一验收、P3 固定 Q、P4 残差联合优化和 P5 合并验收已实现；P6 尚未实现。
 
 2026-10-22 实机证据：`runs/example_only_p2_keys_20261022_review2/round_0/p2_keys_acceptance_report.json` 为 `passed`。第 0 层 K 为 `[12288, 1]`，原始捕获为 bfloat16、存储为 float32；初态 logits 与 P1 一致，重复捕获最大绝对差为 0，文件摘要与保存读取通过。P1 的 3 个前向前状态中保留 1 个兼容初态、诊断记录 2 个冲突状态，权重和为 1。首次运行 `review1` 的挂载盘重命名后即时读取失败已修复，失败报告原样保留。`runs/` 由 `.gitignore` 排除，仅本机保留实验产物。
 
@@ -286,6 +286,46 @@ python -u -m util.optimize_residuals runs/your_run/round_0/p1 --config configs/p
 ```
 
 此前额外强制单线程运行时，既有 C 的 float32 大批数值 QA 测试出现线程相关差异，默认线程复核通过；此限制仍待专项数值核验，本轮未放宽容差或修改 C 算法。
+
+## P5 实际合并、开发验收与回退：公式（13）～（18）
+
+`MDLM/merge.py` 计算真正的权重增量 `RQ`；每个公共 α 都从 CPU 保存的同一份 W_b 构造 `W_b+αRQ`，按配置精度计算后转换一次到模型权重精度。目标层输出的全部位置/全部调用，以及指定位置完整词表 logits，均须与同 α 的因子候选在预定容差内一致。比较完成后因子 hook 已移除，开发指标由实际合并模型计算。共享目标权重当前明确拒绝，等待专用绑定参数适配；偏置和其他参数保持白名单完整性检查。`R(QK-I)` 是软拟合误差诊断，不要求为零，`V*=W_bK+R` 不直接写入权重。
+
+`MDLM/acceptance.py` 顺序尝试配置中的 α，接受第一个同时满足 `F_dev≤F_dev(W_b)-δ`、`G_dev≤τ_G`、`U≤τ_U` 的模型。G 是相同开发保持 mask 输入/读出位置上的完整词表 `KL(theta_0 || candidate)`，即使训练 β=0 也必须执行；U 使用当前实际存储权重相对最初 W_0 的净差，按公式（17）跨目标层汇总，不累加每次更新的范数。等价失败/非有限试步拒绝并恢复后继续；全部拒绝或运行/保存异常恢复 W_b，并记录原因。
+
+开发编辑直接读取原有案例 JSON/JSONL，由 `dev_edit_probes` 显式选择 `case_id/probe_id`，不修改案例结构、不自动划分数据。原文未给出 F_dev 的具体输入与归一配方，首版将选择显式冻结为 `full_mask_mean_fact_probe_token_v1`：每个探针准备一个全 mask 短答案输入，事实均分、同事实探针均分、答案 token 均分。其答案仅作固定短答案监督；开发探针不得重新用于 P4 优化，独立测试不得用于 α 选择。正式数据用途在运行前独立审核，算法不扫描格式/质量/重复/答案或跨划分泄漏。
+
+开发保持文件是单独的计算合同，版本 `p5.keep_development.1`、`purpose=keep_dev`，包含 `example_only`、`tokenizer_revision`、`mask_token_id` 和 `inputs`；每项格式与 P4 冻结 token 输入相同，但 `positions` 必须是输入中的合法 mask 位置，非负 `weights` 全局和为 1。不得自动将 C 配方或保持训练输入当作开发保持。配置显式指定最初模型路径与修订；先缓存其完整词表 log-probabilities 和 W_0，同一身份可复用已加载模型作为 W_b，不同身份则释放参考再加载基准。
+
+复用本机已完成的同轮 P4 审核产物，一条命令启动三个技术检查：配置门槛试步、固定 `δ=1e6` 的强制拒绝回退、首个结果的磁盘模型重载/前向。配置试步可能正常拒绝；技术报告 `passed` 不等于模型通过开发门槛。
+
+```bash
+conda activate mdlm
+python -u -m util.smoke_p5_acceptance \
+  --p1-dir runs/example_only_p2_keep_20261023T063109Z_9628d2ee/round_0/p1 \
+  --residual-dir runs/example_only_p2_keep_20261023T063109Z_9628d2ee/round_0/residuals_review_v2
+```
+
+默认输出为同轮 `p5_smoke/`，旧目录不覆盖；重复运行添加 `--output-dir runs/your_new_p5_smoke`。入口先冻结本地模型身份、样例配置，以及独立构造的“清水颜色”开发保持输入；编辑开发题选原示例的 `birth_test`。样例 α=(1,0.5,0.25)、δ=0.001、τ_G=τ_U=0.05、等价 atol=0.125/rtol=0.02 均仅用于技术联调，不能作为正式推荐参数，运行后也不会自动放宽。`configs/p5_example_only.json` 中占位修订必须由该入口生成实际值，或在独立配置中手动冻结。
+
+正式/自定义单次入口：
+
+```bash
+python -u -m util.merge_and_accept runs/your_run/round_0/p1 \
+  --residual-dir runs/your_run/round_0/residuals \
+  --config configs/your_frozen_p5.json
+python -m unittest tests.test_merge tests.test_acceptance tests.test_workflow -v
+```
+
+`MDLM/workflow.py` 只编排既有同轮 P1～P4 产物和 P5，当前不自动刷新第二轮。P4 必须是 complete 的 `p4.residual_candidate.2`；正式输入要求其阶段完成，示例须显式允许。输出 `editing/manifest.json`（当前版本 `p5.merged_model.2`）、逐 α 的 `acceptance_report.json`、开发输入与 theta_0 缓存、候选 `candidate_increments.safetensors`、实际最终 `final_target_weights.safetensors` 和最终开发 logits。状态为 accepted 或 rejected；失败为 failed。磁盘保存实际目标层权重，可由 `MDLM.workflow.load_final_model(output_dir)` 加载不可变基准并覆盖这些目标层，再核对真实前向，无需复制全部 8B 权重。拒绝结果保存的是恢复后的基准；原始模型目录不被写入。来源/缓存结束复查、张量精确读回与参数完整性均是算法产物验收，不调用 `schema.py`。历史版本 1 保留作为原始技术记录；当前加载器要求版本 2，应以同一配置在新目录重新验收，不自动升级或改写旧结果。
+
+P5 开发自查时新增 46 项：11 合并、12 门槛、23 流程。专项审核已完成，新增 12 项，当前 P5 共 **58 项**（14 合并、15 门槛、29 流程），全套 **242 项通过**；用户个人阅读与正式阶段验收另行记录。
+
+审核修复：目标权重在受控写入后记录版本与字节摘要，防止前向意外修改被误接受；合并计算同时保留 Q/R 和 W_b 的精度，目标层共用同一事实数 N。公式（17）的分子分母使用同一尺度计算，避免范数或异号差值上溢，仍为相对最初 W_0 的净变化。回退失败保留原始异常与恢复错误，不误报恢复成功。模型重载额外核对完整目标白名单、试步顺序和独立门槛、α/增量文件与公式（15），前向后复查权重/参数/缓冲区及所有来源。两个冒烟配置均在第一次试步前落盘。算法公式、KL 方向、α 顺序、参数与容差不变。
+
+审核后真实复验另存同轮 `p5_smoke_review_v2/p5_acceptance_report.json`，status=passed：仍接受 α=0.5，F_dev=`13.4479265213`、G=`7.2084367e-5`，稳定 U=`0.012271586977127007`；与旧 U 仅差浮点舍入。强制拒绝恢复、版本 2 的白名单/实际公式/前向后来源校验及模型重载全部通过。新旧实际权重文件 SHA-256 均为 `17fd3fce6350f12cc7c261a68d8014e6a546176bad53906ba4dc41168ee5ebbc`，原 `p5_smoke/` 和 P1～P4 保留；正式数据及真实多事实/多层验收仍待完成。
+
+2026-10-23 验证：WSL `mdlm` 默认线程下全套 **230 项通过**，语法、两个 CLI 和 diff 检查通过。真实 LLaDA 第 0 层运行的总报告为 `runs/example_only_p2_keep_20261023T063109Z_9628d2ee/round_0/p5_smoke/p5_acceptance_report.json`，status=passed。配置试步 α=1 因合并 logits 超过预定等价容差被拒绝，随后 α=0.5 通过：F_dev `14.252653→13.447927`，G_dev=`7.20844e-5`，U=`0.01227159`；目标层输出/logits 最大绝对差分别 `0.0625/0.125`（bfloat16，按预定 atol/rtol 逐元素核对）。强制拒绝实验所有试步均拒绝并完整恢复基准；实际模型从磁盘重载后的前向通过。共三次顺序加载本地模型，无优化反向；原 P1～P4 产物保留。示例继续 `p5_stage_complete=false`，不能视为正式编辑效果或独立自由回答正确率。
 
 依赖选择参考：[LLaDA 官方仓库](https://github.com/ML-GSAI/LLaDA/blob/main/README.md)、[PyTorch 官方历史版本安装页](https://docs.pytorch.org/get-started/previous-versions/)、[EasyEdit 当前依赖清单](https://github.com/zjunlp/EasyEdit/blob/main/requirements.txt)、[Safetensors 文档](https://huggingface.co/docs/safetensors/index)。
 

@@ -75,6 +75,10 @@ class ModelAdapter(ABC):
     def prepare_edit_input(self, case: dict, probe_id: str) -> tuple[MaskedEditInput, EditTarget]:
         raise NotImplementedError
 
+    def prepare_development_input(self, case: dict, probe_id: str) -> tuple[MaskedEditInput, EditTarget]:
+        """Fixed short-answer diagnostic; references remain outside model-facing tokens."""
+        raise NotImplementedError("development probe alignment is unavailable for this adapter")
+
     @abstractmethod
     def forward_with_capture(self, model: Any, model_input: MaskedEditInput) -> ForwardCapture:
         raise NotImplementedError

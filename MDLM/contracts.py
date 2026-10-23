@@ -265,6 +265,70 @@ class WritebackConfig:
         return asdict(self)
 
 
+MERGED_MODEL_VERSION = "p5.merged_model.2"
+DEVELOPMENT_KEEP_VERSION = "p5.keep_development.1"
+
+
+@dataclass(frozen=True)
+class AcceptanceConfig:
+    """Freeze formulas (15)–(18) and development inputs before any trial."""
+
+    dev_edit_file: str
+    dev_edit_probes: tuple[FactSelection, ...]
+    dev_keep_file: str
+    reference_model_path: str
+    reference_model_revision: str
+    reference_tokenizer_revision: str
+    alphas: tuple[float, ...] = (1.0, 0.5, 0.25)
+    delta: float = 0.001
+    tau_g: float = 0.05
+    tau_u: float = 0.05
+    epsilon: float = 1e-12
+    compute_dtype: str = "float32"
+    equivalence_atol: float = 0.125
+    equivalence_rtol: float = 0.02
+    chunk_size: int = 256
+    edit_protocol: str = "full_mask_mean_fact_probe_token_v1"
+    allow_example_only: bool = False
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "AcceptanceConfig":
+        with Path(path).open(encoding="utf-8") as stream:
+            return cls.from_record(json.load(stream))
+
+    @classmethod
+    def from_record(cls, values: dict) -> "AcceptanceConfig":
+        values = dict(values)
+        values["dev_edit_probes"] = tuple(FactSelection(**item) for item in values["dev_edit_probes"])
+        values["alphas"] = tuple(values.get("alphas", cls.alphas))
+        config = cls(**values)
+        config.check()
+        return config
+
+    def check(self) -> None:
+        if not all(isinstance(value, str) and value for value in (
+            self.dev_edit_file, self.dev_keep_file, self.reference_model_path,
+            self.reference_model_revision, self.reference_tokenizer_revision
+        )) or not self.dev_edit_probes:
+            raise ValueError("P5 requires explicit development inputs and original theta_0 identity")
+        if not self.alphas or any(isinstance(a, bool) or not isinstance(a, (int, float))
+                                 or not math.isfinite(a) or a <= 0 for a in self.alphas):
+            raise ValueError("P5 requires a finite ordered sequence of positive common alphas")
+        for name in ("delta", "tau_g", "tau_u", "epsilon", "equivalence_atol", "equivalence_rtol"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"P5 {name} must be finite and nonnegative")
+        if self.delta == 0 or self.epsilon == 0:
+            raise ValueError("P5 delta and epsilon must be positive")
+        if self.compute_dtype not in ("float32", "float64") or type(self.chunk_size) is not int or self.chunk_size < 1:
+            raise ValueError("P5 requires float32/float64 merge arithmetic and positive chunk_size")
+        if self.edit_protocol != "full_mask_mean_fact_probe_token_v1" or type(self.allow_example_only) is not bool:
+            raise ValueError("unsupported P5 development protocol or example permission")
+
+    def as_record(self) -> dict:
+        return asdict(self)
+
+
 @dataclass(frozen=True)
 class ResidualOptimizationConfig:
     """Formula (10): explicit finite budget; rho penalizes R, independently of lambda."""
