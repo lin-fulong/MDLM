@@ -1,6 +1,6 @@
 # MDLM 扩散知识编辑项目
 
-本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。P0 模型与数据接口、P1 固定状态与监督、P2 的 K/C 提取和统一验收、P3 固定 Q 求解已实现，并取得真实 LLaDA 单案例的技术验收证据。正式数据、保持配方、多事实/多层验收和 P4～P6 编辑闭环仍待完成。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
+本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。P0 模型与数据接口、P1 固定状态与监督、P2 的 K/C 提取和统一验收、P3 固定 Q、P4 真实候选前向与 R 联合优化已实现，并取得真实 LLaDA 单案例的技术验收证据。正式数据、保持配方、多事实/多层验收和 P5/P6 编辑闭环仍待完成。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
 
 ## 基础扩散模型
 
@@ -141,7 +141,7 @@ K 产物写入同轮的 `matrices/reference_keys/`：`keys.safetensors` 以完�
 
 2026-10-22 已完成 K 的代码审核：公式（4）的计算逻辑符合方案；修复 P1 覆盖报告的重放事实数、logits 重放数和示例数未与采集报告交叉核对的问题。修复不改变 K 数值计算，也不新增输入数据质量校验。已有真实 P1 产物通过新检查；本次审核未重跑 8B，沿用下方已保存的单案例实机证据。
 
-K、下节的 C、P2 统一验收和 P3 固定 Q 求解已实现；P4～P6 尚未实现。
+K、下节的 C、P2 统一验收、P3 固定 Q 和 P4 残差联合优化已实现；P5/P6 尚未实现。
 
 2026-10-22 实机证据：`runs/example_only_p2_keys_20261022_review2/round_0/p2_keys_acceptance_report.json` 为 `passed`。第 0 层 K 为 `[12288, 1]`，原始捕获为 bfloat16、存储为 float32；初态 logits 与 P1 一致，重复捕获最大绝对差为 0，文件摘要与保存读取通过。P1 的 3 个前向前状态中保留 1 个兼容初态、诊断记录 2 个冲突状态，权重和为 1。首次运行 `review1` 的挂载盘重命名后即时读取失败已修复，失败报告原样保留。`runs/` 由 `.gitignore` 排除，仅本机保留实验产物。
 
@@ -227,7 +227,7 @@ python -u -m util.solve_writeback_factor runs/your_run/round_0/p1 --config confi
 
 P3 只读取已验收的状态和矩阵产物，不加载 8B 权重，不执行模型前向。`ridge_by_layer` 必须与 P2 目标层完整对应；示例矩阵需要配置明确 `allow_example_only=true`。正式输入要求 P2 阶段完成；示例输出仍保持 `example_only=true`、`p3_stage_complete=false`。已有成功或失败目录不覆盖，重复实验应在新运行目录执行。
 
-产物位于 `matrices/writeback_factors/`：逐层 `q_layer_<n>.safetensors`、版本 `p3.writeback_factor.2` 的 `manifest.json` 和 `qa_report.json`。记录同轮来源摘要、事实顺序、模型基准、λ、dtype、H 尺度、Cholesky 诊断、计算/保存后的线性系统与转置正规方程残差、耗时、进程内存峰值及失败原因。Q 在后续 P4 中固定；当前尚未优化 R 或写回模型权重。版本 1 的历史产物保持原样，其报告没有新增的转置正规方程证据。
+产物位于 `matrices/writeback_factors/`：逐层 `q_layer_<n>.safetensors`、版本 `p3.writeback_factor.2` 的 `manifest.json` 和 `qa_report.json`。记录同轮来源摘要、事实顺序、模型基准、λ、dtype、H 尺度、Cholesky 诊断、计算/保存后的线性系统与转置正规方程残差、耗时、进程内存峰值及失败原因。Q 在 P4 中固定，P3 不优化 R。版本 1 的历史产物保持原样，其报告没有新增的转置正规方程证据；P4 会用原始 K/C 重新核对旧 Q 的双侧保存残差。
 
 2026-10-23 复用 `runs/example_only_p2_keep_20261023T063109Z_9628d2ee/round_0/` 的真实 P2 产物，P3 报告 `p3_writeback_acceptance_report.json` 为 passed。第 0 层 Q 为 `[1,12288]`，λ=`0.01`，求解相对残差约 `8.78e-16`，float32 保存后约 `1.81e-9`，磁盘往返一致。16 CPU 线程下求解约 3.37 秒，进程峰值约 4.53 GiB；该资源记录仅代表本机本次运行。结果仍为人工案例技术验收。
 
@@ -240,6 +240,52 @@ python -m unittest tests.test_writeback_math tests.test_writeback_pipeline -v
 ```
 
 阅读顺序：`WritebackConfig` 与示例配置 → `solve_writeback_factor/relative_residual` → 数学测试 → `load_matrix_bundle/solve_run` → P3 冒烟入口与流水线测试。小例验证 `RQ` 满足公式（7）及公式（6）的唯一最小值；`QK` 一般不等于单位阵。
+
+## P4 真实候选前向与多层 R 联合优化：公式（10）～（12）
+
+`MDLM/candidate.py` 冻结基准模型参数，在每个选定线性层的全部实际调用位置加入 `R(Qk)`，后层 k 由同一次候选网络实时计算。Q 使用 P3 保存精度，`residual_dtype` 必须与其一致；R 从零开始。`forward_logits` 在 eval 模式下保留梯度；P0/P2 捕获接口仍用于无梯度重放。
+
+`MDLM/optimize.py` 直接使用 P1 的 `1/(N·|T_i|·|M_i,t|)` 全局位置权重，优化 `J=F+βL_keep+Σρ||R||²/2`。每个完整步逐微批累积数据梯度，正则仅求导一次；Adam 不带 weight decay，也不自动更改预算或正则系数。只在冻结检查点中选择有限、非零且 `J<J(0)` 的最佳候选，保存同一步的 R 和优化器状态。无合格候选则输出 `rejected/no_candidate`，不发布 R。
+
+已有同轮 P1、P2-QA 和 P3 complete 产物、且该轮尚无 P4 输出时执行：
+
+```bash
+python -u -m util.smoke_p4_candidate --p1-dir runs/your_new_run/round_0/p1
+# 多层或正式配置：rho_by_layer 必须完整对应 P3 层名
+python -u -m util.optimize_residuals runs/your_new_run/round_0/p1 --config configs/your_p4_config.json
+```
+
+以上两条是同一任务的两种入口，选择其一。示例 `configs/p4_example_only.json` 选择第 0 层、ρ=0.001、β=0、20 步、检查点 1/5/10/20；这些参数只用于技术联调。运行会真实加载 LLaDA 并执行反向传播，需要模型层常驻 CPU/GPU；推理专用 CPU/disk offload 会被明确拒绝，避免其 `no_grad` 包装切断跨层梯度。保持训练关闭时不加载 theta_0；P5 的开发保持门槛仍须执行。
+
+启用保持训练时，设置 β>0，并显式配置 `keep_train_file`、`reference_model_path`、`reference_model_revision` 和 `reference_tokenizer_revision`。参考必须是最初的 theta_0，不能以本轮 theta_b 自动替代。保持训练文件使用独立的冻结 token 合同：
+
+```text
+artifact_version: "p4.keep_training.1"
+purpose: "keep_train"
+example_only: true/false
+inputs: [{input: {input_ids, attention_mask, mask_positions}, positions, weights}, ...]
+```
+
+`positions/weights` 逐项对应，权重非负且全局和为 1；token IDs 属于冻结 Tokenizer，不含编辑目标监督字段。训练、开发、独立测试用途由运行前独立审核确定，算法不执行数据质量或跨划分泄漏扫描。代码只读取指定训练输入，用 theta_0 计算完整词表参考 log-probabilities 并保存，然后释放参考模型，再加载候选模型；KL 方向为 `theta_0 || candidate`。原案例 JSON 结构不变，不自动复用 locality 或 C 配方作为训练/开发输入。
+
+输出在同轮 `residuals/`：当前版本 `p4.residual_candidate.2` 的 `manifest.json`、`optimization_report.json`、合格候选的 `residuals.safetensors` 和 `optimizer_state.pt`；β>0 时另有 `theta0_keep_log_probs.safetensors`。报告记录来源、事实/层序、有效监督数、各项损失、梯度与 R/RQ 范数、资源、保存读回及失败阶段。R 和 Adam 的步数/矩/参数组均须读回一致；模型、Tokenizer、theta_0 文件及参考缓存结束时复查原始摘要。入口总报告为 `p4_candidate_acceptance_report.json`。旧成功/失败目录均不覆盖；重复同轮实验可在直接入口指定新的 `--output-dir`，原版本 1 产物保留。P4 不合并权重。
+
+2026-10-23 真实单案例证据：`runs/example_only_p2_keep_20261023T063109Z_9628d2ee/round_0/p4_candidate_acceptance_report.json` 为 passed。LLaDA-8B-Instruct 第 0 层、1 个兼容状态、3 个监督位置，β=0，20 步后 `J: 14.219749 → 11.173778`，选中第 20 步，R 为 `[4096,1]`，非零有限，基准和 Q 未改变、磁盘读回一致。本次加载模型 1 次，28 次前向、20 次反向；CUDA 分配峰值约 15.06 GiB，仅代表本机短输入实验。示例继续标记 `p4_stage_complete=false`，不表示目标事实生成正确、P5 接受或正式实验有效。真实多事实/多层和 β>0 训练路径的 8B 验收仍待补。
+
+```bash
+python -m unittest tests.test_candidate tests.test_optimize tests.test_residual_pipeline -v
+python -m unittest discover -s tests
+```
+
+P4 开发时新增 35 项，全套 167 项通过；本轮专项审核再新增 17 项，P4 共 52 项（12 候选、18 优化、22 产物），默认 16 CPU 线程下全套 **184 项通过**。审核修复目标权重与未选中参数的共享遗漏、复合推理 hook 与数据梯度断链、极端尺度正则/范数失真、模型/参考来源复查和优化器状态读回遗漏，并使候选清理可重复调用、逐模块恢复模式。正则以 float64 的等价 `||sqrt(ρ/2)R||²` 计算，范数复用 P3 的稳定缩放实现；系数、三级权重、KL 方向、公式和优化预算不变。关键反例先复现再修复，覆盖单精度下溢、极端正则值及梯度、被正则掩盖的断链、来源/缓存/配置变化、损坏的优化器状态和失败入口。
+
+审核后真实复验另存于同轮 `residuals_review_v2/`，独立 `p4_candidate_review_report.json` 为 passed：同一配置 20 步后 `J:14.2197494507→11.1737776872`，基准/Q 未变、优化器读回通过。R 与旧文件最大差 `2.98e-8`，编辑损失一致；原版本 1 产物原样保留。此结果仍为构造案例技术验收。对同轮产物复验时，可用新目录：
+
+```bash
+python -u -m util.optimize_residuals runs/your_run/round_0/p1 --config configs/p4_example_only.json --output-dir runs/your_run/round_0/residuals_review_v2
+```
+
+此前额外强制单线程运行时，既有 C 的 float32 大批数值 QA 测试出现线程相关差异，默认线程复核通过；此限制仍待专项数值核验，本轮未放宽容差或修改 C 算法。
 
 依赖选择参考：[LLaDA 官方仓库](https://github.com/ML-GSAI/LLaDA/blob/main/README.md)、[PyTorch 官方历史版本安装页](https://docs.pytorch.org/get-started/previous-versions/)、[EasyEdit 当前依赖清单](https://github.com/zjunlp/EasyEdit/blob/main/requirements.txt)、[Safetensors 文档](https://huggingface.co/docs/safetensors/index)。
 

@@ -15,6 +15,8 @@ KEEP_INPUTS_VERSION = "p2.keep_inputs.1"
 KEEP_STATISTICS_VERSION = "p2.keep_statistics.1"
 MATRIX_BUNDLE_VERSION = "p2.matrix_bundle.1"
 WRITEBACK_FACTOR_VERSION = "p3.writeback_factor.2"
+RESIDUAL_CANDIDATE_VERSION = "p4.residual_candidate.2"
+KEEP_TRAINING_VERSION = "p4.keep_training.1"
 
 
 def config_digest(values: dict) -> str:
@@ -256,6 +258,70 @@ class WritebackConfig:
             raise ValueError("writeback residual_epsilon must be positive")
         if type(self.chunk_size) is not int or self.chunk_size < 1:
             raise ValueError("writeback chunk_size must be a positive integer")
+        if type(self.allow_example_only) is not bool:
+            raise ValueError("allow_example_only must be boolean")
+
+    def as_record(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ResidualOptimizationConfig:
+    """Formula (10): explicit finite budget; rho penalizes R, independently of lambda."""
+
+    rho_by_layer: dict[str, float]
+    beta: float = 0.0
+    learning_rate: float = 0.01
+    max_steps: int = 20
+    checkpoints: tuple[int, ...] = (1, 5, 10, 20)
+    microbatch_size: int = 1
+    residual_dtype: str = "float32"
+    seed: int = 2026
+    optimizer: str = "adam"
+    equivalence_atol: float = 0.01
+    equivalence_rtol: float = 0.001
+    keep_train_file: str | None = None
+    reference_model_path: str | None = None
+    reference_model_revision: str | None = None
+    reference_tokenizer_revision: str | None = None
+    allow_example_only: bool = False
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "ResidualOptimizationConfig":
+        with Path(path).open(encoding="utf-8") as stream:
+            values = json.load(stream)
+        values["checkpoints"] = tuple(values.get("checkpoints", cls.checkpoints))
+        config = cls(**values)
+        config.check()
+        return config
+
+    def check(self) -> None:
+        if not isinstance(self.rho_by_layer, dict) or not self.rho_by_layer or any(
+            not isinstance(name, str) or not name or isinstance(value, bool)
+            or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+            for name, value in self.rho_by_layer.items()
+        ):
+            raise ValueError("one finite positive rho is required per target layer")
+        for name in ("beta", "learning_rate", "equivalence_atol", "equivalence_rtol"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"P4 {name} must be finite and nonnegative")
+        if self.learning_rate == 0 or self.optimizer != "adam":
+            raise ValueError("P4 uses explicitly configured Adam with a positive learning rate and no weight decay")
+        if any(type(value) is not int or value < 1 for value in (self.max_steps, self.microbatch_size)):
+            raise ValueError("P4 step and microbatch sizes must be positive integers")
+        if not self.checkpoints or tuple(sorted(set(self.checkpoints))) != self.checkpoints or any(
+            type(step) is not int or not 1 <= step <= self.max_steps for step in self.checkpoints
+        ) or self.checkpoints[-1] != self.max_steps:
+            raise ValueError("P4 checkpoints must be ordered unique steps including max_steps")
+        if self.residual_dtype not in ("float32", "float64") or type(self.seed) is not int or self.seed < 0:
+            raise ValueError("P4 requires float32/float64 residuals and a nonnegative integer seed")
+        reference = (self.keep_train_file, self.reference_model_path,
+                     self.reference_model_revision, self.reference_tokenizer_revision)
+        if self.beta > 0 and not all(isinstance(value, str) and value for value in reference):
+            raise ValueError("beta>0 requires explicit keep-training inputs and original theta_0 identity")
+        if self.beta == 0 and any(value is not None for value in reference):
+            raise ValueError("beta=0 must leave keep-training and theta_0 fields null")
         if type(self.allow_example_only) is not bool:
             raise ValueError("allow_example_only must be boolean")
 

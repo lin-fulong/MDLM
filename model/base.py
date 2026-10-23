@@ -85,6 +85,12 @@ class ModelAdapter(ABC):
         """Return each selected module's actual inputs as [position, input feature]."""
         raise NotImplementedError("preservation-input capture is unavailable for this model adapter")
 
+    def forward_logits(
+        self, model: Any, model_input: MaskedEditInput | KeepModelInput, positions: tuple[int, ...]
+    ) -> Any:
+        """Selected full-vocabulary logits, preserving the candidate's autograd graph."""
+        raise NotImplementedError("differentiable candidate forward is unavailable for this adapter")
+
     @abstractmethod
     def snapshot_target_weights(self, model: Any) -> TargetWeightSnapshot:
         raise NotImplementedError

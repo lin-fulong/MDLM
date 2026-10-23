@@ -18,7 +18,7 @@ class WritebackSolveError(ValueError):
         self.diagnostics = diagnostics
 
 
-def _stable_norm(value: torch.Tensor) -> torch.Tensor:
+def stable_frobenius_norm(value: torch.Tensor) -> torch.Tensor:
     """Scale before squaring so finite small/large Frobenius norms stay representable."""
     scale = value.abs().max()
     if bool(scale == 0):
@@ -39,8 +39,8 @@ def relative_residual(keys: torch.Tensor, keep: torch.Tensor, solution: torch.Te
         rows = keep[start:end].detach().to(device=device, dtype=torch.float64)
         error = rows @ solution64 + keys64[start:end] @ small + ridge * solution64[start:end] - keys64[start:end]
         # 分块范数用 hypot 合并，避免平方和下溢为 0 或溢出为 inf。
-        error_norm = torch.hypot(error_norm, _stable_norm(error))
-    return float(error_norm / _stable_norm(keys64).clamp_min(epsilon))
+        error_norm = torch.hypot(error_norm, stable_frobenius_norm(error))
+    return float(error_norm / stable_frobenius_norm(keys64).clamp_min(epsilon))
 
 
 @torch.no_grad()
@@ -90,7 +90,7 @@ def solve_writeback_factor(keys: torch.Tensor, keep: torch.Tensor, ridge: float,
             rows = system[start:start + settings.chunk_size]
             require(bool(torch.isfinite(rows).all()), "H contains nonfinite values")
             infinity_norm = max(infinity_norm, float(rows.double().abs().sum(dim=1).max()))
-        key_norm = float(_stable_norm(values.double()))
+        key_norm = float(stable_frobenius_norm(values.double()))
         require(math.isfinite(infinity_norm) and math.isfinite(key_norm), "H/K scale exceeds diagnostic precision")
         report.update({"h_infinity_norm": infinity_norm, "ridge_to_h_scale": ridge / max(infinity_norm, ridge),
                        "h_diagonal_min": float(system.diagonal().min()),

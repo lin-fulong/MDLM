@@ -262,3 +262,22 @@ def save_supervision(path: str | Path, facts: list[dict]) -> None:
 def load_supervision(path: str | Path) -> list[dict]:
     with Path(path).open(encoding="utf-8") as stream:
         return [json.loads(line) for line in stream if line.strip()]
+
+
+@dataclass(frozen=True)
+class EditTrainingExample:
+    case_id: str
+    model_input: MaskedEditInput
+    positions: tuple[int, ...]
+    targets: tuple[int, ...]
+    weights: tuple[float, ...]
+
+
+def edit_training_examples(facts: list[dict]) -> list[EditTrainingExample]:
+    """Reuse P1 formula (3) weights unchanged; never insert targets into inputs."""
+    return [EditTrainingExample(
+        fact["case_id"], input_from_record(state["input"]),
+        tuple(term["position"] for term in state["supervision"]),
+        tuple(term["target_token_id"] for term in state["supervision"]),
+        tuple(term["weight"] for term in state["supervision"]),
+    ) for fact in facts for state in fact["states"]]

@@ -251,6 +251,34 @@ class LLaDA8BInstructAdapter(ModelAdapter):
             for handle in handles:
                 handle.remove()
 
+    def forward_logits(
+        self, model: Any, model_input: MaskedEditInput | KeepModelInput, positions: tuple[int, ...]
+    ):
+        """P4: eval-mode forward without inference_mode, detach, or target injection."""
+        import torch
+
+        length = len(model_input.input_ids)
+        if model.training or getattr(model.config, "mask_token_id", None) != self.mask_token_id:
+            raise ValueError("P4 requires eval mode and the frozen mask token identity")
+        if not 0 < length <= model.config.max_sequence_length or len(model_input.attention_mask) != length:
+            raise ValueError("P4 input length differs from the model contract")
+        if any(value != 1 for value in model_input.attention_mask) or not positions or any(
+            type(position) is not int or not 0 <= position < length for position in positions
+        ):
+            raise ValueError("P4 requires all-ones attention and in-range readout positions")
+        device = model.get_input_embeddings().weight.device
+        logits = model(
+            input_ids=torch.tensor([model_input.input_ids], dtype=torch.long, device=device),
+            attention_mask=torch.tensor([model_input.attention_mask], dtype=torch.long, device=device),
+            use_cache=False, return_dict=True,
+        ).logits
+        if logits.ndim != 3 or logits.shape[:2] != (1, length):
+            raise ValueError("unexpected P4 logits shape")
+        selected = logits[0, list(positions)]
+        if not torch.isfinite(selected).all():
+            raise FloatingPointError("nonfinite P4 readout logits")
+        return selected
+
     def sample_denoise(
         self, model: Any, model_input: MaskedEditInput, *, steps: int, temperature: float, seed: int
     ) -> DenoiseTrace:
