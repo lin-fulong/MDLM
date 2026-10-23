@@ -1,6 +1,6 @@
 # MDLM 扩散知识编辑项目
 
-本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。P0 数据与 LLaDA 适配、P1 固定状态与监督、P2 的 K/C 提取已实现；真实 LLaDA 的单编辑案例和独立构造保持输入已通过技术联调。正式数据、正式保持统计配方、完整 P2 产物验收及后续编辑仍待完成。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
+本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。P0 数据与 LLaDA 适配、P1 固定状态与监督、P2 的 K/C 提取及统一产物验收已实现；真实 LLaDA 的单编辑案例和独立构造保持输入已通过技术验收。正式数据、正式保持统计配方、多事实/多层验收及后续编辑仍待完成。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
 
 ## 基础扩散模型
 
@@ -141,7 +141,7 @@ K 产物写入同轮的 `matrices/reference_keys/`：`keys.safetensors` 以完�
 
 2026-10-22 已完成 K 的代码审核：公式（4）的计算逻辑符合方案；修复 P1 覆盖报告的重放事实数、logits 重放数和示例数未与采集报告交叉核对的问题。修复不改变 K 数值计算，也不新增输入数据质量校验。已有真实 P1 产物通过新检查；本次审核未重跑 8B，沿用下方已保存的单案例实机证据。
 
-K 和下节的 C 已实现；完整 P2 产物包验收仍待开发，P3～P5 尚未实现。
+K、下节的 C 及 P2 统一产物验收已实现；P3～P5 尚未实现。
 
 2026-10-22 实机证据：`runs/example_only_p2_keys_20261022_review2/round_0/p2_keys_acceptance_report.json` 为 `passed`。第 0 层 K 为 `[12288, 1]`，原始捕获为 bfloat16、存储为 float32；初态 logits 与 P1 一致，重复捕获最大绝对差为 0，文件摘要与保存读取通过。P1 的 3 个前向前状态中保留 1 个兼容初态、诊断记录 2 个冲突状态，权重和为 1。首次运行 `review1` 的挂载盘重命名后即时读取失败已修复，失败报告原样保留。`runs/` 由 `.gitignore` 排除，仅本机保留实验产物。
 
@@ -163,15 +163,15 @@ C_\ell=\sum_m\omega_{\ell,m}u_{\ell,m}u_{\ell,m}^{\top},\qquad\omega_{\ell,m}\ge
 
 ### 启动命令
 
-激活 `mdlm` 后，在项目根目录一条命令新建独立运行，依次执行真实 P0/P1/K/C：
+激活 `mdlm` 后，在项目根目录一条命令新建独立运行，依次执行真实 P0/P1/K/C 和矩阵包验收：
 
 ```bash
 python -m util.smoke_p2_keep --layer 0
 ```
 
-该入口依次执行 **P0 → P1 → P2-K → P2-C**，全部调用本地 LLaDA-8B；任一阶段失败立即停止。`p2_keep_acceptance_report.json` 汇总执行顺序、上游报告路径/摘要和 C 结果。它测试当前已实现的正常主流程，不包含尚未开发的 P2-03、Q 求解及知识编辑优化。启动后自动生成新运行目录，本轮脚本准备未代替实验者执行真实模型实验。
+该入口依次执行 **P0 → P1 → P2-K → P2-C → P2-QA**，全部调用本地 LLaDA-8B；任一阶段失败立即停止。`p2_keep_acceptance_report.json` 汇总各阶段结果。P2-QA 重新加载模型、重放 P1 初态及保持输入，再逐层复算 C 的 trace、小坐标外积和独立投影二阶矩；Q 求解及知识编辑优化仍待开发。
 
-当前示例共加载模型 4 次、执行 15 次前向：上游 P0/P1/K 为 10 次，C 为 1 次 P1 初态重放加 2 条保持输入各 2 次前向。第 0 层仅为示例选择。若已有完整 P1/K，可复用该轮、仅加载一次模型提取 C：
+当前单层示例共加载模型 5 次、执行 18 次前向：上游 P0/P1/K 为 10 次，C 为 5 次，P2-QA 为 1 次 P1 初态和 2 次保持输入重放。第 0 层仅为示例选择。若已有完整 P1/K，可复用该轮提取 C 并验收：
 
 ```bash
 python -m util.smoke_p2_keep --p1-dir runs/your_run/round_0/p1
@@ -183,10 +183,16 @@ python -m util.smoke_p2_keep --p1-dir runs/your_run/round_0/p1
 python -m util.extract_keep_statistics runs/your_run/round_0/p1 runs/your_run/round_0/keep_inputs.json --config configs/your_keep_config.json
 ```
 
-仅运行 C 的轻量测试，不加载 8B：
+已有同轮 P1/K/C 且尚无 `matrices/validation/` 时，可单独验收，无须重新提取矩阵：
 
 ```bash
-python -m unittest tests.test_keep_capture tests.test_keep_statistics_math tests.test_keep_statistics_pipeline tests.test_p2_keep_smoke -v
+python -m util.validate_matrix_artifacts runs/your_run/round_0/p1
+```
+
+仅运行 P2-QA 的轻量测试，不加载 8B：
+
+```bash
+python -m unittest tests.test_matrix_artifacts tests.test_p2_keep_smoke -v
 ```
 
 ### 产物与验证范围
@@ -197,7 +203,9 @@ python -m unittest tests.test_keep_capture tests.test_keep_statistics_math tests
 
 本轮 C 代码审核已完成：修复极端尺度的中间溢出/下溢、近零项误拒及失败报告非有限值；原始示例配方在分词前后核对摘要，避免旧输入绑定新来源；磁盘读回显式核对 dtype 和数值，防止清单精度与文件不符。新增 12 项回归，先复现缺陷再修复。公式（5）、非负权重及总尺度不变，不恢复数据集运行时质量检查。本次只运行 CPU 轻量回归，未重跑 8B；下述实机记录保留为此前示例证据。
 
-2026-10-22 已复用上述真实 P1/K 运行执行 C。`runs/example_only_p2_keys_20261022_review2/round_0/p2_keep_acceptance_report.json` 为 `passed`：第 0 层 C 为 `[12288,12288]`，捕获 bfloat16、累计 float64、保存 float32；4 个保持位置中 3 个正权重、1 个零权重，总量 4。共 5 次真实前向，P1 初态 logits 一致，保持输入重复捕获差值均为 0；对称差为 0，trace 为约 12.093753，数值诊断及磁盘往返全部通过。结果明确标记 `example_only=true`、`formal_dataset_acceptance=false`、`p2_stage_complete=false`。正式保持配方、多层真实运行和 P2-03 仍需完成。
+2026-10-22 已复用上述真实 P1/K 运行执行 C。`runs/example_only_p2_keys_20261022_review2/round_0/p2_keep_acceptance_report.json` 为 `passed`：第 0 层 C 为 `[12288,12288]`，捕获 bfloat16、累计 float64、保存 float32；4 个保持位置中 3 个正权重、1 个零权重，总量 4。共 5 次真实前向，P1 初态 logits 一致，保持输入重复捕获差值均为 0；对称差为 0，trace 为约 12.093753，数值诊断及磁盘往返全部通过。
+
+2026-10-23 对 `runs/example_only_p2_keep_20261023T063109Z_9628d2ee/round_0/` 的真实 P1/K/C 产物执行 P2-03，`matrices/validation/qa_report.json` 为 `complete`。额外 3 次真实前向通过 K 初态和两条保持输入重放；第 0 层 C 的对称差为 0，独立外积块最大差约 `7.28e-12`，独立投影二阶矩最大差约 `3.62e-11`。验收报告明确 `example_only=true`、`p2_stage_complete=false`、`full_spectrum_checked=false`。正式保持配方、多事实/多层运行与正式验收仍待完成。
 
 依赖选择参考：[LLaDA 官方仓库](https://github.com/ML-GSAI/LLaDA/blob/main/README.md)、[PyTorch 官方历史版本安装页](https://docs.pytorch.org/get-started/previous-versions/)、[EasyEdit 当前依赖清单](https://github.com/zjunlp/EasyEdit/blob/main/requirements.txt)、[Safetensors 文档](https://huggingface.co/docs/safetensors/index)。
 
