@@ -15,7 +15,7 @@
 
 ## 依赖环境
 
-当前以 **Python 3.10 + LLaDA 8B 的基础适配路径**作为依赖基线。`requirement.txt` 只列现阶段确定的直接依赖：PyTorch 用于模型前向、梯度和矩阵求解；Transformers 用于模型及 Tokenizer 加载；Accelerate 用于大模型加载/设备管理；NumPy、SciPy 用于数据和数值校验；Safetensors 用于模型/矩阵张量读写；tqdm 用于长时间提取任务的进度显示。LLaDA 官方示例指定 `transformers==4.38.2`，所以暂不照搬 EasyEdit 当前的 Transformers 5.x 依赖组合。本机 WSL 环境已通过真实 8B 单案例联调；这份依赖清单尚不代表后续训练和完整实验已验收。
+当前以 **WSL/Linux + Python 3.10 + LLaDA-8B-Instruct 的 P0～P5 实现**作为依赖基线。`requirement.txt` 固定所需运行依赖及部分关键间接依赖：PyTorch 用于模型前向、梯度和矩阵求解；Transformers 用于模型及 Tokenizer 加载；Accelerate 支持 `device_map` 加载；Tokenizers 固定为当前已验证的 `0.15.2`，便于复现 token 对齐；NumPy 支持张量摘要的 `.numpy()` 字节转换；Safetensors 用于模型和算法张量产物读写；tqdm 是 Transformers 显示权重分片加载进度的间接依赖。矩阵求解使用 `torch.linalg`，移除未使用的 SciPy。保留已通过本机真实 8B 单案例联调的 `transformers==4.38.2` 等版本；正式多事实、多层实验仍需另行验收。本文件不是完整环境锁文件，实验环境另存 `pip freeze`。
 
 在项目根目录创建 Conda 环境：
 
@@ -40,12 +40,12 @@ python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/
 ```bash
 python -m pip install -r requirement.txt
 python -m pip check
-python -c "import torch, transformers, accelerate, numpy, scipy, safetensors, tqdm; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'available:', torch.cuda.is_available()); print('transformers:', transformers.__version__)"
+python -c "import torch, transformers, accelerate, tokenizers, numpy, safetensors, tqdm; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'available:', torch.cuda.is_available()); print('transformers:', transformers.__version__, 'tokenizers:', tokenizers.__version__)"
 ```
 
 `requirement.txt` 中的 `torch==2.5.1` 会沿用先安装的同版 CPU/CUDA wheel；若直接运行 `pip install -r requirement.txt`，pip 按当前包索引选取 wheel，未必符合目标设备。8B 模型的实际可运行性仍取决于显存、模型修订、驱动和后续适配代码。首次 P0 真实前向通过后，应保存 `python -m pip freeze` 输出及模型/Tokenizer 修订，作为实验环境记录。
 
-暂不加入 `datasets`、`peft`、`vllm`、`flash-attn`、外部裁判 SDK、`torchvision` 或 `torchaudio`：当前尚未确定数据读取方式、加速方案和裁判提供方，算法主线也没有图像或音频需求。选定首个数据集和模型后，只添加实际用到的包并核验其版本；更换为其他扩散模型时先验证其 Transformers 版本要求。
+当前 JSON/JSONL 读取和测试分别使用标准库 `json` 与 `unittest`。`datasets`、`peft`、`vllm`、`flash-attn`、外部裁判 SDK、`torchvision`、`torchaudio` 和 `pytest` 尚非现有代码的必需依赖，待实际接入时核验版本。更换为其他三个扩散模型时须分别验证兼容环境，不能直接视为当前依赖基线已支持。
 
 ## P0 人工案例接口检查
 

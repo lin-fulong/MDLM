@@ -1,10 +1,24 @@
-# Python 3.10 baseline. Direct dependencies for the first LLaDA-compatible implementation.
-# Select the PyTorch CPU/CUDA wheel for the target machine before installing this file.
+# 当前 LLaDA-8B-Instruct 的 P0～P5 依赖基线；已验证环境为 WSL/Linux + Python 3.10。
+# 安装：先选择同版 PyTorch 的 CPU/CUDA wheel，再执行 python -m pip install -r requirement.txt。
+# 本文件固定运行依赖及影响分词/加载的部分间接依赖，不是完整环境锁文件。
+
+# 模型前向、联合梯度、K/C/Q 矩阵计算及实际权重合并。
 torch==2.5.1
+
+# 本地自定义模型、Tokenizer 和 chat template；device_map 加载需要 Accelerate。
 transformers==4.38.2
 accelerate==0.34.2
+tokenizers==0.15.2
+
+# tensor_sha256 使用 Tensor.numpy() 转换原始字节；保持已验证的 NumPy 1.x 基线。
 numpy==1.26.4
-scipy==1.13.1
+
+# 模型权重及 K/C/Q/R/合并权重产物读写。
 safetensors==0.4.5
+
+# Transformers 的间接依赖，用于权重分片加载进度显示。
 tqdm==4.67.1
+
+# 矩阵求解使用 torch.linalg，无需 SciPy；测试使用标准库 unittest，无需 pytest。
+# 其他三个模型尚未适配，P6 裁判尚未实现，相关可选依赖待实际接入时确定。
 
