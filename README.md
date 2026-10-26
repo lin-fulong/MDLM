@@ -1,6 +1,6 @@
 # MDLM 扩散知识编辑项目
 
-本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。LLaDA 的 P0～P5 核心实现及相应审核已完成，并有真实单案例技术证据。全链路复查修复 C 的线程相关非对称舍入、K 精度检查及投影谱诊断的中间溢出，新增 5 项，当前全套 247 项在默认和单线程 CPU 环境下均通过。正式数据、保持配方、多事实/多层阶段验收、其他模型适配和 P6 独立生成评价待完成。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
+本项目按[完整算法逻辑](docs/最终逻辑%20V1.0.md)实现掩码扩散语言模型的事实知识编辑。LLaDA 的 P0～P5 核心实现已完成，并已接入保留测试题的短答案准确率评价。正式保持语料、多事实/多层阶段验收、其他模型适配及更完整的自由生成评价仍需继续完善。开发顺序及进度见[开发进度记录](docs/开发进度/01_开发顺序与进度记录.md)和[待办事项](docs/开发进度/02_开发待办事项.md)，代码审核见[代码审查进度](docs/开发进度/03_代码文件审查进度.md)。
 
 ## 基础扩散模型
 
@@ -48,6 +48,106 @@ python -c "import torch, transformers, accelerate, tokenizers, numpy, safetensor
 当前 JSON/JSONL 读取和测试分别使用标准库 `json` 与 `unittest`。`datasets`、`peft`、`vllm`、`flash-attn`、外部裁判 SDK、`torchvision`、`torchaudio` 和 `pytest` 尚非现有代码的必需依赖，待实际接入时核验版本。更换为其他三个扩散模型时须分别验证兼容环境，不能直接视为当前依赖基线已支持。
 
 ## P0 人工案例接口检查
+
+### P0–P5 统一算法入口
+
+项目根目录的 `main.py` 是算法入口。`--dataset` 选择本次实验的数据集，覆盖配置中的
+`dataset`；未指定时使用 `configs/full_run.json` 中的数据集。`--model-path` 可覆盖模型目录。
+JSON 中的相对路径按项目根目录解析，命令行路径按当前工作目录解析。
+
+```bash
+python -u main.py --dataset data/datasets/cases.jsonl
+```
+
+默认配置使用 `execution={"backend":"resident","device":"cuda:0"}`，P0–P5 在同一进程中执行。
+模型前向、P4 残差优化、P2 的 C 累计与数值检查、P3 的 Q 求解、P5 的 RQ 写回和参数变化计算均使用 GPU。
+非连续编辑在不同阶段和案例间复用同一份驻留模型，下一次使用前精确恢复目标层基线；
+连续模式切换到不同基线或原始参考时按需加载。原始模型文件不被改写。
+数据读取、分词、SHA256 和文件保存仍使用 CPU；同次运行内复用文件摘要，张量文件摘要还保存在
+`runs/cache/file_hashes.json`，下一次启动时核对设备、inode、大小、mtime 和 ctime，均未变化才复用。
+首次计算仍需读取权重；启动会打印初始化、模型身份检查及大文件摘要进度，避免长时间无输出。
+需要完整重读权重核验时添加 `--rehash-model`；`--no-cache` 同样绕过跨运行摘要缓存。
+矩阵精度与验收容差保持配置值，未以降低精度替代加速。阶段结束会打印耗时，结束时打印模型加载/复用次数。
+捕获前向使用 `torch.no_grad()`，使共享 RoPE 缓存可用于后续 P4 反向传播；若预热已生成
+inference tensor，安装候选分支前会在原共享字典中以普通张量替换，保持数值、精度与设备一致。
+
+可以用 `--device` 选择其他 GPU，或明确选择 CPU；指定 CUDA 时不可用或显存不足会停止，不会自动卸载到 CPU：
+
+```bash
+python -u main.py --dataset data/datasets/cases.jsonl --device cuda:0
+python -u main.py --dataset data/datasets/cases.jsonl --device cpu
+```
+
+CPU/GPU、执行后端和代码变更均参与缓存标识。首次切换 GPU 执行会生成新的算法缓存；旧运行产物保留。
+需要原有独立进程执行方式时，在自定义配置中设置 `execution.backend="subprocess"`。
+
+入口读取已审核数据，调用现有适配器选出全部 `gold_ready` 编辑事实，不再次审核数据质量。
+默认逐源案例运行，每个案例都从原始模型开始。一个源案例含多个编辑请求时联合编辑，
+避免把链式事实拆散。需要其他超参数时指定 `--config`：
+
+```bash
+python -u main.py --config configs/full_run.json --dataset data/datasets/cases.jsonl
+```
+
+显式传入 `sequential`（或 `--sequential`）时，只有通过 P5 验收的权重才导出为
+下一条事实的基线；被拒绝的事实不改变后续基线：
+
+```bash
+python -u main.py --dataset data/datasets/cases.jsonl sequential
+```
+
+每个源案例对应一轮，依次运行所有目标层的 P0、P1、P2-K、
+P2-C、P2-QA、P3、P4 和 P5。逐轮 `pipeline_report.json`、阶段日志与总
+`run_report.json` 均保留；执行错误即停止。P4 没有合格残差时记录为拒绝，继续下一案例。
+P5 `decision=accepted` 时，`editing/` 是可通过
+`MDLM.workflow.load_final_model` 加载的最终模型产物；`decision=rejected` 表示
+试步均未通过且基准已恢复。连续模式将接受的结果写到该轮 `checkpoint/`，
+只重写包含目标权重的 safetensors 分片，其余分片以硬链接复用或复制。
+最终模型路径在总报告的 `final_checkpoint_dir`。
+
+默认 `input_preparation.mode=dataset`，入口调用 `util/prepare_dataset_inputs.py`：
+
+- 从 `preservation_questions`（运行时为 `prompts.preservation`）生成保持输入。相同题目按内容分组，
+  用固定种子分配为保持统计/训练、开发保持、保留评价三种用途。默认开发和评价各占 25%，
+  其余用于 C 和可选 P4 保持训练；小样本时至少留一道统计题和一道开发题。
+- 所有回答位置均使用 mask，答案只确定短答案窗口长度。C 捕获模板末 token 和答案 mask 位置，
+  提示之间均分权重、同提示位置之间均分权重，总尺度由 `statistics_scale` 配置。
+  P4/P5 的 KL 读出权重全局归一为 1。P4 设置 `beta>0` 时自动使用生成的保持训练输入。
+- P5 的 `F_dev` 默认在当前案例的编辑题上计算短答案损失。它复用编辑题，不能作为独立泛化结果。
+  原 `independent_test_questions` 全部留在 `evaluation_inputs.json`，不参与优化和试步选择。
+- 自动保存实际用途划分、输入 token、mask/捕获位置、权重、tokenizer 修订和数据集摘要。
+  生成互不重叠的统计/开发输入至少需要两道不同保持题。已有外部冻结输入时可设置
+  `input_preparation.mode=explicit`，填写 `keep_inputs`、`p2_keep.recipe_id` 和 P5 开发输入/探针。
+
+预处理结果保存在 `runs/cache/datasets/`，算法轮次索引在 `runs/cache/rounds/`。
+数据集内容、模型基线、tokenizer、目标层、数值配置、运行库和代码均匹配且文件摘要一致时，
+直接复用已有阶段的 P1/K/C/Q/R/P5 产物；中断后也可重新启动同一命令接续未完成阶段。
+连续模式换了基线后会重新计算对应产物。失败或损坏阶段移到原轮次的 `failed_attempts/` 后重算。
+每次实验生成新的总报告，`round_<n>_reference.json` 指向实际计算或复用的轮次目录；
+`--cache-dir` 可改变缓存目录，`--no-cache` 强制本次重新计算。
+旧的手工实验产物缺少这些缓存标识，不会自动混入新实验。
+
+只准备输入时可单独调用下列脚本（不加载 8B 模型权重）：
+
+```bash
+python -m util.prepare_dataset_inputs --dataset data/datasets/cases.jsonl --layers 0
+```
+
+入口现在会用保留的独立测试题计算编辑前后的短答案准确率，并用保持测试题计算保持准确率。
+生成时按参考答案的 token 数设置全 mask 答案窗口，温度为 0；解码后经过 Unicode、大小写和空白
+归一，再做精确匹配。这个指标知道参考答案长度，因此不是无限制自由生成准确率。
+`accuracy_report.json` 保存每道题的参考答案、模型答案、正确与否及逐轮汇总；`run_report.json`
+保存总准确率。保持题按每轮重复评估，报告同时记录唯一题数。
+已有完成的实验可以直接补算准确率，不重复 P0–P5：
+
+```bash
+python -u main.py --evaluate-run runs/<实验目录> --device cuda:0
+```
+
+显式输入模式可在配置中设置 `evaluation.inputs_file` 指向同结构的保留测试输入；未提供时报告
+`evaluation_status=unavailable`。
+`main.py` 仍拒绝 `example_only` 输入。默认目标层、优化预算和门槛都可在配置中调整，
+自动生成脚本不重新审核数据质量。
 
 `data/datasets/cases.jsonl` 使用已审核数据的原生字段，而非下文人工示例的
 `0.3-proposal` 结构。`data/readers/json_cases.py` 读取该文件时调用
