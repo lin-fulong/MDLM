@@ -49,6 +49,26 @@ python -c "import torch, transformers, accelerate, tokenizers, numpy, safetensor
 
 ## P0 人工案例接口检查
 
+`data/datasets/cases.jsonl` 使用已审核数据的原生字段，而非下文人工示例的
+`0.3-proposal` 结构。`data/readers/json_cases.py` 读取该文件时调用
+`data/readers/reviewed_cases.py`：只按现有 `gold_ready` 标记选取案例，按
+`edit_requests` 与 `edit_questions` 的顺序配对；一个编辑请求对应一个运行时事实。
+双请求案例使用原 `request_id` 作为运行时 `case_id`，并保存 `source_case_id`；
+链级测试题和保持题只挂到第一个事实，避免重复计数。适配器只转换字段，不重新审核事实质量。
+
+可为单案例联调生成独立输入（原文件不变）：
+
+```bash
+python -m data.readers.reviewed_cases data/datasets/cases.jsonl runs/cf_00001_case.json --case-id cf_00001
+python -m util.smoke_p0_llada runs/cf_00001_case.json --layer 0
+```
+
+双请求案例的 `--case-id` 请使用具体 `request_id`（如 `mq_00004:rewrite:0`）
+来生成单事实输入；不指定则生成所有已标记 `gold_ready` 的事实。输出是运行时
+P0～P5 所需的最小案例结构，不声称符合下述 `0.3-proposal` 手工质量校验结构。
+原数据没有案例级 `split`，`independent_test_questions` 是案例内测试探针，
+适配时不虚构独立案例划分。
+
 `tests/fixtures/p0_case_example.json` 是 `0.3-proposal` 结构的人工示例，`quality_control.status=example_only`，不能进入正式实验。`split=gold` 表示开发联调；同一案例中 `prompts.edit` 是编辑输入，其他 `used_for_edit=false` 的探针是开发验证题。独立测试案例使用 `split=test`。正式数据的质量和划分应在算法运行前完成审核。
 
 轻量回归检查（不加载下载的 8B 权重）：

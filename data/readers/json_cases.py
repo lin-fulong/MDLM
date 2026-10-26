@@ -15,6 +15,10 @@ def load_cases(path: str | Path) -> list[dict]:
         with path.open(encoding="utf-8") as stream:
             payload = json.load(stream)
         cases = payload if isinstance(payload, list) else [payload]
+    if cases and "edit_requests" in cases[0] and "edit_questions" in cases[0]:
+        from data.readers.reviewed_cases import adapt_reviewed_cases
+
+        return adapt_reviewed_cases(cases)
     return cases
 
 
@@ -22,9 +26,9 @@ def case_purpose(case: dict) -> str:
     """Describe the case's intended use without validating it."""
     if case["quality_control"]["status"] == "example_only":
         return "example_only"
-    if case["split"] == "test":
+    if case.get("split") == "test":
         return "independent_test"
-    if case["split"] in ("gold", "pilot", "dev"):
+    if case.get("split") in ("gold", "pilot", "dev"):
         return "development"
     return "edit"
 
@@ -36,9 +40,11 @@ def evaluation_inputs(case: dict) -> list[dict]:
         for probe in probes:
             if probe["used_for_edit"]:
                 continue
-            if case["split"] == "test":
+            if "role" in probe:
+                role = probe["role"]
+            elif case.get("split") == "test":
                 role = "independent_test"
-            elif case["split"] == "train":
+            elif case.get("split") == "train":
                 role = "edit_diagnostic"
             else:
                 role = "development_validation"
