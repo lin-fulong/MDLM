@@ -120,15 +120,15 @@ def check_matrix(name: str, path: Path, key_path: Path, width: int, count: int,
         indices = expected["indices"]
         for start in range(0, width, settings.chunk_size):
             end = min(width, start + settings.chunk_size)
-            rows = view[start:end]
+            rows = view[start:end].to(expected["vectors"].device)
             require(rows.dtype == getattr(torch, keep_dtype) and bool(torch.isfinite(rows).all()),
                     f"C dtype or finite values differ at {name}")
             rows = rows.double()
-            columns = view[:, start:end].T.double()
+            columns = view[:, start:end].T.to(device=rows.device, dtype=torch.float64)
             difference = (rows - columns).abs()
             symmetry_max = max(symmetry_max, float(difference.max()))
             require(bool((difference <= atol + rtol * columns.abs()).all()), f"C is asymmetric at {name}")
-            diagonal = rows[torch.arange(end - start), torch.arange(start, end)]
+            diagonal = rows[torch.arange(end - start, device=rows.device), torch.arange(start, end, device=rows.device)]
             trace += float(diagonal.sum())
             diagonal_min = min(diagonal_min, float(diagonal.min()))
             projection += expected["vectors"][start:end].T @ (rows @ expected["vectors"])
@@ -273,11 +273,11 @@ def validate_run(p1_dir: str | Path) -> dict:
                     f"K/C shapes or module dimensions differ at {name}")
             generator = torch.Generator(device="cpu").manual_seed(settings.qa_seed + 1)
             vectors = torch.linalg.qr(torch.randn((width, min(width, settings.projection_count)),
-                                                 generator=generator, dtype=torch.float64), mode="reduced").Q
-            indices = torch.randperm(width, generator=generator)[:min(width, settings.direct_block_size)].sort().values
+                                                 generator=generator, dtype=torch.float64).to(settings.device), mode="reduced").Q
+            indices = torch.randperm(width, generator=generator)[:min(width, settings.direct_block_size)].sort().values.to(settings.device)
             expected = {"vectors": vectors, "indices": indices,
-                        "direct": torch.zeros((len(indices), len(indices)), dtype=torch.float64),
-                        "projection": torch.zeros((vectors.shape[1], vectors.shape[1]), dtype=torch.float64),
+                        "direct": torch.zeros((len(indices), len(indices)), dtype=torch.float64, device=settings.device),
+                        "projection": torch.zeros((vectors.shape[1], vectors.shape[1]), dtype=torch.float64, device=settings.device),
                         "trace": 0.0, "vector_count": 0, "positive_weight_count": 0,
                         "weights": [], "source_groups": {}}
             layer_adapter = LLaDA8BInstructAdapter(
@@ -301,8 +301,8 @@ def validate_run(p1_dir: str | Path) -> dict:
                 require(tensor_sha256(captured.mask_logits) == recorded["mask_logits_sha256"]
                         and tensor_sha256(captured.module_inputs[name]) == recorded["capture_sha256"],
                         f"C keep input replay differs at {name}: {recorded['input_id']}")
-                values = captured.module_inputs[name].detach().cpu().double()
-                weights = torch.as_tensor(recorded["weights"], dtype=torch.float64)
+                values = captured.module_inputs[name].detach().to(device=settings.device, dtype=torch.float64)
+                weights = torch.as_tensor(recorded["weights"], dtype=torch.float64, device=settings.device)
                 require(tuple(values.shape) == (len(positions), width)
                         and len(weights) == len(positions)
                         and bool(torch.isfinite(values).all())

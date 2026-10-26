@@ -5,6 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -24,12 +28,76 @@ def config_digest(values: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+_hash_cache = ContextVar("mdlm_file_hash_cache", default=None)
+_hash_progress = ContextVar("mdlm_hash_progress", default=None)
+
+
+@contextmanager
+def cached_file_hashes(persistent_path: str | Path | None = None, *, force_rehash: bool = False, progress=None):
+    """Reuse matching file signatures; optionally persist large tensor-file hashes."""
+    cache = {}
+    path = Path(persistent_path) if persistent_path is not None else None
+    if path is not None and not force_rehash:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(record, dict) and record.get("version") == "mdlm.file_hash_cache.1" \
+                    and isinstance(record.get("files"), dict):
+                for name, row in record["files"].items():
+                    signature, digest = row
+                    if len(signature) == 5 and all(type(value) is int for value in signature) \
+                            and isinstance(digest, str) and len(digest) == 64 \
+                            and all(char in "0123456789abcdef" for char in digest):
+                        cache[name] = (tuple(signature), digest)
+        except (OSError, ValueError, KeyError, TypeError):
+            cache.clear()
+    token = _hash_cache.set(cache)
+    progress_token = _hash_progress.set(progress)
+    try:
+        yield
+    finally:
+        _hash_cache.reset(token)
+        _hash_progress.reset(progress_token)
+        if path is not None:
+            # 仅跨运行保存张量文件摘要；写入日志和配置仍按当前内容计算。
+            files = {name: row for name, row in cache.items() if Path(name).suffix == ".safetensors"}
+            temporary = None
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                                 prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+                    temporary = Path(stream.name)
+                    json.dump({"version": "mdlm.file_hash_cache.1", "files": files}, stream)
+                os.replace(temporary, path)
+            except OSError:
+                # 摘要缓存只是加速；缓存写入失败不能覆盖实验原有异常。
+                if temporary is not None:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+
 def file_sha256(path: str | Path) -> str:
+    path = Path(path).resolve()
+    cache = _hash_cache.get()
+    before = path.stat()
+    signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+    if cache is not None and cache.get(str(path), (None,))[0] == signature:
+        return cache[str(path)][1]
+    progress = _hash_progress.get()
+    if progress is not None and before.st_size >= 64 * 1024 * 1024:
+        progress(f"[文件摘要] 正在读取 {path.name}（{before.st_size / 1024**3:.2f} GiB）")
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    after = path.stat()
+    if signature != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise RuntimeError(f"file changed during hashing: {path}")
+    value = digest.hexdigest()
+    if cache is not None:
+        cache[str(path)] = (signature, value)
+    return value
 
 
 def local_model_identity(model_path: str | Path) -> dict:
@@ -181,6 +249,7 @@ class KeepStatisticsConfig:
     projection_count: int = 8
     direct_block_size: int = 16
     chunk_size: int = 512
+    device: str = "cpu"
 
     @classmethod
     def from_file(cls, path: str | Path) -> "KeepStatisticsConfig":
@@ -192,6 +261,10 @@ class KeepStatisticsConfig:
     def check(self) -> None:
         if not self.recipe_id:
             raise ValueError("keep recipe_id must be explicitly identified")
+        if self.device != "cpu" and self.device != "cuda" and not (
+            self.device.startswith("cuda:") and self.device[5:].isdigit()
+        ):
+            raise ValueError("keep device must be cpu, cuda or cuda:<index>")
         if any(dtype not in ("float32", "float64") for dtype in (self.accumulation_dtype, self.storage_dtype)):
             raise ValueError("keep accumulation/storage dtype must be float32 or float64")
         if any(not math.isfinite(value) or value < 0 for value in (

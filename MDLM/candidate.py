@@ -15,6 +15,20 @@ def require_differentiable_model(model: nn.Module) -> None:
         if getattr(hook, "offload", False) or getattr(hook, "no_grad", False):
             raise ValueError("P4 requires resident layers with continuous gradients; inference offload/no_grad is unsupported")
         hooks.extend(getattr(hook, "hooks", ()))
+    # 兼容此前推理预热留下的 inference tensor；LLaDA 多层共享同一 BufferCache。
+    # 原位替换缓存条目，保持共享字典、值、精度和设备一致，不改动模型参数。
+    seen = set()
+    with torch.inference_mode(False), torch.no_grad():
+        for module in model.modules():
+            for name, cache in vars(module).items():
+                if not isinstance(cache, dict) or (name != "_buffers" and "cache" not in name.lower()):
+                    continue
+                if id(cache) in seen:
+                    continue
+                seen.add(id(cache))
+                for key, value in cache.items():
+                    if isinstance(value, torch.Tensor) and torch.is_inference(value):
+                        cache[key] = value.clone()
 
 
 class ResidualBranch(nn.Module):

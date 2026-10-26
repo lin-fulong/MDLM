@@ -17,7 +17,7 @@ class EquivalenceError(RuntimeError):
 
 
 class WeightMerge:
-    """Keep CPU baseline copies; every trial is rebuilt from these same weights."""
+    """Keep baseline copies beside target weights; rebuild every trial from them."""
 
     @torch.no_grad()
     def __init__(self, model, factors: dict, residuals: dict, *, compute_dtype="float32", chunk_size=256):
@@ -57,13 +57,15 @@ class WeightMerge:
             if not torch.isfinite(q).all() or not torch.isfinite(r).all():
                 raise FloatingPointError("nonfinite P5 factors")
             self.parameters[name] = module.weight
-            self.baseline[name] = module.weight.detach().to("cpu", copy=True)
+            self.baseline[name] = module.weight.detach().clone()
             if not torch.isfinite(self.baseline[name]).all():
                 raise FloatingPointError(f"nonfinite baseline weight at {name}")
-            delta = torch.empty(module.weight.shape, dtype=self.dtype)
+            device = module.weight.device
+            q_device, r_device = q.to(device=device, dtype=self.dtype), r.to(device=device, dtype=self.dtype)
+            delta = torch.empty(module.weight.shape, dtype=self.dtype, device=device)
             for begin in range(0, q.shape[1], chunk_size):
                 # 公式（13）：真正写回的是 RQ；按列分块限制中间内存。
-                delta[:, begin:begin + chunk_size] = r.cpu().to(self.dtype) @ q[:, begin:begin + chunk_size].cpu().to(self.dtype)
+                delta[:, begin:begin + chunk_size] = r_device @ q_device[:, begin:begin + chunk_size]
             if not torch.isfinite(delta).all():
                 raise FloatingPointError(f"nonfinite actual increment at {name}")
             self.increments[name] = delta
@@ -107,7 +109,7 @@ class WeightMerge:
             weight.copy_(self.baseline[name].to(weight.device))
         self._remember_target_writes()
         self.check_integrity()
-        if any(not torch.equal(weight.detach().cpu(), self.baseline[name]) for name, weight in self.parameters.items()):
+        if any(not torch.equal(weight.detach(), self.baseline[name]) for name, weight in self.parameters.items()):
             raise RuntimeError("P5 baseline recovery failed")
 
     def weight_hashes(self) -> dict:
@@ -117,9 +119,10 @@ class WeightMerge:
     def diagnostics(self, factors: dict, residuals: dict, keys: dict) -> dict:
         result = {}
         for name, k in keys.items():
-            q, r, k = factors[name].double(), residuals[name].double(), k.double()
+            device = self.parameters[name].device
+            q, r, k = (value.to(device=device, dtype=torch.float64) for value in (factors[name], residuals[name], k))
             # 公式（14）：软拟合误差允许非零；V* 仅是参考键上的辅助量。
-            error = r @ (q @ k - torch.eye(q.shape[0], dtype=torch.float64))
+            error = r @ (q @ k - torch.eye(q.shape[0], dtype=torch.float64, device=device))
             result[name] = {"increment_norm": float(stable_frobenius_norm(self.increments[name].double())),
                             "soft_fit_error_norm": float(stable_frobenius_norm(error)),
                             "auxiliary_v_norm": float(stable_frobenius_norm(self.baseline[name].double() @ k + r))}
@@ -134,8 +137,8 @@ def capture_outputs(adapter, model, model_input, positions, names):
     try:
         for name in names:
             handles.append(model.get_submodule(name).register_forward_hook(
-                lambda module, inputs, output, name=name: outputs[name].append(output.detach().cpu().clone())))
-        logits = adapter.forward_logits(model, model_input, positions).detach().cpu().clone()
+                lambda module, inputs, output, name=name: outputs[name].append(output.detach().clone())))
+        logits = adapter.forward_logits(model, model_input, positions).detach().clone()
         if any(not values for values in outputs.values()):
             raise RuntimeError("a P5 target module was not called")
         return logits, outputs

@@ -134,14 +134,14 @@ def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatist
         for layer in config.target_layers:
             name = f"model.transformer.blocks.{layer}.ff_out"
             report["phase"], report["current_layer"] = "accumulation", name
-            print(f"Accumulating C for {name} on CPU...", flush=True)
+            print(f"Accumulating C for {name} on {settings.device}...", flush=True)
             # 按层重放保持输入，只驻留这一层的方阵，不保存全量激活。
             layer_adapter = LLaDA8BInstructAdapter(
                 adapter.tokenizer, mask_token_id=adapter.mask_token_id, target_layers=(layer,))
             accumulator = SecondMomentAccumulator(
                 descriptions[name]["in_features"], accumulation_dtype=settings.accumulation_dtype,
                 projection_count=settings.projection_count, direct_block_size=settings.direct_block_size,
-                seed=settings.qa_seed)
+                seed=settings.qa_seed, device=settings.device)
             completed = []
             groups = {}
             report["layers"][name] = {"status": "partial", "inputs": completed}
@@ -187,7 +187,7 @@ def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatist
                 raise ValueError(f"formula (5) numeric checks failed at {name}")
             report["phase"] = "save_and_reload"
             tensor_path = output_dir / f"c_layer_{layer}.safetensors"
-            save_file({name: stored}, str(tensor_path), metadata={
+            save_file({name: stored.cpu().contiguous()}, str(tensor_path), metadata={
                 "artifact_version": KEEP_STATISTICS_VERSION, "recipe_id": settings.recipe_id,
                 "p1_config_sha256": config.digest(),
             })
@@ -204,7 +204,7 @@ def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatist
                     # torch.equal 不比较 dtype，必须单独核对冻结的保存精度。
                     if saved_rows.dtype != stored.dtype:
                         raise ValueError("saved C dtype differs from the frozen storage precision")
-                    if not torch.equal(saved_rows, stored[start:end]):
+                    if not torch.equal(saved_rows.to(stored.device), stored[start:end]):
                         raise ValueError("saved C did not round-trip exactly")
             layers[name] = {
                 **descriptions[name], "shape": list(stored.shape),

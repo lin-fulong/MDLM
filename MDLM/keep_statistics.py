@@ -8,11 +8,11 @@ import torch
 
 
 class SecondMomentAccumulator:
-    """Accumulate C on CPU without retaining the sampled activation vectors."""
+    """Accumulate C on the configured device without retaining activations."""
 
     def __init__(
         self, width: int, *, accumulation_dtype: str = "float64", projection_count: int = 8,
-        direct_block_size: int = 16, seed: int = 2026,
+        direct_block_size: int = 16, seed: int = 2026, device: str = "cpu",
     ):
         if type(width) is not int or width < 1:
             raise ValueError("width must be a positive integer")
@@ -25,7 +25,8 @@ class SecondMomentAccumulator:
         if type(seed) is not int or seed < 0:
             raise ValueError("seed must be a nonnegative integer")
         self.width = width
-        self.matrix = torch.zeros((width, width), dtype=getattr(torch, accumulation_dtype))
+        self.device = torch.device(device)
+        self.matrix = torch.zeros((width, width), dtype=getattr(torch, accumulation_dtype), device=self.device)
         self.vector_count = 0
         self.positive_weight_count = 0
         self.weight_sum = 0.0
@@ -33,11 +34,11 @@ class SecondMomentAccumulator:
         generator = torch.Generator(device="cpu").manual_seed(seed)
         vectors = torch.randn((width, min(width, projection_count)), generator=generator,
                               dtype=torch.float64)
-        self.projection_vectors = torch.linalg.qr(vectors, mode="reduced").Q
-        self.direct_indices = torch.randperm(width, generator=generator)[:min(width, direct_block_size)].sort().values
-        self._direct_expected = torch.zeros((len(self.direct_indices), len(self.direct_indices)), dtype=torch.float64)
+        self.projection_vectors = torch.linalg.qr(vectors.to(self.device), mode="reduced").Q
+        self.direct_indices = torch.randperm(width, generator=generator)[:min(width, direct_block_size)].sort().values.to(self.device)
+        self._direct_expected = torch.zeros((len(self.direct_indices), len(self.direct_indices)), dtype=torch.float64, device=self.device)
         count = self.projection_vectors.shape[1]
-        self._projection_expected = torch.zeros((count, count), dtype=torch.float64)
+        self._projection_expected = torch.zeros((count, count), dtype=torch.float64, device=self.device)
 
     def add(self, activations: torch.Tensor, weights: list[float]) -> None:
         """Add explicit nonnegative weights; neither center nor normalize the samples."""
@@ -45,8 +46,8 @@ class SecondMomentAccumulator:
             raise ValueError("activations must have shape [sample_count, width]")
         if activations.is_complex():
             raise ValueError("activations must be real")
-        values = activations.detach().to(device="cpu", dtype=torch.float64)
-        weight_tensor = torch.as_tensor(weights, dtype=torch.float64, device="cpu")
+        values = activations.detach().to(device=self.device, dtype=torch.float64)
+        weight_tensor = torch.as_tensor(weights, dtype=torch.float64, device=self.device)
         if weight_tensor.ndim != 1 or len(weight_tensor) != len(values):
             raise ValueError("one weight is required per activation vector")
         if not bool(torch.isfinite(values).all()) or not bool(torch.isfinite(weight_tensor).all()):
@@ -76,7 +77,7 @@ class SecondMomentAccumulator:
                 if start:
                     self.matrix[start:end, :start].copy_(self.matrix[:start, start:end].T)
                 block = self.matrix[start:end, start:end]
-                lower = torch.tril_indices(end - start, end - start, offset=-1)
+                lower = torch.tril_indices(end - start, end - start, offset=-1, device=self.device)
                 block[lower[0], lower[1]] = block[lower[1], lower[0]]
         projected = weighted_values @ self.projection_vectors
         direct = weighted_values[:, self.direct_indices]
@@ -107,15 +108,15 @@ class SecondMomentAccumulator:
         diagonal_min, diagonal_max, diagonal_abs_max = math.inf, -math.inf, 0.0
         for start in range(0, self.width, chunk_size):
             end = min(self.width, start + chunk_size)
-            rows = matrix[start:end].detach().to(device="cpu", dtype=torch.float64)
-            columns = matrix[:, start:end].T.detach().to(device="cpu", dtype=torch.float64)
+            rows = matrix[start:end].detach().to(device=self.device, dtype=torch.float64)
+            columns = matrix[:, start:end].T.detach().to(device=self.device, dtype=torch.float64)
             if not bool(torch.isfinite(rows).all()) or not bool(torch.isfinite(columns).all()):
                 finite = False
                 continue
             difference = (rows - columns).abs()
             symmetry_max_diff = max(symmetry_max_diff, float(difference.max()))
             symmetric = symmetric and bool((difference <= atol + rtol * columns.abs()).all())
-            diagonal = rows[torch.arange(end - start), torch.arange(start, end)]
+            diagonal = rows[torch.arange(end - start, device=self.device), torch.arange(start, end, device=self.device)]
             trace += float(diagonal.sum())
             diagonal_min = min(diagonal_min, float(diagonal.min()))
             diagonal_max = max(diagonal_max, float(diagonal.max()))
@@ -123,7 +124,7 @@ class SecondMomentAccumulator:
             projection.add_(vectors[start:end].T @ (rows @ vectors))
 
         indices = self.direct_indices.to(matrix.device)
-        direct = matrix[indices[:, None], indices[None, :]].detach().to(device="cpu", dtype=torch.float64)
+        direct = matrix[indices[:, None], indices[None, :]].detach().to(device=self.device, dtype=torch.float64)
         direct_finite = bool(torch.isfinite(direct).all())
         expected_finite = math.isfinite(self.expected_trace) and math.isfinite(self.weight_sum)
         expected_finite = expected_finite and bool(torch.isfinite(self._direct_expected).all())

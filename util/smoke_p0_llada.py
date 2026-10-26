@@ -14,6 +14,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("case_file", type=Path)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--device-map", default="auto", help="模型计算设备，如 cuda:0")
+    parser.add_argument("--torch-dtype", default="auto")
     parser.add_argument("--layer", type=int, required=True, help="one explicitly chosen FFN layer")
     parser.add_argument("--forward", action="store_true", help="load 8B weights and run two replay-checked forwards")
     parser.add_argument("--output", type=Path, help="also save the JSON report to this path")
@@ -21,7 +23,7 @@ def main() -> None:
     cases = load_cases(args.case_file)
     adapter = LLaDA8BInstructAdapter.from_local_tokenizer(model_path=args.model_path, target_layers=(args.layer,))
     results = []
-    model = adapter.load_model(args.model_path, torch_dtype="auto", device_map="auto") if args.forward else None
+    model = adapter.load_model(args.model_path, torch_dtype=args.torch_dtype, device_map=args.device_map) if args.forward else None
     module_info = adapter.inspect_target_modules(model) if model is not None else None
     for case in cases:
         for probe in case["prompts"]["edit"]:

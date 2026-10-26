@@ -67,16 +67,19 @@ def solve_writeback_factor(keys: torch.Tensor, keep: torch.Tensor, ridge: float,
         width, count = keys.shape
         report.update({"key_shape": list(keys.shape), "keep_shape": list(keep.shape),
                        "q_shape": [count, width]})
+        device = torch.device(settings.device)
+        if device.type == "cuda":
+            require(torch.cuda.is_available(), "the configured CUDA device is unavailable")
+        # C 在 GPU 上复用，避免四次方程复核重复搬运同一方阵。
+        keep = keep.detach().to(device=device)
+        keys = keys.detach().to(device=device)
         for start in range(0, width, settings.chunk_size):
-            rows = keep[start:start + settings.chunk_size].detach().cpu().double()
-            columns = keep[:, start:start + settings.chunk_size].T.detach().cpu().double()
+            rows = keep[start:start + settings.chunk_size].detach().double()
+            columns = keep[:, start:start + settings.chunk_size].T.detach().double()
             require(bool(torch.isfinite(rows).all()) and bool(torch.isfinite(columns).all()), "C contains nonfinite values")
             require(torch.allclose(rows, columns, atol=settings.symmetry_atol, rtol=settings.symmetry_rtol),
                     "C is not symmetric within the frozen tolerance")
         require(bool(torch.isfinite(keys).all()), "K contains nonfinite values")
-        device = torch.device(settings.device)
-        if device.type == "cuda":
-            require(torch.cuda.is_available(), "the configured CUDA device is unavailable")
         values = keys.detach().to(device=device, dtype=getattr(torch, settings.compute_dtype))
         # 公式（8）（9）：按冻结 λ 构造 H，不缩放 C，不补 jitter，也不改动输入矩阵。
         report["phase"] = "system"

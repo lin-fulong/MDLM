@@ -54,8 +54,8 @@ def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float) -> f
         for begin in range(0, weight.shape[1], merger.chunk_size):
             columns = slice(begin, begin + merger.chunk_size)
             # 公式（17）分子分母用同一尺度；先缩放，避免差值/整体范数上溢。
-            w0 = original[:, columns].double().cpu() / scale
-            difference = weight[:, columns].detach().double().cpu() / scale - w0
+            w0 = original[:, columns].to(device=weight.device, dtype=torch.float64) / scale
+            difference = weight[:, columns].detach().double() / scale - w0
             numerator = math.hypot(numerator, float(stable_frobenius_norm(difference)))
             denominator = math.hypot(denominator, float(stable_frobenius_norm(w0)))
     divisor = max(denominator, epsilon / scale)

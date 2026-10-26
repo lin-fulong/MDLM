@@ -237,7 +237,8 @@ class LLaDA8BInstructAdapter(ModelAdapter):
             device = model.get_input_embeddings().weight.device
             input_ids = torch.tensor([model_input.input_ids], dtype=torch.long, device=device)
             attention_mask = torch.tensor([model_input.attention_mask], dtype=torch.long, device=device)
-            with torch.inference_mode():
+            # 同一模型后续要优化 R；no_grad 生成的 RoPE 缓存可安全用于反向传播。
+            with torch.no_grad():
                 logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True).logits
             if logits.ndim != 3 or logits.shape[1] != len(model_input.input_ids):
                 raise ValueError("unexpected LLaDA logits shape")
