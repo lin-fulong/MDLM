@@ -15,7 +15,7 @@ from MDLM.contracts import (
 from MDLM.states import input_record
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import tensor_sha256
-from util.extract_keep_statistics import keep_input_from_record
+from util.extract_keep_statistics import equal_length_groups, keep_input_from_record
 from util.extract_reference_keys import load_reference_inputs, write_json
 
 
@@ -114,17 +114,19 @@ def check_matrix(name: str, path: Path, key_path: Path, width: int, count: int,
         require(set(stream.keys()) == {name}, f"C tensor names differ at {name}")
         view = stream.get_slice(name)
         require(view.get_shape() == [width, width], f"C shape differs at {name}")
+        # CUDA 上整块 C 常驻显存，避免每个行块重复从磁盘/CPU 搬运转置列块。
+        matrix = stream.get_tensor(name).to(settings.device) if settings.device.startswith("cuda") else None
         projection = torch.zeros_like(expected["projection"])
         trace, symmetry_max, diagonal_min = 0.0, 0.0, math.inf
         direct = torch.empty_like(expected["direct"])
         indices = expected["indices"]
         for start in range(0, width, settings.chunk_size):
             end = min(width, start + settings.chunk_size)
-            rows = view[start:end].to(expected["vectors"].device)
+            rows = matrix[start:end] if matrix is not None else view[start:end].to(expected["vectors"].device)
             require(rows.dtype == getattr(torch, keep_dtype) and bool(torch.isfinite(rows).all()),
                     f"C dtype or finite values differ at {name}")
             rows = rows.double()
-            columns = view[:, start:end].T.to(device=rows.device, dtype=torch.float64)
+            columns = (matrix[:, start:end].T if matrix is not None else view[:, start:end].T.to(rows.device)).double()
             difference = (rows - columns).abs()
             symmetry_max = max(symmetry_max, float(difference.max()))
             require(bool((difference <= atol + rtol * columns.abs()).all()), f"C is asymmetric at {name}")
@@ -158,7 +160,7 @@ def check_matrix(name: str, path: Path, key_path: Path, width: int, count: int,
                 "replayed_vector_count": expected["vector_count"]}
 
 
-def validate_run(p1_dir: str | Path) -> dict:
+def validate_run(p1_dir: str | Path, *, batch_keep: bool = False) -> dict:
     """Publish a complete bundle only after all source, replay and matrix checks pass."""
     import torch
     from safetensors import safe_open
@@ -285,6 +287,7 @@ def validate_run(p1_dir: str | Path) -> dict:
                 target_layers=(config.target_layers[names.index(name)],))
             rows = source_reports["C"]["layers"][name]["inputs"]
             require(len(rows) == len(keep_inputs["inputs"]), f"C input count differs at {name}")
+            keep_records = []
             for input_row, recorded in zip(keep_inputs["inputs"], rows):
                 positions = tuple(input_row["capture_positions"])
                 model_input = keep_input_from_record(input_row["input"])
@@ -296,33 +299,37 @@ def validate_run(p1_dir: str | Path) -> dict:
                         and recorded["mask_count"] == len(model_input.mask_positions)
                         and math.isclose(recorded["weight_sum"], math.fsum(recorded["weights"])),
                         f"C keep input order or weights differ at {name}")
-                captured = layer_adapter.forward_keep_with_capture(model, model_input, positions)
+                keep_records.append((input_row, recorded, model_input, positions))
+            for group_rows in equal_length_groups(keep_records, 2, batch_keep):
+                captures = layer_adapter.forward_keep_batch_with_capture(
+                    model, tuple((model_input, positions) for _, _, model_input, positions in group_rows))
                 report["real_model_forward_count"] += 1
-                require(tensor_sha256(captured.mask_logits) == recorded["mask_logits_sha256"]
-                        and tensor_sha256(captured.module_inputs[name]) == recorded["capture_sha256"],
-                        f"C keep input replay differs at {name}: {recorded['input_id']}")
-                values = captured.module_inputs[name].detach().to(device=settings.device, dtype=torch.float64)
-                weights = torch.as_tensor(recorded["weights"], dtype=torch.float64, device=settings.device)
-                require(tuple(values.shape) == (len(positions), width)
-                        and len(weights) == len(positions)
-                        and bool(torch.isfinite(values).all())
-                        and bool(torch.isfinite(weights).all()) and bool((weights >= 0).all()),
-                        f"C replayed inputs or weights are invalid at {name}")
-                weighted = values[weights > 0] * weights[weights > 0].sqrt()[:, None]
-                direct = weighted[:, indices]
-                projected = weighted @ vectors
-                expected["direct"] += direct.T @ direct
-                expected["projection"] += projected.T @ projected
-                expected["trace"] += float(weighted.square().sum())
-                expected["vector_count"] += len(positions)
-                expected["positive_weight_count"] += int((weights > 0).sum())
-                expected["weights"].extend(recorded["weights"])
-                group = expected["source_groups"].setdefault(
-                    recorded["source"].get("source_dataset", "unspecified"),
-                    {"input_count": 0, "vector_count": 0, "weight_sum": 0.0})
-                group["input_count"] += 1
-                group["vector_count"] += len(positions)
-                group["weight_sum"] += sum(recorded["weights"])
+                for (input_row, recorded, model_input, positions), captured in zip(group_rows, captures):
+                    require(tensor_sha256(captured.mask_logits) == recorded["mask_logits_sha256"]
+                            and tensor_sha256(captured.module_inputs[name]) == recorded["capture_sha256"],
+                            f"C keep input replay differs at {name}: {recorded['input_id']}")
+                    values = captured.module_inputs[name].detach().to(device=settings.device, dtype=torch.float64)
+                    weights = torch.as_tensor(recorded["weights"], dtype=torch.float64, device=settings.device)
+                    require(tuple(values.shape) == (len(positions), width)
+                            and len(weights) == len(positions)
+                            and bool(torch.isfinite(values).all())
+                            and bool(torch.isfinite(weights).all()) and bool((weights >= 0).all()),
+                            f"C replayed inputs or weights are invalid at {name}")
+                    weighted = values[weights > 0] * weights[weights > 0].sqrt()[:, None]
+                    direct = weighted[:, indices]
+                    projected = weighted @ vectors
+                    expected["direct"] += direct.T @ direct
+                    expected["projection"] += projected.T @ projected
+                    expected["trace"] += float(weighted.square().sum())
+                    expected["vector_count"] += len(positions)
+                    expected["positive_weight_count"] += int((weights > 0).sum())
+                    expected["weights"].extend(recorded["weights"])
+                    source_group = expected["source_groups"].setdefault(
+                        recorded["source"].get("source_dataset", "unspecified"),
+                        {"input_count": 0, "vector_count": 0, "weight_sum": 0.0})
+                    source_group["input_count"] += 1
+                    source_group["vector_count"] += len(positions)
+                    source_group["weight_sum"] += sum(recorded["weights"])
             require(expected["vector_count"] == layer["vector_count"]
                     and expected["positive_weight_count"] == layer["positive_weight_count"]
                     and layer["zero_weight_count"] == layer["vector_count"] - layer["positive_weight_count"]
@@ -376,8 +383,9 @@ def validate_run(p1_dir: str | Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("p1_dir", type=Path, help="completed runs/<run_id>/round_<n>/p1 directory")
+    parser.add_argument("--batch-keep", action="store_true", help="batch equal-length keep replay inputs")
     args = parser.parse_args()
-    print(json.dumps(validate_run(args.p1_dir), ensure_ascii=False, indent=2))
+    print(json.dumps(validate_run(args.p1_dir, batch_keep=args.batch_keep), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -61,6 +61,12 @@ python -u main.py --dataset data/datasets/cases.jsonl
 
 默认配置使用 `execution={"backend":"resident","device":"cuda:0"}`，P0–P5 在同一进程中执行。
 模型前向、P4 残差优化、P2 的 C 累计与数值检查、P3 的 Q 求解、P5 的 RQ 写回和参数变化计算均使用 GPU。
+CUDA 驻留模式会把等长的 P2 保持输入组成小批次（不填充、不改变位置与权重），
+按原顺序更新 C；P2 独立复核也采用同样的批次，并把 C 矩阵驻留 GPU 完成逐块检查。
+输入长度不同时仍逐条前向。批次最多 4 条、256 token，其他阶段依赖和验收条件不变。
+独立编辑中，同一基准模型和保持输入的 C 只计算一次，后续轮次复用经摘要校验的矩阵；
+P5 复用等价性验证时实际合并模型的 logits 计算开发指标，减少重复前向。
+连续编辑的基准会改变，因此每轮重新计算 C。
 非连续编辑在不同阶段和案例间复用同一份驻留模型，下一次使用前精确恢复目标层基线；
 连续模式切换到不同基线或原始参考时按需加载。原始模型文件不被改写。
 数据读取、分词、SHA256 和文件保存仍使用 CPU；同次运行内复用文件摘要，张量文件摘要还保存在
@@ -105,7 +111,7 @@ P5 `decision=accepted` 时，`editing/` 是可通过
 只重写包含目标权重的 safetensors 分片，其余分片以硬链接复用或复制。
 最终模型路径在总报告的 `final_checkpoint_dir`。
 
-默认 `input_preparation.mode=dataset`，入口调用 `util/prepare_dataset_inputs.py`：
+入口始终从所选数据集自动准备阶段输入，调用 `util/prepare_dataset_inputs.py`：
 
 - 从 `preservation_questions`（运行时为 `prompts.preservation`）生成保持输入。相同题目按内容分组，
   用固定种子分配为保持统计/训练、开发保持、保留评价三种用途。默认开发和评价各占 25%，
@@ -116,8 +122,7 @@ P5 `decision=accepted` 时，`editing/` 是可通过
 - P5 的 `F_dev` 默认在当前案例的编辑题上计算短答案损失。它复用编辑题，不能作为独立泛化结果。
   原 `independent_test_questions` 全部留在 `evaluation_inputs.json`，不参与优化和试步选择。
 - 自动保存实际用途划分、输入 token、mask/捕获位置、权重、tokenizer 修订和数据集摘要。
-  生成互不重叠的统计/开发输入至少需要两道不同保持题。已有外部冻结输入时可设置
-  `input_preparation.mode=explicit`，填写 `keep_inputs`、`p2_keep.recipe_id` 和 P5 开发输入/探针。
+  生成互不重叠的统计/开发输入至少需要两道不同保持题；用户只需提供数据集和模型路径。
 
 预处理结果保存在 `runs/cache/datasets/`，算法轮次索引在 `runs/cache/rounds/`。
 数据集内容、模型基线、tokenizer、目标层、数值配置、运行库和代码均匹配且文件摘要一致时，

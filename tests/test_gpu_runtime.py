@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import logging
 import sys
 import tempfile
 import unittest
@@ -81,6 +82,69 @@ class ResidentRuntimeTests(unittest.TestCase):
         self.assertIs(sys.argv, previous)
         self.assertEqual(Path.cwd(), cwd)
         self.assertIn("stage output", stream.getvalue())
+
+    def test_stage_logging_restores_transformers_handler_before_evaluation(self):
+        from transformers.utils import logging as transformers_logging
+
+        root = logging.getLogger("transformers")
+        previous_handlers, previous_level, previous_propagate = list(root.handlers), root.level, root.propagate
+        outside = io.StringIO()
+        original_stdout = sys.stdout
+        try:
+            root.handlers.clear()
+            with patch.object(transformers_logging, "_default_handler", None), \
+                    patch.object(sys, "stderr", outside), tempfile.TemporaryDirectory() as temporary:
+                def stage_main():
+                    print("stage stdout")
+                    print("stage stderr", file=sys.stderr)
+                    transformers_logging.get_logger("transformers.stage_test").warning("stage warning")
+                    if sys.argv[1] == "fail":
+                        raise SystemExit(1)
+
+                with patch("util.gpu_runtime.importlib.import_module", return_value=SimpleNamespace(main=stage_main)):
+                    for index in range(3):
+                        with (Path(temporary) / f"stage_{index}.log").open("w") as stream:
+                            if index == 2:
+                                import subprocess
+                                with self.assertRaises(subprocess.CalledProcessError):
+                                    execute_stage(["constructed_stage", "fail"], stream=stream,
+                                                  cwd=Path.cwd(), resident=True)
+                            else:
+                                execute_stage(["constructed_stage", str(index)], stream=stream,
+                                              cwd=Path.cwd(), resident=True)
+                        self.assertIs(sys.stdout, original_stdout)
+                        self.assertIs(sys.stderr, outside)
+                        self.assertIn("stage stdout", (Path(temporary) / f"stage_{index}.log").read_text())
+                        self.assertIn("stage stderr", (Path(temporary) / f"stage_{index}.log").read_text())
+                        self.assertIn("stage warning", (Path(temporary) / f"stage_{index}.log").read_text())
+                handler = transformers_logging._default_handler
+                self.assertIs(handler.stream, outside)
+                self.assertIs(getattr(handler.flush, "__self__", None), outside)
+                from util import evaluate_accuracy as accuracy
+                run_dir = Path(temporary)
+                inputs = run_dir / "evaluation_inputs.json"
+                inputs.write_text("{}")
+                (run_dir / "effective_config.json").write_text('{"target_layers": [0], "execution": {"device": "cpu"}}')
+                (run_dir / "run_report.json").write_text(
+                    '{"status": "complete", "mode": "independent", "original_model": "unused", '
+                    '"rounds": [{"round_id": 0, "case_id": "case", "fact_ids": ["case"], '
+                    '"baseline_model": "unused", "decision": "rejected", "final_model_dir": null}]}')
+                probe = {"case_id": "case", "probe_id": "probe", "role": "independent_test"}
+
+                def load_tokenizer(**kwargs):
+                    transformers_logging.get_logger("transformers.evaluation_test").warning("evaluation warning")
+                    return SimpleNamespace(load_model=lambda *args, **kwargs: object())
+
+                with patch.object(accuracy, "evaluation_inputs", return_value=(inputs, [probe])), \
+                        patch.object(accuracy.LLaDA8BInstructAdapter, "from_local_tokenizer",
+                                     side_effect=load_tokenizer), \
+                        patch.object(accuracy, "score_probe", return_value={**probe, "correct": True}):
+                    self.assertEqual(accuracy.evaluate_run(run_dir)["status"], "complete")
+                self.assertIn("evaluation warning", outside.getvalue())
+        finally:
+            root.handlers[:] = previous_handlers
+            root.setLevel(previous_level)
+            root.propagate = previous_propagate
 
     def test_hash_cache_reuses_unchanged_file_and_detects_rewrite(self):
         with tempfile.TemporaryDirectory() as temporary:

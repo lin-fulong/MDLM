@@ -46,7 +46,10 @@ def log_probabilities(logits: torch.Tensor) -> torch.Tensor:
 
 
 def edit_loss(adapter: ModelAdapter, model, example: EditTrainingExample) -> torch.Tensor:
-    logits = adapter.forward_logits(model, example.model_input, example.positions)
+    return edit_loss_from_logits(adapter.forward_logits(model, example.model_input, example.positions), example)
+
+
+def edit_loss_from_logits(logits: torch.Tensor, example: EditTrainingExample) -> torch.Tensor:
     log_probs = log_probabilities(logits)
     targets = torch.tensor(example.targets, device=logits.device, dtype=torch.long)
     weights = torch.tensor(example.weights, device=logits.device, dtype=log_probs.dtype)
@@ -55,7 +58,11 @@ def edit_loss(adapter: ModelAdapter, model, example: EditTrainingExample) -> tor
 
 
 def keep_loss(adapter: ModelAdapter, model, example: KeepTrainingExample) -> torch.Tensor:
-    log_probs = log_probabilities(adapter.forward_logits(model, example.model_input, example.positions))
+    return keep_loss_from_logits(adapter.forward_logits(model, example.model_input, example.positions), example)
+
+
+def keep_loss_from_logits(logits: torch.Tensor, example: KeepTrainingExample) -> torch.Tensor:
+    log_probs = log_probabilities(logits)
     reference = example.reference_log_probs.to(device=log_probs.device, dtype=log_probs.dtype)
     if reference.shape != log_probs.shape:
         raise ValueError("theta_0 and candidate full-vocabulary logits shapes differ")

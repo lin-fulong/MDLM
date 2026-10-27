@@ -41,20 +41,42 @@ class MainPipelineTests(unittest.TestCase):
             "p3": {"ridge_by_layer": {"model.transformer.blocks.0.ff_out": 0.01}},
             "p4": {"rho_by_layer": {"model.transformer.blocks.0.ff_out": 0.001}},
             "p5": {"dev_edit_file": str(self.dev), "dev_keep_file": str(self.dev_keep),
-                   "dev_edit_probes": [{"case_id": "dev_1", "probe_id": "qa_1"}]},
+                   "dev_edit_probes": [{"case_id": "fact_1", "probe_id": "edit_1"}]},
         }
         self.config.write_text(json.dumps(self.choices), encoding="utf-8")
         self.identity = {"model_revision": "model_hash", "tokenizer_revision": "tokenizer_hash"}
 
-    def test_incomplete_config_reports_all_missing_inputs_before_run(self):
-        template = {"dataset": str(self.dataset), "model_path": str(self.model),
-                    "keep_inputs": "REPLACE_WITH_KEEP", "p2_keep": {}, "p5": {}}
+    def fake_prepare(self, dataset, model, layers, cache_dir, **kwargs):
+        from data.readers.json_cases import load_cases
+        prepared = self.root / ("prepared_" + dataset.stem)
+        prepared.mkdir(exist_ok=True)
+        probes = [{"case_id": case["case_id"], "probe_id": case["prompts"]["edit"][0]["probe_id"]}
+                  for case in load_cases(dataset)]
+        (prepared / "development_probes.json").write_text(json.dumps(probes), encoding="utf-8")
+        (prepared / "evaluation_inputs.json").write_text('{"inputs": []}', encoding="utf-8")
+        manifest = prepared / "manifest.json"
+        evaluation_file = prepared / "evaluation_inputs.json"
+        manifest.write_text(json.dumps({"status": "complete",
+                                        "files": {"evaluation_inputs.json": str(evaluation_file)},
+                                        "files_sha256": {str(evaluation_file): pipeline.file_sha256(evaluation_file)}}),
+                            encoding="utf-8")
+        return {"cache_hit": False, "manifest": str(manifest), "cache_key": "test",
+                "recipe_id": "frozen_keep", "files": {
+                    "editing_cases.json": str(dataset), "keep_statistics.json": str(self.keep),
+                    "development_probes.json": str(prepared / "development_probes.json"),
+                    "development_keep.json": str(self.dev_keep),
+                    "keep_training.json": str(self.keep),
+                    "evaluation_inputs.json": str(prepared / "evaluation_inputs.json")}}
+
+    def test_config_requires_only_dataset_and_model_paths(self):
+        template = {"dataset": "REPLACE_WITH_DATASET", "model_path": "REPLACE_WITH_MODEL"}
         issues = pipeline.config_setup_issues(template)
-        self.assertTrue(any("keep_inputs" in issue for issue in issues))
-        self.assertTrue(any("p5.dev_edit_file" in issue for issue in issues))
-        self.assertTrue(any("p5.dev_keep_file" in issue for issue in issues))
-        self.assertTrue(any("p2_keep.recipe_id" in issue for issue in issues))
-        self.assertTrue(any("p5.dev_edit_probes" in issue for issue in issues))
+        self.assertEqual(len(issues), 2)
+        self.assertEqual(pipeline.config_setup_issues({"dataset": str(self.dataset),
+                                                       "model_path": str(self.model)}), [])
+        self.assertTrue(any("only automatic" in issue for issue in pipeline.config_setup_issues({
+            "dataset": str(self.dataset), "model_path": str(self.model),
+            "input_preparation": {"mode": "explicit"}})))
 
     @patch.object(pipeline, "local_model_identity")
     @patch.object(pipeline.subprocess, "run")
@@ -120,6 +142,35 @@ class MainPipelineTests(unittest.TestCase):
         self.assertTrue((self.root / "runs/trial/round_0/p1_config.json").exists())
 
     @patch.object(pipeline, "local_model_identity")
+    def test_c_reuse_is_enabled_only_for_independent_resident_rounds(self, identity):
+        identity.return_value = self.identity
+        self.choices["execution"] = {"backend": "resident", "device": "cpu"}
+        self.config.write_text(json.dumps(self.choices), encoding="utf-8")
+
+        def stage(label, arguments, artifact, accepted=("complete",)):
+            if label.startswith("P0_"):
+                return [{"case_id": "fact_1", "probe_id": "edit_1", "real_forward": True,
+                         "replay_within_tolerance": True, "full_mask_input": True,
+                         "mask_count": 1, "target_token_count": 1,
+                         "target_modules": {"model.transformer.blocks.0.ff_out": {}},
+                         "ffn_input_shapes": {"model.transformer.blocks.0.ff_out": [1]}}]
+            return {"status": "rejected" if label == "P4" else "complete"}
+
+        for sequential in (False, True):
+            with patch.object(pipeline.StageRunner, "run", side_effect=stage) as run:
+                pipeline.one_round(self.config, run_id_override=f"mode_{sequential}", sequential=sequential)
+            command = next(call.args[1] for call in run.call_args_list if call.args[0] == "P2_KEEP")
+            self.assertEqual("--reuse-across-rounds" in command, not sequential)
+            self.assertNotIn("--batch-keep", command)
+        self.choices["p2_keep"]["device"] = "cuda:0"
+        self.config.write_text(json.dumps(self.choices), encoding="utf-8")
+        with patch.object(pipeline.StageRunner, "run", side_effect=stage) as run:
+            pipeline.one_round(self.config, run_id_override="batched")
+        for label in ("P2_KEEP", "P2_QA"):
+            command = next(call.args[1] for call in run.call_args_list if call.args[0] == label)
+            self.assertIn("--batch-keep", command)
+
+    @patch.object(pipeline, "local_model_identity")
     @patch.object(pipeline.subprocess, "run")
     def test_stage_failure_stops_and_preserves_report(self, execute, identity):
         identity.return_value = self.identity
@@ -168,7 +219,8 @@ class MainPipelineTests(unittest.TestCase):
         identity.return_value = self.identity
         run_round.return_value = {"decision": "rejected", "selected_alpha": None,
                                   "final_model_dir": None, "checkpoint_dir": None}
-        pipeline.run_dataset(self.config, run_id_override="device_choice", use_cache=False, device_override="cpu")
+        with patch.object(pipeline, "prepare_inputs", side_effect=self.fake_prepare):
+            pipeline.run_dataset(self.config, run_id_override="device_choice", use_cache=False, device_override="cpu")
         effective = json.loads((self.root / "runs/device_choice/effective_config.json").read_text(encoding="utf-8"))
         self.assertEqual(effective["execution"], {"backend": "resident", "device": "cpu"})
         self.assertEqual(effective["p1"]["device_map"], "cpu")
@@ -186,8 +238,9 @@ class MainPipelineTests(unittest.TestCase):
         identity.return_value = self.identity
         run_round.return_value = {"decision": "rejected", "selected_alpha": None,
                                   "final_model_dir": None, "checkpoint_dir": None}
-        result = pipeline.run_dataset(self.config, run_id_override="override", dataset_override=selected,
-                                      cache_override=self.root / "cache", use_cache=False)
+        with patch.object(pipeline, "prepare_inputs", side_effect=self.fake_prepare):
+            result = pipeline.run_dataset(self.config, run_id_override="override", dataset_override=selected,
+                                          cache_override=self.root / "cache", use_cache=False)
         self.assertEqual((result["fact_count"], result["case_count"]), (2, 1))
         self.assertEqual(run_round.call_args.kwargs["selected_case_ids"], ["other_0", "other_1"])
         effective = json.loads((self.root / "runs/override/effective_config.json").read_text(encoding="utf-8"))
@@ -204,8 +257,13 @@ class MainPipelineTests(unittest.TestCase):
         case["prompts"]["preservation"] = [
             {"probe_id": f"keep_{i}", "prompt": f"keep {i}?", "answer": "old"} for i in range(4)]
         self.dataset.write_text(json.dumps([case]), encoding="utf-8")
-        self.choices["input_preparation"] = {"mode": "dataset"}
+        self.choices["input_preparation"] = {"settings": {}}
         self.choices["cache_dir"] = str(self.root / "cache")
+        del self.choices["keep_inputs"]
+        del self.choices["p2_keep"]["recipe_id"]
+        del self.choices["p5"]["dev_edit_file"]
+        del self.choices["p5"]["dev_keep_file"]
+        del self.choices["p5"]["dev_edit_probes"]
         self.config.write_text(json.dumps(self.choices), encoding="utf-8")
         tokenizer = SimpleNamespace(all_special_ids=[], encode=lambda text, **kwargs: [ord(c) for c in text],
                                     apply_chat_template=lambda messages, **kwargs: messages[0]["content"] + " answer:")
@@ -246,7 +304,8 @@ class MainPipelineTests(unittest.TestCase):
                         "checkpoint_dir": str(checkpoint) if sequential and accepted else None}
 
             with patch.object(pipeline, "local_model_identity", return_value=self.identity), \
-                 patch.object(pipeline, "one_round", side_effect=fake_round):
+                 patch.object(pipeline, "one_round", side_effect=fake_round), \
+                 patch.object(pipeline, "prepare_inputs", side_effect=self.fake_prepare):
                 result = pipeline.run_dataset(self.config, sequential=sequential,
                                               run_id_override="seq" if sequential else "ind")
             self.assertEqual(seen, expected)
@@ -261,7 +320,7 @@ class MainPipelineTests(unittest.TestCase):
         identity.return_value = {"model_revision": "edited_hash", "tokenizer_revision": "tokenizer_hash"}
         with self.assertRaisesRegex(RuntimeError, "stop before model forward"):
             pipeline.one_round(self.config, run_id_override="trial", round_index=1,
-                               selected_case_id="fact_1", baseline_model=checkpoint,
+                               selected_case_ids=["fact_1"], baseline_model=checkpoint,
                                sequential=True, original_identity=self.identity)
         round_dir = self.root / "runs/trial/round_1"
         p1 = json.loads((round_dir / "p1_config.json").read_text(encoding="utf-8"))

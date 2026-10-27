@@ -54,6 +54,17 @@ class AcceptanceTests(unittest.TestCase):
         self.assertTrue(report["trials"][0]["baseline_restored"])
         torch.testing.assert_close(self.model[0].weight, self.originals["0"] + self.r["0"])
 
+    def test_trial_metrics_reuse_verified_merged_forward(self):
+        with patch.object(self.adapter, "forward_logits", wraps=self.adapter.forward_logits) as forward:
+            report = self.run_selection()
+        self.assertEqual(report["selected_alpha"], 1)
+        # 基线各一次；每次试步仅运行因子模型和合并模型各一次。
+        self.assertEqual(forward.call_count, 2 + 2 * 2 * len(report["trials"]))
+        direct = acceptance.development_metrics(self.merger, self.adapter, self.edits, self.keeps,
+                                                self.originals, self.settings.epsilon)
+        for key, value in report["trials"][-1]["metrics"].items():
+            self.assertAlmostEqual(value, direct[key], places=12)
+
     def test_all_rejected_recovers_baseline_bit_for_bit(self):
         report = self.run_selection(replace(self.settings, delta=100))
         self.assertEqual(report["status"], "rejected")

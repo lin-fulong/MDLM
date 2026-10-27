@@ -126,7 +126,7 @@ def _prepare_inputs(dataset: Path, model_path: Path, layers: tuple[int, ...], ca
                 evaluation.extend({"case_id": case["case_id"], **probe} for probe in probes)
         ordered = sorted(pool, key=lambda key_: config_digest({"seed": policy["seed"], "prompt": key_}))
         if len(ordered) < 2:
-            raise ValueError("生成保持统计和开发保持输入至少需要两道不同的 preservation 题；也可使用 input_preparation.mode=explicit 指定外部保持输入")
+            raise ValueError("自动生成保持统计和开发保持输入至少需要两道不同的 preservation 题")
         dev_count = min(len(ordered) - 1, max(1, int(len(ordered) * policy["dev_fraction"])))
         test_count = min(len(ordered) - dev_count - 1, max(1, int(len(ordered) * policy["test_fraction"]))) \
             if policy["test_fraction"] > 0 and len(ordered) >= 3 else 0

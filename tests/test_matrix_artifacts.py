@@ -162,6 +162,24 @@ class MatrixArtifactTests(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "PyTorch and safetensors are required for matrix numeric tests")
 class MatrixNumericTests(unittest.TestCase):
+    def test_cuda_matrix_check_uses_same_moment(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            key_path, keep_path = root / "k.safetensors", root / "c.safetensors"
+            save_file({"layer": torch.ones(2, 1, dtype=torch.float32)}, str(key_path))
+            matrix = torch.diag(torch.tensor([2.0, 3.0], dtype=torch.float32))
+            save_file({"layer": matrix}, str(keep_path))
+            expected = {"vectors": torch.eye(2, dtype=torch.float64, device="cuda:0"),
+                        "indices": torch.tensor([0, 1], device="cuda:0"),
+                        "direct": matrix.double().to("cuda:0"),
+                        "projection": matrix.double().to("cuda:0"),
+                        "trace": 5.0, "vector_count": 2}
+            report = check_matrix("layer", keep_path, key_path, 2, 1, "torch.float32", "float32",
+                                  KeepStatisticsConfig("cuda_check", device="cuda:0", chunk_size=1), expected)
+            self.assertEqual(report["trace"], 5.0)
+
     def test_finite_large_projected_moment_does_not_overflow_symmetrization(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

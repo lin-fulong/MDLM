@@ -9,7 +9,7 @@ import torch
 
 from MDLM.contracts import AcceptanceConfig
 from MDLM.merge import EquivalenceError, WeightMerge, merge_with_equivalence
-from MDLM.optimize import edit_loss, keep_loss
+from MDLM.optimize import edit_loss, edit_loss_from_logits, keep_loss, keep_loss_from_logits
 from MDLM.states import EditTrainingExample
 from MDLM.writeback import stable_frobenius_norm
 
@@ -66,12 +66,17 @@ def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float) -> f
 
 
 @torch.no_grad()
-def development_metrics(merger, adapter, edits, keeps, originals, epsilon) -> dict:
+def development_metrics(merger, adapter, edits, keeps, originals, epsilon, logits=None) -> dict:
     if not edits or not keeps:
         raise ValueError("P5 requires both development edit and preservation readouts even when training beta=0")
-    edit = math.fsum(float(edit_loss(adapter, merger.model, item)) for item in edits)
+    if logits is not None and len(logits) != len(edits) + len(keeps):
+        raise ValueError("P5 cached logits do not cover all development readouts")
+    edit = math.fsum(float(edit_loss(adapter, merger.model, item) if logits is None
+                          else edit_loss_from_logits(logits[index], item)) for index, item in enumerate(edits))
     # 公式（16）：复用完整词表 KL(theta_0 || theta_alpha)，开发保持始终执行。
-    keep = math.fsum(float(keep_loss(adapter, merger.model, item)) for item in keeps)
+    keep = math.fsum(float(keep_loss(adapter, merger.model, item) if logits is None
+                          else keep_loss_from_logits(logits[len(edits) + index], item))
+                     for index, item in enumerate(keeps))
     change = cumulative_change(merger, originals, epsilon)
     if not all(math.isfinite(value) for value in (edit, keep, change)):
         raise FloatingPointError("nonfinite P5 development metrics")
@@ -98,13 +103,13 @@ def select_merged_candidate(merger: WeightMerge, adapter, factors: dict, residua
             report["trials"].append(row)
             try:
                 # 先证明同 alpha 的因子/合并前向一致，再对实际合并模型验收。
+                merged_logits = []
                 row["equivalence"] = merge_with_equivalence(merger, adapter, factors, residuals, inputs, alpha,
-                    atol=settings.equivalence_atol, rtol=settings.equivalence_rtol)
-                hashes = merger.weight_hashes()
-                row["metrics"] = development_metrics(merger, adapter, edits, keeps, originals, settings.epsilon)
+                    atol=settings.equivalence_atol, rtol=settings.equivalence_rtol, merged_logits=merged_logits)
+                row["metrics"] = development_metrics(merger, adapter, edits, keeps, originals, settings.epsilon,
+                                                     merged_logits)
+                # check_integrity 已将当前目标层摘要与 apply() 后的冻结摘要逐项比较。
                 merger.check_integrity()
-                if merger.weight_hashes() != hashes:
-                    raise RuntimeError("target weights changed during development evaluation")
                 row["gate"] = gate_decision(row["metrics"], report["baseline"]["f_dev"], settings)
                 row["accepted"] = row["gate"]["passed"]
             except (EquivalenceError, FloatingPointError) as error:

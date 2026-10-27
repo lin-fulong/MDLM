@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import importlib
+import logging
 import os
 import subprocess
 import sys
@@ -121,9 +122,20 @@ def execute_stage(arguments, *, stream, cwd, resident=False):
         return subprocess.run([sys.executable, "-u", "-m", *arguments], cwd=cwd,
                               stdout=stream, stderr=subprocess.STDOUT, check=True)
     previous_argv, previous_cwd = sys.argv, Path.cwd()
+    previous_stdout, previous_stderr = sys.stdout, sys.stderr
+    original_streams = {}
     try:
         sys.argv = [arguments[0], *arguments[1:]]
         os.chdir(cwd)
+        for logger in (logging.getLogger(), *logging.Logger.manager.loggerDict.values()):
+            if isinstance(logger, logging.Logger):
+                for handler in logger.handlers:
+                    current = getattr(handler, "stream", None)
+                    if current is previous_stdout or current is previous_stderr:
+                        original_streams[handler] = current
+                        handler.stream = stream
+                        if getattr(handler.flush, "__self__", None) is current:
+                            handler.flush = stream.flush
         with redirect_stdout(stream), redirect_stderr(stream):
             try:
                 importlib.import_module(arguments[0]).main()
@@ -134,6 +146,15 @@ def execute_stage(arguments, *, stream, cwd, resident=False):
                 traceback.print_exc()
                 raise
     finally:
+        # 还原已有 handler；阶段内新建的 handler 也不能持有即将关闭的日志文件。
+        for logger in (logging.getLogger(), *logging.Logger.manager.loggerDict.values()):
+            if isinstance(logger, logging.Logger):
+                for handler in logger.handlers:
+                    if getattr(handler, "stream", None) is stream:
+                        target = original_streams.get(handler, previous_stderr)
+                        handler.stream = target
+                        if getattr(handler.flush, "__self__", None) is stream:
+                            handler.flush = target.flush
         sys.argv = previous_argv
         os.chdir(previous_cwd)
         gc.collect()

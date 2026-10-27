@@ -149,7 +149,8 @@ def capture_outputs(adapter, model, model_input, positions, names):
 
 @torch.no_grad()
 def merge_with_equivalence(merger: WeightMerge, adapter, factors: dict, residuals: dict,
-                           inputs: list, alpha: float, *, atol: float, rtol: float) -> dict:
+                           inputs: list, alpha: float, *, atol: float, rtol: float,
+                           merged_logits: list[torch.Tensor] | None = None) -> dict:
     """Compare the same inputs/alpha, then leave only actual merged weights active."""
     merger.restore()
     expected = []
@@ -167,6 +168,8 @@ def merge_with_equivalence(merger: WeightMerge, adapter, factors: dict, residual
         logits, outputs = capture_outputs(adapter, merger.model, model_input, positions, factors)
         if logits.shape != expected_logits.shape or not torch.allclose(logits, expected_logits, atol=atol, rtol=rtol):
             raise EquivalenceError("actual merged logits differ from the scaled factor candidate")
+        if merged_logits is not None:
+            merged_logits.append(logits)
         logits_max = max(logits_max, float((logits.double() - expected_logits.double()).abs().max()))
         for name in factors:
             if len(outputs[name]) != len(expected_outputs[name]):

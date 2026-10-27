@@ -9,9 +9,9 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
-import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,47 +53,54 @@ def required_path(config: dict, key: str) -> Path:
     return path
 
 
+def choose_run_id(configured: str | None, override: str | None) -> str:
+    run_id = override or configured or (
+        "edit_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
+    )
+    if not isinstance(run_id, str) or run_id in ("", ".", "..") or "/" in run_id or "\\" in run_id:
+        raise ValueError("run_id must be one directory name")
+    return run_id
+
+
 def config_setup_issues(choices: dict) -> list[str]:
-    """Explain absent experiment inputs before allocating a run directory."""
-    paths = {
-        "dataset": choices.get("dataset"),
-        "model_path": choices.get("model_path"),
-    }
-    mode = choices.get("input_preparation", {}).get("mode", "explicit")
-    if mode == "explicit":
-        paths.update({"keep_inputs": choices.get("keep_inputs"),
-                      "p5.dev_edit_file": choices.get("p5", {}).get("dev_edit_file"),
-                      "p5.dev_keep_file": choices.get("p5", {}).get("dev_keep_file")})
+    """Check the two user-supplied paths; all stage inputs are derived from the dataset."""
+    paths = {"dataset": choices.get("dataset"), "model_path": choices.get("model_path")}
     issues = []
     for label, value in paths.items():
         if not isinstance(value, str) or not value or value.startswith("REPLACE_WITH_"):
             issues.append(f"{label}: specify a real path")
         elif not project_path(value).exists():
             issues.append(f"{label}: file or directory does not exist: {project_path(value)}")
-    if mode == "dataset":
-        return issues
-    if mode != "explicit":
-        return [*issues, "input_preparation.mode: choose dataset or explicit"]
-    recipe = choices.get("p2_keep", {}).get("recipe_id")
-    if not isinstance(recipe, str) or not recipe or recipe.startswith("REPLACE_WITH_"):
-        issues.append("p2_keep.recipe_id: specify the frozen keep recipe ID")
-    probes = choices.get("p5", {}).get("dev_edit_probes")
-    if not isinstance(probes, list) or not probes or any(
-        not isinstance(item, dict) or any(
-            not isinstance(item.get(key), str) or not item[key]
-            or item[key].startswith("REPLACE_WITH_") for key in ("case_id", "probe_id")
-        ) for item in probes
-    ):
-        issues.append("p5.dev_edit_probes: select real development probes")
+    if choices.get("input_preparation", {}).get("mode", "dataset") != "dataset":
+        issues.append("input_preparation.mode: only automatic dataset preparation is supported")
     return issues
 
 
-def one_round(config_file: Path, *, run_id_override: str | None = None,
-              round_index: int = 0, selected_case_id: str | None = None,
-              baseline_model: Path | None = None, sequential: bool = False,
-              original_identity: dict | None = None, selected_case_ids: list[str] | None = None,
-              workspace: Path | None = None, request_key: str | None = None,
-              use_cache: bool = True, baseline_identity: dict | None = None) -> dict:
+@dataclass(frozen=True)
+class RoundInputs:
+    choices: dict
+    dataset: Path
+    original_model: Path
+    model: Path
+    keep_inputs: Path
+    dev_edit_file: Path
+    dev_keep_file: Path
+    layers: list[int]
+    cases: list[dict]
+    facts: list[FactSelection]
+    keys: ReferenceKeyConfig
+    keep: KeepStatisticsConfig
+    q: WritebackConfig
+    residual: ResidualOptimizationConfig
+    p5_values: dict
+    original_identity: dict
+    baseline_identity: dict
+
+
+def load_round_inputs(config_file: Path, baseline_model: Path | None,
+                      selected_case_ids: list[str] | None, original_identity: dict | None,
+                      baseline_identity: dict | None) -> RoundInputs:
+    """Validate one round's frozen inputs and stage settings."""
     choices = read_json(config_file)
     dataset = required_path(choices, "dataset")
     original_model = required_path(choices, "model_path")
@@ -102,10 +109,10 @@ def one_round(config_file: Path, *, run_id_override: str | None = None,
     p5_values = dict(choices["p5"])
     dev_edit_file = required_path(p5_values, "dev_edit_file")
     dev_keep_file = required_path(p5_values, "dev_keep_file")
-    for label, path in (("dataset", dataset), ("keep_inputs", keep_inputs),
+    for label, file in (("dataset", dataset), ("keep_inputs", keep_inputs),
                         ("dev_edit_file", dev_edit_file), ("dev_keep_file", dev_keep_file)):
-        if not path.is_file():
-            raise ValueError(f"{label} must be a file: {path}")
+        if not file.is_file():
+            raise ValueError(f"{label} must be a file: {file}")
     if not model.is_dir() or not original_model.is_dir():
         raise ValueError("model_path and baseline_model must be model directories")
     layers = choices["target_layers"]
@@ -114,14 +121,12 @@ def one_round(config_file: Path, *, run_id_override: str | None = None,
     names = {f"model.transformer.blocks.{layer}.ff_out" for layer in layers}
     if len(names) != len(layers):
         raise ValueError("target_layers must not contain duplicates")
-
-    # 输入已由预处理脚本生成，或由配置显式指定；这里核对运行用途。
     if read_json(keep_inputs)["example_only"] or read_json(dev_keep_file)["example_only"]:
         raise ValueError("main.py requires non-example P2 and P5 preservation inputs")
+
     cases = load_cases(dataset)
-    selections = selected_case_ids or ([selected_case_id] if selected_case_id is not None else None)
-    if selections is not None:
-        cases = [case for case in cases if case["case_id"] in selections]
+    if selected_case_ids is not None:
+        cases = [case for case in cases if case["case_id"] in selected_case_ids]
     if not cases:
         raise ValueError("the dataset adapter selected no editing facts")
     if any(case["quality_control"]["status"] == "example_only" for case in cases):
@@ -141,33 +146,37 @@ def one_round(config_file: Path, *, run_id_override: str | None = None,
     keep.check()
     q = WritebackConfig(**choices["p3"])
     q.check()
-    theta0_identity = original_identity or local_model_identity(original_model)
-    identity = baseline_identity or (theta0_identity if model == original_model else local_model_identity(model))
-    r_values = dict(choices["p4"])
-    if "checkpoints" in r_values:
-        r_values["checkpoints"] = tuple(r_values["checkpoints"])
-    if r_values.get("beta", 0) > 0:
-        r_values.setdefault("reference_model_path", str(original_model))
-        r_values.setdefault("reference_model_revision", theta0_identity["model_revision"])
-        r_values.setdefault("reference_tokenizer_revision", theta0_identity["tokenizer_revision"])
-        r_values["keep_train_file"] = str(required_path(r_values, "keep_train_file"))
-    r = ResidualOptimizationConfig(**r_values)
-    r.check()
-    if set(q.ridge_by_layer) != names or set(r.rho_by_layer) != names:
+    theta0 = original_identity or local_model_identity(original_model)
+    identity = baseline_identity or (theta0 if model == original_model else local_model_identity(model))
+    residual_values = dict(choices["p4"])
+    if "checkpoints" in residual_values:
+        residual_values["checkpoints"] = tuple(residual_values["checkpoints"])
+    if residual_values.get("beta", 0) > 0:
+        residual_values.setdefault("reference_model_path", str(original_model))
+        residual_values.setdefault("reference_model_revision", theta0["model_revision"])
+        residual_values.setdefault("reference_tokenizer_revision", theta0["tokenizer_revision"])
+        residual_values["keep_train_file"] = str(required_path(residual_values, "keep_train_file"))
+    residual = ResidualOptimizationConfig(**residual_values)
+    residual.check()
+    if set(q.ridge_by_layer) != names or set(residual.rho_by_layer) != names:
         raise ValueError("P3/P4 layer names must match target_layers exactly")
-    if q.allow_example_only or r.allow_example_only or p5_values.get("allow_example_only", False):
+    if q.allow_example_only or residual.allow_example_only or p5_values.get("allow_example_only", False):
         raise ValueError("the main entrypoint does not allow example-only stage inputs")
-    if r.beta > 0 and (project_path(r.reference_model_path) != original_model
-                       or r.reference_model_revision != theta0_identity["model_revision"]
-                       or r.reference_tokenizer_revision != theta0_identity["tokenizer_revision"]):
+    if residual.beta > 0 and (project_path(residual.reference_model_path) != original_model
+                              or residual.reference_model_revision != theta0["model_revision"]
+                              or residual.reference_tokenizer_revision != theta0["tokenizer_revision"]):
         raise ValueError("P4 theta_0 reference must match the original model directory")
+    return RoundInputs(choices, dataset, original_model, model, keep_inputs, dev_edit_file,
+                       dev_keep_file, layers, cases, facts, keys, keep, q, residual,
+                       p5_values, theta0, identity)
 
-    run_id = run_id_override or choices.get("run_id") or (
-        "edit_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
-    )
-    if not isinstance(run_id, str) or run_id in ("", ".", "..") or "/" in run_id or "\\" in run_id:
-        raise ValueError("run_id must be one directory name")
-    output_root = project_path(choices.get("output_root", "runs"))
+
+def start_round(config_file: Path, inputs: RoundInputs, run_id_override: str | None,
+                round_index: int, sequential: bool, workspace: Path | None,
+                request_key: str | None) -> tuple[Path, dict]:
+    """Create the round directory and its initial report."""
+    run_id = choose_run_id(inputs.choices.get("run_id"), run_id_override)
+    output_root = project_path(inputs.choices.get("output_root", "runs"))
     if workspace is not None:
         output_root, run_id = workspace.parent.parent, workspace.parent.name
         round_index = int(workspace.name.removeprefix("round_"))
@@ -176,11 +185,11 @@ def one_round(config_file: Path, *, run_id_override: str | None = None,
     report_path = round_dir / "pipeline_report.json"
     report = {"status": "running", "phase": "freeze_inputs", "run_id": run_id,
               "round_id": round_index, "mode": "sequential" if sequential else "independent",
-              "baseline_model": str(model), "original_model": str(original_model),
-              "fact_count": len(facts), "target_layers": layers, "stages": {},
-              "source_dataset": str(dataset), "source_dataset_sha256": file_sha256(dataset),
-              "source_keep_inputs": str(keep_inputs), "source_dev_edit_file": str(dev_edit_file),
-              "source_dev_keep_file": str(dev_keep_file),
+              "baseline_model": str(inputs.model), "original_model": str(inputs.original_model),
+              "fact_count": len(inputs.facts), "target_layers": inputs.layers, "stages": {},
+              "source_dataset": str(inputs.dataset), "source_dataset_sha256": file_sha256(inputs.dataset),
+              "source_keep_inputs": str(inputs.keep_inputs), "source_dev_edit_file": str(inputs.dev_edit_file),
+              "source_dev_keep_file": str(inputs.dev_keep_file),
               "config_file": str(config_file.resolve()), "config_sha256": file_sha256(config_file)}
     if workspace is not None and report_path.is_file():
         existing = read_json(report_path)
@@ -189,36 +198,50 @@ def one_round(config_file: Path, *, run_id_override: str | None = None,
         report["stages"] = existing.get("stages", {})
     report["request_key"] = request_key
     write_json(report_path, report)
+    return round_dir, report
 
-    upstream = {}
 
-    def stage(label: str, arguments: list[str], artifact: Path, accepted: tuple[str, ...]) -> dict:
+class StageRunner:
+    """Execute one stage and reuse only matching, intact artifacts."""
+
+    def __init__(self, round_dir: Path, report: dict, request_key: str | None,
+                 use_cache: bool, resident: bool):
+        self.round_dir = round_dir
+        self.report = report
+        self.request_key = request_key
+        self.use_cache = use_cache
+        self.resident = resident
+        self.upstream = {}
+
+    def run(self, label: str, arguments: list[str], artifact: Path,
+            accepted: tuple[str, ...] = ("complete",)) -> dict:
+        report_path = self.round_dir / "pipeline_report.json"
         dependency = config_digest({"arguments": arguments, "configs": {
-            str(path): file_sha256(path) for path in sorted(round_dir.glob("*_config.json"))},
-            "upstream": upstream, "request_key": request_key})
-        prior = report["stages"].get(label, {})
-        if use_cache and prior.get("status") in accepted and prior.get("dependency") == dependency and files_match(prior.get("files_sha256", {})):
+            str(path): file_sha256(path) for path in sorted(self.round_dir.glob("*_config.json"))},
+            "upstream": self.upstream, "request_key": self.request_key})
+        prior = self.report["stages"].get(label, {})
+        if (self.use_cache and prior.get("status") in accepted and prior.get("dependency") == dependency
+                and files_match(prior.get("files_sha256", {}))):
             result = read_json(artifact)
             status = result["status"] if isinstance(result, dict) else "complete"
             if status in accepted:
                 prior["cache_hit"] = True
-                upstream[label] = prior["files_sha256"]
+                self.upstream[label] = prior["files_sha256"]
                 print(f"[{label}] 复用本地缓存：{artifact}", flush=True)
                 return result
-        report["phase"] = label
-        write_json(report_path, report)
-        log_path = round_dir / f"{label.lower()}.log"
-        report["stages"][label] = {"status": "running", "artifact": str(artifact), "log": str(log_path)}
-        write_json(report_path, report)
+        self.report["phase"] = label
+        write_json(report_path, self.report)
+        log_path = self.round_dir / f"{label.lower()}.log"
+        self.report["stages"][label] = {"status": "running", "artifact": str(artifact), "log": str(log_path)}
+        write_json(report_path, self.report)
         print(f"[{label}] {log_path}", flush=True)
-        target = artifact if artifact.parent == round_dir else artifact.parent
-        archive_partial(target, round_dir / "failed_attempts", label)
+        target = artifact if artifact.parent == self.round_dir else artifact.parent
+        archive_partial(target, self.round_dir / "failed_attempts", label)
         started = time.perf_counter()
         with log_path.open("w", encoding="utf-8") as stream:
             try:
                 from util.gpu_runtime import execute_stage
-                execute_stage(arguments, stream=stream, cwd=ROOT,
-                              resident=choices.get("execution", {}).get("backend") == "resident")
+                execute_stage(arguments, stream=stream, cwd=ROOT, resident=self.resident)
             except subprocess.CalledProcessError:
                 if label != "P4" or not artifact.is_file() or read_json(artifact).get("status") != "rejected":
                     raise
@@ -227,141 +250,201 @@ def one_round(config_file: Path, *, run_id_override: str | None = None,
         if status not in accepted:
             raise RuntimeError(f"{label} artifact status is {status!r}: {artifact}")
         digests = snapshot(target)
-        report["stages"][label] = {"status": status, "artifact": str(artifact), "log": str(log_path),
-                                    "dependency": dependency, "files_sha256": digests, "cache_hit": False,
-                                    "elapsed_seconds": time.perf_counter() - started}
-        upstream[label] = digests
-        write_json(report_path, report)
-        print(f"[{label}] {status} | {report['stages'][label]['elapsed_seconds']:.1f}s", flush=True)
+        self.report["stages"][label] = {"status": status, "artifact": str(artifact), "log": str(log_path),
+                                        "dependency": dependency, "files_sha256": digests, "cache_hit": False,
+                                        "elapsed_seconds": time.perf_counter() - started}
+        self.upstream[label] = digests
+        write_json(report_path, self.report)
+        print(f"[{label}] {status} | {self.report['stages'][label]['elapsed_seconds']:.1f}s", flush=True)
         return result
 
+
+def freeze_round_configs(inputs: RoundInputs, round_dir: Path, run_id: str,
+                         round_index: int) -> P1RunConfig:
+    """Write exactly the frozen inputs and settings consumed by P0–P5."""
+    write_json(round_dir / "model_identity.json", inputs.baseline_identity)
+    case_file = round_dir / "editing_cases.json"
+    write_json(case_file, inputs.cases)
+    write_json(round_dir / "keep_inputs.json", read_json(inputs.keep_inputs))
+    write_json(round_dir / "source_config.json", inputs.choices)
+    p1_values = dict(inputs.choices.get("p1", {}))
+    p1 = P1RunConfig(
+        run_id=run_id, round_id=round_index, baseline_id=inputs.baseline_identity["model_revision"],
+        model_name="LLaDA-8B-Instruct", model_path=str(inputs.model),
+        model_revision=inputs.baseline_identity["model_revision"],
+        tokenizer_revision=inputs.baseline_identity["tokenizer_revision"],
+        case_file=str(case_file), facts=tuple(inputs.facts), target_layers=tuple(inputs.layers),
+        window_policy_id="short_answer_exact_tokens_v1",
+        sampler_policy_id="confidence_no_remask_v1",
+        seed=p1_values.pop("seed", 2026), steps=p1_values.pop("steps", None),
+        temperature=p1_values.pop("temperature", 0.0),
+        replay_count=p1_values.pop("replay_count", 1),
+        output_root=str(round_dir.parent.parent),
+        torch_dtype=p1_values.pop("torch_dtype", "auto"),
+        device_map=p1_values.pop("device_map", "auto"),
+    )
+    if p1_values:
+        raise ValueError(f"unsupported P1 settings: {sorted(p1_values)}")
+    p1.check()
+    p5_values = dict(inputs.p5_values)
+    p5_values.update(dev_edit_file=str(inputs.dev_edit_file), dev_keep_file=str(inputs.dev_keep_file),
+                     reference_model_path=str(inputs.original_model),
+                     reference_model_revision=inputs.original_identity["model_revision"],
+                     reference_tokenizer_revision=inputs.original_identity["tokenizer_revision"])
+    selected = {fact.case_id for fact in inputs.facts}
+    p5_values["dev_edit_probes"] = [probe for probe in p5_values["dev_edit_probes"]
+                                    if probe["case_id"] in selected]
+    if not p5_values["dev_edit_probes"]:
+        raise ValueError("当前编辑案例没有配置相应的 P5 开发探针")
+    p5 = AcceptanceConfig.from_record(p5_values)
+    for name, value in (("p1", p1.as_record()), ("p2_keys", inputs.keys.as_record()),
+                        ("p2_keep", inputs.keep.as_record()), ("p3", inputs.q.as_record()),
+                        ("p4", inputs.residual.as_record()), ("p5", p5.as_record())):
+        write_json(round_dir / f"{name}_config.json", value)
+    return p1
+
+
+def check_p0(rows: list[dict], facts: list[FactSelection], module: str) -> None:
+    """Require a real full-mask forward and replay for every selected fact."""
+    if len(rows) != len(facts) or [(row["case_id"], row["probe_id"]) for row in rows] != [
+        (fact.case_id, fact.probe_id) for fact in facts
+    ] or any(not row["real_forward"] or not row["replay_within_tolerance"]
+             or not row["full_mask_input"] or row["mask_count"] != row["target_token_count"]
+             or set(row["target_modules"]) != {module}
+             or set(row["ffn_input_shapes"]) != {module} for row in rows):
+        raise RuntimeError(f"P0 did not cover and replay all {len(facts)} facts at {module}")
+
+
+def run_round_stages(inputs: RoundInputs, runner: StageRunner, p1: P1RunConfig) -> dict | None:
+    """Run P0 through P5 in their fixed dependency order."""
+    round_dir = runner.round_dir
+    case_file = round_dir / "editing_cases.json"
+    for layer in inputs.layers:
+        label = f"P0_LAYER_{layer}"
+        module = f"model.transformer.blocks.{layer}.ff_out"
+        artifact = round_dir / f"p0_layer_{layer}.json"
+        rows = runner.run(label, ["util.smoke_p0_llada", str(case_file), "--model-path", str(inputs.model),
+                                  "--layer", str(layer), "--forward", "--output", str(artifact),
+                                  "--device-map", p1.device_map, "--torch-dtype", p1.torch_dtype], artifact)
+        check_p0(rows, inputs.facts, module)
+    p1_dir = round_dir / "p1"
+    runner.run("P1", ["util.collect_denoise_states", str(round_dir / "p1_config.json")],
+               p1_dir / "coverage_report.json")
+    runner.run("P2_KEYS", ["util.extract_reference_keys", str(p1_dir),
+                           "--config", str(round_dir / "p2_keys_config.json")],
+               round_dir / "matrices/reference_keys/manifest.json")
+    keep_command = ["util.extract_keep_statistics", str(p1_dir), str(round_dir / "keep_inputs.json"),
+                    "--config", str(round_dir / "p2_keep_config.json")]
+    if runner.resident and runner.report["mode"] == "independent":
+        keep_command.append("--reuse-across-rounds")
+    batch_keep = runner.resident and inputs.keep.device.startswith("cuda")
+    if batch_keep:
+        keep_command.append("--batch-keep")
+    runner.run("P2_KEEP", keep_command,
+               round_dir / "matrices/keep_statistics/manifest.json")
+    qa_command = ["util.validate_matrix_artifacts", str(p1_dir)]
+    if batch_keep:
+        qa_command.append("--batch-keep")
+    runner.run("P2_QA", qa_command,
+               round_dir / "matrices/validation/manifest.json")
+    runner.run("P3", ["util.solve_writeback_factor", str(p1_dir),
+                      "--config", str(round_dir / "p3_config.json")],
+               round_dir / "matrices/writeback_factors/manifest.json")
+    p4 = runner.run("P4", ["util.optimize_residuals", str(p1_dir),
+                            "--config", str(round_dir / "p4_config.json")],
+                    round_dir / "residuals/manifest.json", ("complete", "rejected"))
+    if p4["status"] == "rejected":
+        return None
+    return runner.run("P5", ["util.merge_and_accept", str(p1_dir),
+                             "--config", str(round_dir / "p5_config.json"),
+                             "--residual-dir", str(round_dir / "residuals"),
+                             "--output-dir", str(round_dir / "editing")],
+                      round_dir / "editing/acceptance_report.json")
+
+
+def verify_p5(round_dir: Path, result: dict) -> str:
+    """Check that the saved P5 artifact matches its acceptance decision."""
+    decision = result["decision"]
+    if decision not in ("accepted", "rejected"):
+        raise RuntimeError(f"unexpected P5 decision: {decision!r}")
+    manifest = read_json(round_dir / "editing/manifest.json")
+    if manifest["status"] != decision or manifest["example_only"] or not manifest["p5_stage_complete"]:
+        raise RuntimeError("P5 final manifest does not represent a completed non-example round")
+    return decision
+
+
+def reload_accepted_model(runner: StageRunner) -> None:
+    """Verify that an accepted P5 model can be reconstructed from disk."""
+    round_dir, report = runner.round_dir, runner.report
+    p5_dir = round_dir / "editing"
+    report["phase"] = "P5_RELOAD"
+    write_json(round_dir / "pipeline_report.json", report)
+    dependency = config_digest(runner.upstream)
+    prior = report["stages"].get("P5_RELOAD", {})
+    if runner.use_cache and prior.get("dependency") == dependency and files_match(prior.get("files_sha256", {})):
+        return
+    from MDLM.workflow import load_final_model
+    adapter, edited_model = load_final_model(p5_dir)
+    del adapter, edited_model
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    report["stages"]["P5_RELOAD"] = {"status": "complete", "artifact": str(p5_dir / "manifest.json"),
+                                     "dependency": dependency, "files_sha256": snapshot(p5_dir)}
+
+
+def export_accepted_checkpoint(inputs: RoundInputs, runner: StageRunner) -> Path:
+    """Write the accepted weights as the next sequential baseline."""
+    round_dir, report = runner.round_dir, runner.report
+    report["phase"] = "CHECKPOINT_EXPORT"
+    write_json(round_dir / "pipeline_report.json", report)
+    from util.export_edited_checkpoint import export_checkpoint
+    checkpoint_dir = round_dir / "checkpoint"
+    dependency = config_digest(runner.upstream)
+    prior = report["stages"].get("CHECKPOINT_EXPORT", {})
+    if not (runner.use_cache and prior.get("dependency") == dependency
+            and files_match(prior.get("files_sha256", {}))):
+        archive_partial(checkpoint_dir, round_dir / "failed_attempts", "CHECKPOINT_EXPORT")
+        export_checkpoint(inputs.model, round_dir / "editing", checkpoint_dir)
+        report["stages"]["CHECKPOINT_EXPORT"] = {
+            "status": "complete", "artifact": str(checkpoint_dir / "export_report.json"),
+            "dependency": dependency, "files_sha256": snapshot(checkpoint_dir)}
+    return checkpoint_dir
+
+
+def one_round(config_file: Path, *, run_id_override: str | None = None,
+              round_index: int = 0, baseline_model: Path | None = None,
+              sequential: bool = False, original_identity: dict | None = None,
+              selected_case_ids: list[str] | None = None, workspace: Path | None = None,
+              request_key: str | None = None, use_cache: bool = True,
+              baseline_identity: dict | None = None) -> dict:
+    """Orchestrate one source case without implementing stage mathematics."""
+    inputs = load_round_inputs(config_file, baseline_model, selected_case_ids,
+                               original_identity, baseline_identity)
+    round_dir, report = start_round(config_file, inputs, run_id_override, round_index,
+                                    sequential, workspace, request_key)
+    report_path = round_dir / "pipeline_report.json"
+    runner = StageRunner(round_dir, report, request_key, use_cache,
+                         inputs.choices.get("execution", {}).get("backend") == "resident")
     try:
-        write_json(round_dir / "model_identity.json", identity)
-        # Freeze the adapter output once. The source file is never changed.
-        case_file = round_dir / "editing_cases.json"
-        write_json(case_file, cases)
-        write_json(round_dir / "keep_inputs.json", read_json(keep_inputs))
-        keep_file = round_dir / "keep_inputs.json"
-        write_json(round_dir / "source_config.json", choices)
-        p1_values = dict(choices.get("p1", {}))
-        p1 = P1RunConfig(
-            run_id=run_id, round_id=round_index, baseline_id=identity["model_revision"],
-            model_name="LLaDA-8B-Instruct", model_path=str(model),
-            model_revision=identity["model_revision"],
-            tokenizer_revision=identity["tokenizer_revision"],
-            case_file=str(case_file), facts=tuple(facts), target_layers=tuple(layers),
-            window_policy_id="short_answer_exact_tokens_v1",
-            sampler_policy_id="confidence_no_remask_v1",
-            seed=p1_values.pop("seed", 2026), steps=p1_values.pop("steps", None),
-            temperature=p1_values.pop("temperature", 0.0),
-            replay_count=p1_values.pop("replay_count", 1), output_root=str(output_root),
-            torch_dtype=p1_values.pop("torch_dtype", "auto"),
-            device_map=p1_values.pop("device_map", "auto"),
-        )
-        if p1_values:
-            raise ValueError(f"unsupported P1 settings: {sorted(p1_values)}")
-        p1.check()
-        p5_values.update(dev_edit_file=str(dev_edit_file), dev_keep_file=str(dev_keep_file),
-                         reference_model_path=str(original_model),
-                         reference_model_revision=theta0_identity["model_revision"],
-                         reference_tokenizer_revision=theta0_identity["tokenizer_revision"])
-        selected = {fact.case_id for fact in facts}
-        if choices.get("input_preparation", {}).get("mode") == "dataset":
-            p5_values["dev_edit_probes"] = [item for item in p5_values["dev_edit_probes"] if item["case_id"] in selected]
-        if not p5_values["dev_edit_probes"]:
-            raise ValueError("当前编辑案例没有配置相应的 P5 开发探针")
-        p5 = AcceptanceConfig.from_record(p5_values)
-        for name, value in (("p1", p1.as_record()), ("p2_keys", keys.as_record()),
-                            ("p2_keep", keep.as_record()), ("p3", q.as_record()),
-                            ("p4", r.as_record()), ("p5", p5.as_record())):
-            write_json(round_dir / f"{name}_config.json", value)
-
-        for layer in layers:
-            p0_report = round_dir / f"p0_layer_{layer}.json"
-            label = f"P0_LAYER_{layer}"
-            rows = stage(label, ["util.smoke_p0_llada", str(case_file), "--model-path", str(model),
-                         "--layer", str(layer), "--forward", "--output", str(p0_report),
-                         "--device-map", p1.device_map, "--torch-dtype", p1.torch_dtype], p0_report, ("complete",))
-            module = f"model.transformer.blocks.{layer}.ff_out"
-            if len(rows) != len(facts) or [
-                (row["case_id"], row["probe_id"]) for row in rows
-            ] != [(fact.case_id, fact.probe_id) for fact in facts] or any(
-                not row["real_forward"] or not row["replay_within_tolerance"]
-                or not row["full_mask_input"] or row["mask_count"] != row["target_token_count"]
-                or set(row["target_modules"]) != {module}
-                or set(row["ffn_input_shapes"]) != {module} for row in rows
-            ):
-                raise RuntimeError(f"P0 did not cover and replay all {len(facts)} facts at layer {layer}")
-
-        p1_dir = round_dir / "p1"
-        stage("P1", ["util.collect_denoise_states", str(round_dir / "p1_config.json")],
-              p1_dir / "coverage_report.json", ("complete",))
-        stage("P2_KEYS", ["util.extract_reference_keys", str(p1_dir),
-              "--config", str(round_dir / "p2_keys_config.json")],
-              round_dir / "matrices/reference_keys/manifest.json", ("complete",))
-        stage("P2_KEEP", ["util.extract_keep_statistics", str(p1_dir), str(keep_file),
-              "--config", str(round_dir / "p2_keep_config.json")],
-              round_dir / "matrices/keep_statistics/manifest.json", ("complete",))
-        stage("P2_QA", ["util.validate_matrix_artifacts", str(p1_dir)],
-              round_dir / "matrices/validation/manifest.json", ("complete",))
-        stage("P3", ["util.solve_writeback_factor", str(p1_dir),
-              "--config", str(round_dir / "p3_config.json")],
-              round_dir / "matrices/writeback_factors/manifest.json", ("complete",))
-        p4_result = stage("P4", ["util.optimize_residuals", str(p1_dir),
-              "--config", str(round_dir / "p4_config.json")],
-              round_dir / "residuals/manifest.json", ("complete", "rejected"))
-        if p4_result["status"] == "rejected":
+        p1 = freeze_round_configs(inputs, round_dir, report["run_id"], report["round_id"])
+        p5 = run_round_stages(inputs, runner, p1)
+        if p5 is None:
             report.update(status="complete", phase="complete", decision="rejected", selected_alpha=None,
                           decision_reason="P4 未得到合格残差候选", final_model_dir=None,
                           checkpoint_dir=None, baseline_restored=True)
-            write_json(report_path, report)
-            return report
-        p5_dir = round_dir / "editing"
-        p5_result = stage("P5", ["util.merge_and_accept", str(p1_dir),
-              "--config", str(round_dir / "p5_config.json"),
-              "--residual-dir", str(round_dir / "residuals"), "--output-dir", str(p5_dir)],
-              p5_dir / "acceptance_report.json", ("complete",))
-        decision = p5_result["decision"]
-        if decision not in ("accepted", "rejected"):
-            raise RuntimeError(f"unexpected P5 decision: {decision!r}")
-        final_manifest = read_json(p5_dir / "manifest.json")
-        if final_manifest["status"] != decision or final_manifest["example_only"] or not final_manifest["p5_stage_complete"]:
-            raise RuntimeError("P5 final manifest does not represent a completed non-example round")
-        if decision == "accepted":
-            report["phase"] = "P5_RELOAD"
-            write_json(report_path, report)
-            dependency = config_digest(upstream)
-            prior = report["stages"].get("P5_RELOAD", {})
-            if not (use_cache and prior.get("dependency") == dependency and files_match(prior.get("files_sha256", {}))):
-                from MDLM.workflow import load_final_model
-                adapter, edited_model = load_final_model(p5_dir)
-                del adapter, edited_model
-                import gc
-                import torch
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                report["stages"]["P5_RELOAD"] = {"status": "complete", "artifact": str(p5_dir / "manifest.json"),
-                                                  "dependency": dependency, "files_sha256": snapshot(p5_dir)}
-        checkpoint_dir = None
-        if sequential and decision == "accepted":
-            report["phase"] = "CHECKPOINT_EXPORT"
-            write_json(report_path, report)
-            from util.export_edited_checkpoint import export_checkpoint
-            checkpoint_dir = round_dir / "checkpoint"
-            dependency = config_digest(upstream)
-            prior = report["stages"].get("CHECKPOINT_EXPORT", {})
-            if not (use_cache and prior.get("dependency") == dependency and files_match(prior.get("files_sha256", {}))):
-                archive_partial(checkpoint_dir, round_dir / "failed_attempts", "CHECKPOINT_EXPORT")
-                export_checkpoint(model, p5_dir, checkpoint_dir)
-                report["stages"]["CHECKPOINT_EXPORT"] = {
-                    "status": "complete", "artifact": str(checkpoint_dir / "export_report.json"),
-                    "dependency": dependency, "files_sha256": snapshot(checkpoint_dir)}
-        report.update(status="complete", phase="complete", decision=decision,
-                      selected_alpha=p5_result["selection"]["selected_alpha"],
-                      final_model_dir=str(p5_dir) if decision == "accepted" else None,
-                      checkpoint_dir=str(checkpoint_dir) if checkpoint_dir is not None else None,
-                      baseline_restored=p5_result["baseline_restored"])
+        else:
+            decision = verify_p5(round_dir, p5)
+            if decision == "accepted":
+                reload_accepted_model(runner)
+            checkpoint = export_accepted_checkpoint(inputs, runner) if sequential and decision == "accepted" else None
+            report.update(status="complete", phase="complete", decision=p5["decision"],
+                          selected_alpha=p5["selection"]["selected_alpha"],
+                          final_model_dir=str(round_dir / "editing") if p5["decision"] == "accepted" else None,
+                          checkpoint_dir=str(checkpoint) if checkpoint is not None else None,
+                          baseline_restored=p5["baseline_restored"])
         write_json(report_path, report)
         return report
     except Exception as error:
@@ -395,12 +478,21 @@ def run_dataset(config_file: Path, *, sequential: bool = False,
                             execution_override=execution)
 
 
-def _run_dataset(config_file: Path, *, sequential: bool = False,
-                 run_id_override: str | None = None, dataset_override: Path | None = None,
-                 model_override: Path | None = None, cache_override: Path | None = None,
-                 use_cache: bool = True, execution_override: dict | None = None) -> dict:
-    """Prepare the selected dataset, then edit each source case and reuse matching stages."""
-    config_file = config_file.resolve()
+@dataclass(frozen=True)
+class DatasetInputs:
+    choices: dict
+    source_dataset: Path
+    original_model: Path
+    dataset: Path
+    cache_dir: Path
+    original_identity: dict
+    preparation: dict
+
+
+def prepare_dataset_run(config_file: Path, dataset_override: Path | None,
+                        model_override: Path | None, cache_override: Path | None,
+                        use_cache: bool, execution_override: dict | None) -> DatasetInputs:
+    """Prepare all stage inputs from the selected dataset before starting rounds."""
     choices = read_json(config_file)
     if execution_override:
         choices["execution"] = execution_override
@@ -419,37 +511,59 @@ def _run_dataset(config_file: Path, *, sequential: bool = False,
         raise ValueError("full-run configuration is incomplete:\n- " + "\n- ".join(issues))
     source_dataset = required_path(choices, "dataset")
     original_model = required_path(choices, "model_path")
-    choices["dataset"], choices["model_path"] = str(source_dataset), str(original_model)
+    choices["model_path"] = str(original_model)
     choices["source_dataset"] = str(source_dataset)
     choices["source_dataset_sha256"] = file_sha256(source_dataset)
     cache_dir = cache_override.resolve() if cache_override is not None else project_path(choices.get("cache_dir", "runs/cache"))
     print("[模型身份] 检查模型文件（未变化的权重复用本地摘要）...", flush=True)
-    identity_started = time.perf_counter()
-    theta0_identity = local_model_identity(original_model)
-    print(f"[模型身份] 完成 | {time.perf_counter() - identity_started:.1f}s", flush=True)
-    preparation = None
-    if choices.get("input_preparation", {}).get("mode", "explicit") == "dataset":
-        preparation = prepare_inputs(source_dataset, original_model, tuple(choices["target_layers"]), cache_dir,
-                                     settings=choices["input_preparation"].get("settings"), use_cache=use_cache)
-        print("[输入准备] " + ("复用缓存：" if preparation["cache_hit"] else "已生成：") + preparation["manifest"], flush=True)
-        files = preparation["files"]
-        choices["dataset"] = files["editing_cases.json"]
-        choices["keep_inputs"] = files["keep_statistics.json"]
-        choices.setdefault("p2_keep", {})["recipe_id"] = preparation["recipe_id"]
-        choices["p5"].update(dev_edit_file=files["editing_cases.json"],
-                              dev_edit_probes=read_json(Path(files["development_probes.json"])),
-                              dev_keep_file=files["development_keep.json"])
-        if choices["p4"].get("beta", 0) > 0:
-            choices["p4"]["keep_train_file"] = files["keep_training.json"]
-        choices["prepared_inputs"] = {"manifest": preparation["manifest"], "cache_key": preparation["cache_key"],
-                                      "manifest_sha256": file_sha256(preparation["manifest"])}
-    for key in ("dataset", "keep_inputs"):
-        choices[key] = str(required_path(choices, key))
-    for key in ("dev_edit_file", "dev_keep_file"):
-        choices["p5"][key] = str(required_path(choices["p5"], key))
+    started = time.perf_counter()
+    identity = local_model_identity(original_model)
+    print(f"[模型身份] 完成 | {time.perf_counter() - started:.1f}s", flush=True)
+    preparation = prepare_inputs(source_dataset, original_model, tuple(choices["target_layers"]), cache_dir,
+                                 settings=choices.get("input_preparation", {}).get("settings"), use_cache=use_cache)
+    print("[输入准备] " + ("复用缓存：" if preparation["cache_hit"] else "已生成：") + preparation["manifest"], flush=True)
+    files = preparation["files"]
+    choices["dataset"] = files["editing_cases.json"]
+    choices["keep_inputs"] = files["keep_statistics.json"]
+    choices.setdefault("p2_keep", {})["recipe_id"] = preparation["recipe_id"]
+    choices["p5"].update(dev_edit_file=files["editing_cases.json"],
+                          dev_edit_probes=read_json(Path(files["development_probes.json"])),
+                          dev_keep_file=files["development_keep.json"])
     if choices["p4"].get("beta", 0) > 0:
-        choices["p4"]["keep_train_file"] = str(required_path(choices["p4"], "keep_train_file"))
-    dataset = Path(choices["dataset"])
+        choices["p4"]["keep_train_file"] = files["keep_training.json"]
+    choices["prepared_inputs"] = {"manifest": preparation["manifest"], "cache_key": preparation["cache_key"],
+                                  "manifest_sha256": file_sha256(preparation["manifest"])}
+    return DatasetInputs(choices, source_dataset, original_model, Path(choices["dataset"]),
+                         cache_dir, identity, preparation)
+
+
+def record_evaluation(root: Path, report: dict, device: str | None) -> dict:
+    """Evaluate completed rounds and save the two summary reports."""
+    from util.evaluate_accuracy import evaluate_run
+    accuracy = evaluate_run(root, device=device)
+    report["evaluation_status"] = accuracy["status"]
+    report["accuracy_report"] = str(root / "accuracy_report.json")
+    report["independent_accuracy"] = accuracy.get("independent")
+    report["preservation_accuracy"] = accuracy.get("preservation")
+    write_json(root / "evaluation_plan.json", {"status": accuracy["status"],
+               "inputs": accuracy.get("inputs"), "report": report["accuracy_report"],
+               "mode": report["mode"]})
+    write_json(root / "run_report.json", report)
+    return accuracy
+
+
+def _run_dataset(config_file: Path, *, sequential: bool = False,
+                 run_id_override: str | None = None, dataset_override: Path | None = None,
+                 model_override: Path | None = None, cache_override: Path | None = None,
+                 use_cache: bool = True, execution_override: dict | None = None) -> dict:
+    """Edit each source case and aggregate the completed rounds."""
+    config_file = config_file.resolve()
+    prepared = prepare_dataset_run(config_file, dataset_override, model_override, cache_override,
+                                   use_cache, execution_override)
+    choices, source_dataset, original_model = prepared.choices, prepared.source_dataset, prepared.original_model
+    dataset, cache_dir = prepared.dataset, prepared.cache_dir
+    theta0_identity, preparation = prepared.original_identity, prepared.preparation
+    execution = choices.get("execution", {})
     cases = load_cases(dataset)
     if not cases:
         raise ValueError("the dataset adapter selected no editing facts")
@@ -460,11 +574,7 @@ def _run_dataset(config_file: Path, *, sequential: bool = False,
     groups = {}
     for case in cases:
         groups.setdefault(case.get("source_case_id", case["case_id"]), []).append(case["case_id"])
-    run_id = run_id_override or choices.get("run_id") or (
-        "edit_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
-    )
-    if not isinstance(run_id, str) or run_id in ("", ".", "..") or "/" in run_id or "\\" in run_id:
-        raise ValueError("run_id must be one directory name")
+    run_id = choose_run_id(choices.get("run_id"), run_id_override)
     root = project_path(choices.get("output_root", "runs")) / run_id
     root.mkdir(parents=True, exist_ok=False)
     effective_config = root / "effective_config.json"
@@ -474,7 +584,7 @@ def _run_dataset(config_file: Path, *, sequential: bool = False,
               "run_id": run_id, "fact_count": len(case_ids), "case_count": len(groups),
               "source_dataset": str(source_dataset), "original_model": str(original_model),
               "source_dataset_sha256": choices["source_dataset_sha256"],
-              "prepared_inputs": preparation["manifest"] if preparation else None,
+              "prepared_inputs": preparation["manifest"],
               "execution": execution,
               "rounds": [], "current_case_id": None, "evaluation_status": "pending"}
     write_json(report_path, report)
@@ -523,16 +633,7 @@ def _run_dataset(config_file: Path, *, sequential: bool = False,
                       rejected_count=sum(row["decision"] == "rejected" for row in report["rounds"]),
                       final_checkpoint_dir=str(baseline) if sequential else None)
         write_json(report_path, report)
-        from util.evaluate_accuracy import evaluate_run
-        accuracy = evaluate_run(root, device=execution.get("device"))
-        report["evaluation_status"] = accuracy["status"]
-        report["accuracy_report"] = str(root / "accuracy_report.json")
-        report["independent_accuracy"] = accuracy.get("independent")
-        report["preservation_accuracy"] = accuracy.get("preservation")
-        write_json(root / "evaluation_plan.json", {"status": accuracy["status"],
-                   "inputs": accuracy.get("inputs"), "report": report["accuracy_report"],
-                   "mode": report["mode"]})
-        write_json(report_path, report)
+        record_evaluation(root, report, execution.get("device"))
         return report
     except Exception as error:
         report.update(status="failed", failure=str(error))
@@ -557,7 +658,6 @@ def main() -> None:
     parser.add_argument("--sequential", action="store_true", help="same as positional sequential")
     args = parser.parse_args()
     if args.evaluate_run is not None:
-        from util.evaluate_accuracy import evaluate_run
         from util.gpu_runtime import execution_context
         run_dir = args.evaluate_run.resolve()
         prior = read_json(run_dir / "run_report.json")
@@ -566,15 +666,7 @@ def main() -> None:
         if args.device:
             execution.update(backend="resident", device=args.device)
         with execution_context(execution, choices["target_layers"]):
-            accuracy = evaluate_run(run_dir, device=args.device)
-        prior["evaluation_status"] = accuracy["status"]
-        prior["accuracy_report"] = str(run_dir / "accuracy_report.json")
-        prior["independent_accuracy"] = accuracy.get("independent")
-        prior["preservation_accuracy"] = accuracy.get("preservation")
-        write_json(run_dir / "run_report.json", prior)
-        write_json(run_dir / "evaluation_plan.json", {"status": accuracy["status"],
-                   "inputs": accuracy.get("inputs"), "report": prior["accuracy_report"],
-                   "mode": prior["mode"]})
+            accuracy = record_evaluation(run_dir, prior, args.device)
         print(json.dumps({key: accuracy.get(key) for key in ("status", "independent", "preservation")},
                          ensure_ascii=False, indent=2))
         return

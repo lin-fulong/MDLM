@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import os
+import shutil
 from pathlib import Path
 
 from MDLM.contracts import (
@@ -14,6 +17,41 @@ from MDLM.keep_statistics import SecondMomentAccumulator
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import KeepModelInput, tensor_sha256
 from util.extract_reference_keys import load_reference_inputs, write_json
+
+
+# 独立编辑时，同一原始模型与冻结保持输入产生同一个 C；仅缓存最近一次成功的结果。
+_reusable_c: dict | None = None
+
+
+def reusable_c(key: str, names: set[str]) -> dict | None:
+    entry = _reusable_c
+    if entry is None or entry["key"] != key or set(entry["layers"]) != names:
+        return None
+    if any(not (path := entry["directory"] / info["tensor_file"]).is_file()
+           or file_sha256(path) != info["tensor_file_sha256"] for info in entry["layers"].values()):
+        return None
+    return entry
+
+
+def copy_cached_c(source: Path, destination: Path) -> None:
+    # 阶段产物只读；同一文件系统优先复用字节，跨文件系统则复制。
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copyfile(source, destination)
+
+
+def equal_length_groups(records: list[tuple], input_index: int, enabled: bool):
+    """Preserve input order and batch only equal lengths within a bounded token budget."""
+    start = 0
+    while start < len(records):
+        length = len(records[start][input_index].input_ids)
+        limit = min(4, max(1, 256 // max(length, 1))) if enabled else 1
+        end = start + 1
+        while end < len(records) and end - start < limit and len(records[end][input_index].input_ids) == length:
+            end += 1
+        yield records[start:end]
+        start = end
 
 
 def keep_input_from_record(record: dict) -> KeepModelInput:
@@ -48,8 +86,10 @@ def load_key_reference(p1_dir: Path, config, source_hashes: dict) -> tuple[dict,
     return keys, paths
 
 
-def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatisticsConfig) -> dict:
-    """Accumulate one layer at a time on CPU; the model remains read-only."""
+def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatisticsConfig,
+                *, reuse_across_rounds: bool = False, batch_keep: bool = False) -> dict:
+    """Accumulate one layer at a time on the configured device; the model remains read-only."""
+    global _reusable_c
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -63,7 +103,8 @@ def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatist
                 "settings": settings.as_record(), "settings_sha256": config_digest(settings.as_record()),
                 "source_p1_dir": str(p1_dir), "source_keep_file": str(keep_file),
                 "centered": False, "normalization": "none", "p2_stage_complete": False,
-                "memory_policy": "one_layer_at_a_time_cpu_accumulation_and_chunked_QA"}
+                "memory_policy": "one_layer_at_a_time_accumulation_and_chunked_QA",
+                "accumulation_device": settings.device}
     report = {"status": "partial", "phase": "source_artifacts", "forward_count": 0, "layers": {}}
     write_json(manifest_path, manifest)
     try:
@@ -110,6 +151,17 @@ def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatist
                 or identity != keys["model_identity"]):
             raise ValueError("keep statistics baseline differs from P1/K")
         manifest["model_identity"] = identity
+        cache_key = config_digest({"model_path": str(Path(config.model_path).resolve()),
+                                   "model_identity": identity, "keep_sha256": keep_digest,
+                                   "settings": settings.as_record(), "target_layers": config.target_layers,
+                                   "torch_dtype": config.torch_dtype, "device_map": config.device_map,
+                                   "forward_conditions": source["forward_conditions"],
+                                   "batch_keep": batch_keep})
+        cached = reusable_c(cache_key, names) if reuse_across_rounds else None
+        manifest["reused_c"] = cached is not None
+        report["reused_c"] = cached is not None
+        if cached is not None:
+            print(f"Reusing verified C from {cached['directory']}", flush=True)
         report["phase"] = "model_loading"
         adapter = LLaDA8BInstructAdapter.from_local_tokenizer(
             model_path=config.model_path, target_layers=config.target_layers)
@@ -134,6 +186,14 @@ def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatist
         for layer in config.target_layers:
             name = f"model.transformer.blocks.{layer}.ff_out"
             report["phase"], report["current_layer"] = "accumulation", name
+            if cached is not None:
+                tensor_file = cached["layers"][name]["tensor_file"]
+                copy_cached_c(cached["directory"] / tensor_file, output_dir / tensor_file)
+                layers[name] = copy.deepcopy(cached["layers"][name])
+                report["layers"][name] = copy.deepcopy(cached["reports"][name])
+                report["layers"][name]["reused_from"] = str(cached["directory"] / tensor_file)
+                write_json(report_path, report)
+                continue
             print(f"Accumulating C for {name} on {settings.device}...", flush=True)
             # 按层重放保持输入，只驻留这一层的方阵，不保存全量激活。
             layer_adapter = LLaDA8BInstructAdapter(
@@ -146,38 +206,43 @@ def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatist
             groups = {}
             report["layers"][name] = {"status": "partial", "inputs": completed}
             capture_dtype = None
-            for row, model_input, positions in records:
-                report["current_input_id"] = row["input_id"]
-                report["forward_count"] += 1
-                captured = layer_adapter.forward_keep_with_capture(model, model_input, positions)
-                report["forward_count"] += 1
-                repeated = layer_adapter.forward_keep_with_capture(model, model_input, positions)
-                if tensor_sha256(captured.mask_logits) != tensor_sha256(repeated.mask_logits):
-                    raise ValueError(f"{row['input_id']}: keep mask logits did not replay")
-                values, replay_values = captured.module_inputs[name], repeated.module_inputs[name]
-                if values.shape != replay_values.shape or not torch.allclose(
-                    values, replay_values, atol=settings.replay_atol, rtol=settings.replay_rtol
-                ):
-                    raise ValueError(f"{row['input_id']}: keep module inputs did not replay at {name}")
-                if capture_dtype is not None and capture_dtype != str(values.dtype):
-                    raise ValueError(f"keep capture dtype changed between inputs at {name}")
-                capture_dtype = str(values.dtype)
-                weights = row["weights_by_layer"][name]
-                accumulator.add(values, weights)
-                group = groups.setdefault(row["source"].get("source_dataset", "unspecified"),
-                                          {"input_count": 0, "vector_count": 0, "weight_sum": 0.0})
-                group["input_count"] += 1
-                group["vector_count"] += len(positions)
-                group["weight_sum"] += sum(weights)
-                completed.append({
-                    "input_id": row["input_id"], "source": row["source"],
-                    "input_sha256": config_digest(row["input"]),
-                    "capture_positions": list(positions), "weights": weights,
-                    "weight_sum": sum(weights), "mask_count": len(model_input.mask_positions),
-                    "mask_logits_sha256": tensor_sha256(captured.mask_logits),
-                    "capture_sha256": tensor_sha256(values),
-                    "capture_replay_max_abs": float((values.double() - replay_values.double()).abs().max()),
-                })
+            for group in equal_length_groups(records, 1, batch_keep):
+                requests = tuple((model_input, positions) for _, model_input, positions in group)
+                captures = layer_adapter.forward_keep_batch_with_capture(model, requests)
+                repeats = layer_adapter.forward_keep_batch_with_capture(model, requests)
+                report["forward_count"] += 2
+                group_values, group_weights = [], []
+                for (row, model_input, positions), captured, repeated in zip(group, captures, repeats):
+                    report["current_input_id"] = row["input_id"]
+                    if tensor_sha256(captured.mask_logits) != tensor_sha256(repeated.mask_logits):
+                        raise ValueError(f"{row['input_id']}: keep mask logits did not replay")
+                    values, replay_values = captured.module_inputs[name], repeated.module_inputs[name]
+                    if values.shape != replay_values.shape or not torch.allclose(
+                        values, replay_values, atol=settings.replay_atol, rtol=settings.replay_rtol
+                    ):
+                        raise ValueError(f"{row['input_id']}: keep module inputs did not replay at {name}")
+                    if capture_dtype is not None and capture_dtype != str(values.dtype):
+                        raise ValueError(f"keep capture dtype changed between inputs at {name}")
+                    capture_dtype = str(values.dtype)
+                    weights = row["weights_by_layer"][name]
+                    group_values.append(values)
+                    group_weights.extend(weights)
+                    source_group = groups.setdefault(row["source"].get("source_dataset", "unspecified"),
+                                                     {"input_count": 0, "vector_count": 0, "weight_sum": 0.0})
+                    source_group["input_count"] += 1
+                    source_group["vector_count"] += len(positions)
+                    source_group["weight_sum"] += sum(weights)
+                    completed.append({
+                        "input_id": row["input_id"], "source": row["source"],
+                        "input_sha256": config_digest(row["input"]),
+                        "capture_positions": list(positions), "weights": weights,
+                        "weight_sum": sum(weights), "mask_count": len(model_input.mask_positions),
+                        "mask_logits_sha256": tensor_sha256(captured.mask_logits),
+                        "capture_sha256": tensor_sha256(values),
+                        "capture_replay_max_abs": float((values.double() - replay_values.double()).abs().max()),
+                    })
+                # 合并同一批的外积更新，减少巨大 C 矩阵的读写次数；权重和样本顺序不变。
+                accumulator.add(torch.cat(group_values), group_weights)
             report["phase"] = "layer_numeric_QA"
             stored = accumulator.matrix.to(dtype=getattr(torch, settings.storage_dtype))
             diagnostics = accumulator.diagnose(
@@ -234,6 +299,9 @@ def extract_run(p1_dir: str | Path, keep_file: str | Path, settings: KeepStatist
                          "saved_keep_inputs_sha256": file_sha256(output_dir / "keep_inputs.json"),
                          "qa_report_sha256": file_sha256(report_path)})
         write_json(manifest_path, manifest)
+        if reuse_across_rounds:
+            _reusable_c = {"key": cache_key, "directory": output_dir,
+                           "layers": copy.deepcopy(layers), "reports": copy.deepcopy(report["layers"])}
     except Exception as error:
         manifest["status"] = "failed"
         report.update({"status": "failed", "failure": str(error)})
@@ -249,8 +317,12 @@ def main() -> None:
     parser.add_argument("p1_dir", type=Path, help="completed P1 directory with matching K artifacts")
     parser.add_argument("keep_inputs", type=Path, help="frozen keep_statistics input JSON")
     parser.add_argument("--config", type=Path, required=True, help="explicit formula (5) recipe and numeric choices")
+    parser.add_argument("--reuse-across-rounds", action="store_true",
+                        help="reuse the same verified C across independent rounds in this process")
+    parser.add_argument("--batch-keep", action="store_true", help="batch equal-length keep inputs without padding")
     args = parser.parse_args()
-    report = extract_run(args.p1_dir, args.keep_inputs, KeepStatisticsConfig.from_file(args.config))
+    report = extract_run(args.p1_dir, args.keep_inputs, KeepStatisticsConfig.from_file(args.config),
+                         reuse_across_rounds=args.reuse_across_rounds, batch_keep=args.batch_keep)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

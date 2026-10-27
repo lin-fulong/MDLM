@@ -59,12 +59,34 @@ class KeepStatisticsPipelineTests(unittest.TestCase):
     def write_payload(self, payload):
         self.keep_file.write_text(json.dumps(payload), encoding="utf-8")
 
-    def extract(self):
+    def extract(self, *, reuse_across_rounds=False, batch_keep=False):
         with patch.object(LLaDA8BInstructAdapter, "from_local_tokenizer", return_value=self.adapter), \
                 patch.object(LLaDA8BInstructAdapter, "load_model", return_value=self.model), \
                 patch.object(LLaDA8BInstructAdapter, "prepare_edit_input", side_effect=AssertionError("no retokenizing edits")), \
                 patch.object(LLaDA8BInstructAdapter, "sample_denoise", side_effect=AssertionError("no sampling")):
-            return keep_tools.extract_run(self.p1_dir, self.keep_file, self.settings)
+            return keep_tools.extract_run(self.p1_dir, self.keep_file, self.settings,
+                                          reuse_across_rounds=reuse_across_rounds, batch_keep=batch_keep)
+
+    def test_equal_length_batch_replays_and_validates_same_formula(self):
+        result = self.extract(batch_keep=True)
+        self.assertEqual(result["forward_count"], 5)
+        for name, layer in self.read_artifact("manifest.json")["layers"].items():
+            matrix = load_file(str(self.output_dir / layer["tensor_file"]))[name]
+            expected = torch.zeros_like(matrix, dtype=torch.float64)
+            layer_index = int(name.split(".")[3])
+            for row in self.payload["inputs"]:
+                hidden = self.model.embedding.weight[row["input"]["input_ids"]].detach()
+                for block in self.model.model.transformer.blocks[:layer_index]:
+                    hidden = block.ff_out(hidden).detach()
+                for position, weight in zip(row["capture_positions"], row["weights_by_layer"][name]):
+                    expected += weight * torch.outer(hidden[position].double(), hidden[position].double())
+            torch.testing.assert_close(matrix, expected.float(), atol=0, rtol=0)
+        from util.validate_matrix_artifacts import validate_run
+        with patch.object(LLaDA8BInstructAdapter, "from_local_tokenizer", return_value=self.adapter), \
+             patch.object(LLaDA8BInstructAdapter, "load_model", return_value=self.model):
+            self.assertEqual(validate_run(self.p1_dir, batch_keep=True)["status"], "complete")
+        report = json.loads((self.p1_dir.parent / "matrices/validation/qa_report.json").read_text())
+        self.assertEqual(report["real_model_forward_count"], 4)
 
     def read_artifact(self, name):
         return json.loads((self.output_dir / name).read_text(encoding="utf-8"))
@@ -126,6 +148,49 @@ class KeepStatisticsPipelineTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.extract()
         self.assertEqual(snapshot, file_sha256(self.output_dir / "manifest.json"))
+
+    def test_independent_round_reuses_only_verified_C(self):
+        with patch.object(keep_tools, "_reusable_c", None):
+            first = self.extract(reuse_across_rounds=True)
+            saved = self.output_dir.with_name("previous_keep_statistics")
+            self.output_dir.rename(saved)
+            keep_tools._reusable_c["directory"] = saved
+            with patch.object(LLaDA8BInstructAdapter, "forward_keep_with_capture",
+                              side_effect=AssertionError("C capture should be reused")):
+                second = self.extract(reuse_across_rounds=True)
+            self.assertEqual(first["forward_count"], 9)
+            self.assertEqual(second["forward_count"], 1)
+            self.assertEqual(self.read_artifact("manifest.json")["status"], "complete")
+            from util.validate_matrix_artifacts import validate_run
+            with patch.object(LLaDA8BInstructAdapter, "from_local_tokenizer", return_value=self.adapter), \
+                 patch.object(LLaDA8BInstructAdapter, "load_model", return_value=self.model):
+                self.assertEqual(validate_run(self.p1_dir)["status"], "complete")
+            for layer in self.adapter.target_module_names():
+                old = saved / self.read_artifact("manifest.json")["layers"][layer]["tensor_file"]
+                new = self.output_dir / old.name
+                self.assertEqual(file_sha256(old), file_sha256(new))
+                self.assertEqual(self.read_artifact("qa_report.json")["layers"][layer]["reused_from"], str(old))
+
+    def test_corrupted_cached_C_is_recomputed(self):
+        with patch.object(keep_tools, "_reusable_c", None):
+            self.extract(reuse_across_rounds=True)
+            saved = self.output_dir.with_name("previous_keep_statistics")
+            self.output_dir.rename(saved)
+            keep_tools._reusable_c["directory"] = saved
+            damaged = saved / "c_layer_0.safetensors"
+            damaged.write_bytes(damaged.read_bytes() + b"changed")
+            original = LLaDA8BInstructAdapter.forward_keep_with_capture
+            calls = []
+
+            def capture(adapter, model, model_input, positions):
+                calls.append(1)
+                return original(adapter, model, model_input, positions)
+
+            with patch.object(LLaDA8BInstructAdapter, "forward_keep_with_capture", new=capture):
+                result = self.extract(reuse_across_rounds=True)
+            self.assertEqual(result["forward_count"], 9)
+            self.assertEqual(len(calls), 8)
+            self.assertFalse(self.read_artifact("manifest.json")["reused_c"])
 
     def test_recipe_purpose_tokenizer_and_layers_are_bound_before_model_loading(self):
         variants = (

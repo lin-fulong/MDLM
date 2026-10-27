@@ -6,7 +6,6 @@
   "cache_dir": "runs/cache",
   "execution": {"backend": "resident", "device": "cuda:0"},
   "input_preparation": {
-    "mode": "dataset",
     "settings": {"seed": 2026, "dev_fraction": 0.25, "test_fraction": 0.25,
                  "statistics_scale": 1.0, "dev_edit_policy": "edit_probe"}
   },

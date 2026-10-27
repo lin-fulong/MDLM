@@ -184,13 +184,20 @@ class LLaDA8BInstructAdapter(ModelAdapter):
     ) -> ForwardCapture:
         """Capture formula (5) inputs at the frozen positions in their given order."""
         descriptions = self.inspect_target_modules(model)
+        self._check_keep_capture_input(model, model_input, capture_positions)
+        return self._forward_capture(
+            model, model_input, capture_positions, descriptions, require_all_logits_finite=True,
+        )
+
+    def _check_keep_capture_input(self, model: Any, model_input: KeepModelInput,
+                                  capture_positions: tuple[int, ...]) -> None:
         if getattr(model.config, "mask_token_id", None) != self.mask_token_id:
             raise ValueError("model and adapter mask_token_id disagree")
         if model.training:
             raise ValueError("preservation capture requires model.eval() for reproducible outputs")
         length = len(model_input.input_ids)
-        if length > model.config.max_sequence_length:
-            raise ValueError("preservation input exceeds model max_sequence_length")
+        if not 0 < length <= model.config.max_sequence_length:
+            raise ValueError("preservation input length must be within model max_sequence_length")
         if len(model_input.attention_mask) != length or any(value != 1 for value in model_input.attention_mask):
             raise ValueError("preservation input requires an all-ones attention mask")
         if not capture_positions or len(set(capture_positions)) != len(capture_positions) or any(
@@ -204,10 +211,64 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         actual_masks = {i for i, token in enumerate(model_input.input_ids) if token == self.mask_token_id}
         if set(model_input.mask_positions) != actual_masks:
             raise ValueError("preservation mask positions differ from actual mask tokens")
-        # 保持位置可以在 mask 前、中、后，也可显式采用全可见上下文。
-        return self._forward_capture(
-            model, model_input, capture_positions, descriptions, require_all_logits_finite=True,
-        )
+
+    def forward_keep_batch_with_capture(
+        self, model: Any, requests: tuple[tuple[KeepModelInput, tuple[int, ...]], ...]
+    ) -> list[ForwardCapture]:
+        """Capture equal-length preservation inputs together without padding or changing positions."""
+        import torch
+
+        if not requests:
+            raise ValueError("preservation batch must be nonempty")
+        if len(requests) == 1:
+            model_input, positions = requests[0]
+            return [self.forward_keep_with_capture(model, model_input, positions)]
+        descriptions = self.inspect_target_modules(model)
+        lengths = {len(model_input.input_ids) for model_input, positions in requests}
+        if len(lengths) != 1:
+            raise ValueError("preservation batch requires equal input lengths")
+        for model_input, positions in requests:
+            self._check_keep_capture_input(model, model_input, positions)
+        names = self.target_module_names()
+        captured: dict[str, list[torch.Tensor]] = {}
+        call_counts = {name: 0 for name in names}
+        handles = []
+
+        def hook_for(name):
+            def capture(_module, inputs):
+                call_counts[name] += 1
+                values = inputs[0]
+                captured[name] = [values[index, list(positions)].detach().clone()
+                                  for index, (_, positions) in enumerate(requests)]
+            return capture
+
+        try:
+            for name in names:
+                handles.append(model.get_submodule(name).register_forward_pre_hook(hook_for(name)))
+            device = model.get_input_embeddings().weight.device
+            input_ids = torch.tensor([item.input_ids for item, _ in requests], dtype=torch.long, device=device)
+            attention = torch.tensor([item.attention_mask for item, _ in requests], dtype=torch.long, device=device)
+            with torch.no_grad():
+                logits = model(input_ids=input_ids, attention_mask=attention,
+                               use_cache=False, return_dict=True).logits
+            if logits.ndim != 3 or logits.shape[:2] != (len(requests), lengths.pop()):
+                raise ValueError("unexpected batched preservation logits shape")
+            if not torch.isfinite(logits).all() or any(call_counts[name] != 1 for name in names):
+                raise ValueError("invalid batched preservation forward")
+            results = []
+            for index, (model_input, positions) in enumerate(requests):
+                mask_logits = logits[index, list(model_input.mask_positions)].detach().clone()
+                module_inputs = {name: captured[name][index] for name in names}
+                if not torch.isfinite(mask_logits).all() or any(
+                    value.shape != (len(positions), descriptions[name]["in_features"])
+                    or not torch.isfinite(value).all() for name, value in module_inputs.items()
+                ):
+                    raise ValueError("invalid batched preservation capture")
+                results.append(ForwardCapture(mask_logits, module_inputs))
+            return results
+        finally:
+            for handle in handles:
+                handle.remove()
 
     def _forward_capture(
         self, model: Any, model_input: MaskedEditInput | KeepModelInput,
