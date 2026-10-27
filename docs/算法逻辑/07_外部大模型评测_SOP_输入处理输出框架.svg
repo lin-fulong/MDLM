@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="920" viewBox="0 0 1600 920" role="img" aria-labelledby="title desc">
+  <title id="title">外部大模型评测 SOP 输入处理输出框架</title>
+  <desc id="desc">左侧为输入材料，中间为数据准备、模型实验、评价统计三个核心模块，右侧为编辑、预测、裁判和报告输出。底部强调模型输入和裁判参考必须隔离。</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#334155" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <style>
+      .title { font: 700 38px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #172033; }
+      .subtitle { font: 400 20px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #64748b; }
+      .column-title { font: 700 28px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #172033; }
+      .card-title { font: 700 21px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #172033; }
+      .body { font: 400 18px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #475569; }
+      .small { font: 400 16px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #64748b; }
+      .note-title { font: 700 22px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #7c2d12; }
+      .note { font: 400 18px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #9a3412; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="920" fill="#f8fafc"/>
+  <text x="800" y="62" text-anchor="middle" class="title">外部大模型评测 SOP：输入—处理—输出框架</text>
+  <text x="800" y="96" text-anchor="middle" class="subtitle">把复杂步骤归纳为三类输入、三个核心模块和四类可追溯输出</text>
+
+  <!-- Input column -->
+  <rect x="55" y="135" width="390" height="610" rx="24" fill="#eef6ff" stroke="#93c5fd" stroke-width="2" filter="url(#shadow)"/>
+  <text x="250" y="185" text-anchor="middle" class="column-title">输入材料</text>
+
+  <rect x="85" y="220" width="330" height="92" rx="16" fill="#ffffff"/>
+  <text x="110" y="253" class="card-title">编辑案例 dᵢ</text>
+  <text x="110" y="284" class="body">主体、关系、旧对象、新目标</text>
+
+  <rect x="85" y="330" width="330" height="92" rx="16" fill="#ffffff"/>
+  <text x="110" y="363" class="card-title">问题与标准参考</text>
+  <text x="110" y="394" class="body">问题 q、短答案 a*、证据与范围</text>
+
+  <rect x="85" y="440" width="330" height="92" rx="16" fill="#ffffff"/>
+  <text x="110" y="473" class="card-title">模型与编辑方法</text>
+  <text x="110" y="504" class="body">基准状态 Bᵦ、方法 m 与配置</text>
+
+  <rect x="85" y="550" width="330" height="118" rx="16" fill="#ffffff"/>
+  <text x="110" y="583" class="card-title">冻结的评价协议</text>
+  <text x="110" y="614" class="body">生成设置、裁判规则、复核范围</text>
+  <text x="110" y="644" class="body">统计分母、版本与成本预算</text>
+
+  <!-- Center column -->
+  <rect x="595" y="135" width="410" height="610" rx="24" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="2" filter="url(#shadow)"/>
+  <text x="800" y="185" text-anchor="middle" class="column-title">核心处理模块</text>
+
+  <rect x="630" y="220" width="340" height="128" rx="18" fill="#ffffff" stroke="#ddd6fe" stroke-width="2"/>
+  <text x="660" y="257" class="card-title">A. 数据准备</text>
+  <text x="660" y="290" class="body">定义评价规则、构造私有参考 r_q</text>
+  <text x="660" y="320" class="body">隔离无答案模型输入 u_q</text>
+
+  <rect x="630" y="375" width="340" height="128" rx="18" fill="#ffffff" stroke="#ddd6fe" stroke-width="2"/>
+  <text x="660" y="412" class="card-title">B. 模型实验</text>
+  <text x="660" y="445" class="body">执行编辑并固定编辑后状态 Bₑ</text>
+  <text x="660" y="475" class="body">编辑前后生成、提取并保存回答 y_q</text>
+
+  <rect x="630" y="530" width="340" height="148" rx="18" fill="#ffffff" stroke="#ddd6fe" stroke-width="2"/>
+  <text x="660" y="567" class="card-title">C. 评价与统计</text>
+  <text x="660" y="600" class="body">外部裁判、结构校验与独立复核</text>
+  <text x="660" y="630" class="body">保留失败和缺测，按固定分母汇总</text>
+  <text x="660" y="660" class="body">计算成功率、覆盖率、上下界与成本</text>
+
+  <!-- Output column -->
+  <rect x="1155" y="135" width="390" height="610" rx="24" fill="#effaf5" stroke="#86efac" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1350" y="185" text-anchor="middle" class="column-title">可追溯输出</text>
+
+  <rect x="1185" y="220" width="330" height="92" rx="16" fill="#ffffff"/>
+  <text x="1210" y="253" class="card-title">编辑结果</text>
+  <text x="1210" y="284" class="body">提交、拒绝、回退或执行失败</text>
+
+  <rect x="1185" y="330" width="330" height="92" rx="16" fill="#ffffff"/>
+  <text x="1210" y="363" class="card-title">预测记录</text>
+  <text x="1210" y="394" class="body">原始输出 y_raw 与最终回答 y_q</text>
+
+  <rect x="1185" y="440" width="330" height="92" rx="16" fill="#ffffff"/>
+  <text x="1210" y="473" class="card-title">裁判记录</text>
+  <text x="1210" y="504" class="body">可靠标签、证据、复核或缺测</text>
+
+  <rect x="1185" y="550" width="330" height="118" rx="16" fill="#ffffff"/>
+  <text x="1210" y="583" class="card-title">最终报告</text>
+  <text x="1210" y="614" class="body">指标、覆盖率、上下界与故障分类</text>
+  <text x="1210" y="644" class="body">模型、提示、裁判和协议版本</text>
+
+  <!-- Main connections -->
+  <line x1="465" y1="440" x2="565" y2="440" stroke="#64748b" stroke-width="5" marker-end="url(#arrow)"/>
+  <text x="515" y="415" text-anchor="middle" class="small">组织与隔离</text>
+  <line x1="1025" y1="440" x2="1125" y2="440" stroke="#64748b" stroke-width="5" marker-end="url(#arrow)"/>
+  <text x="1075" y="415" text-anchor="middle" class="small">记录与汇总</text>
+
+  <!-- Isolation note -->
+  <rect x="180" y="790" width="1240" height="90" rx="20" fill="#fff7ed" stroke="#fdba74" stroke-width="2"/>
+  <text x="220" y="825" class="note-title">关键隔离原则</text>
+  <text x="220" y="858" class="note">被编辑模型正式生成时只接收无答案输入 u_q；短答案、目标命题和私有参考 r_q 只用于编辑准备与外部裁判，不能泄漏进正式问题。</text>
+</svg>
