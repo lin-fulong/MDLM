@@ -16,21 +16,8 @@ from MDLM.states import input_record
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import tensor_sha256
 from util.extract_keep_statistics import equal_length_groups, keep_input_from_record
-from util.extract_reference_keys import load_reference_inputs, write_json
-
-
-def read_json(path: Path) -> dict:
-    with path.open(encoding="utf-8") as stream:
-        return json.load(stream)
-
-
-def require(condition: bool, message: str) -> None:
-    if not condition:
-        raise ValueError(message)
-
-
-def checked_file(path: Path, digest: str) -> None:
-    require(file_sha256(path) == digest, f"artifact digest differs: {path}")
+from util.extract_reference_keys import load_reference_inputs
+from util.io import checked_file, read_json, require, write_json
 
 
 def check_sources(p1_dir: Path, config, p1_manifest: dict, p1_hashes: dict) -> tuple[dict, dict, dict]:

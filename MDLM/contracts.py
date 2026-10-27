@@ -5,8 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
-import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
@@ -33,48 +31,15 @@ _hash_progress = ContextVar("mdlm_hash_progress", default=None)
 
 
 @contextmanager
-def cached_file_hashes(persistent_path: str | Path | None = None, *, force_rehash: bool = False, progress=None):
-    """Reuse matching file signatures; optionally persist large tensor-file hashes."""
-    cache = {}
-    path = Path(persistent_path) if persistent_path is not None else None
-    if path is not None and not force_rehash:
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(record, dict) and record.get("version") == "mdlm.file_hash_cache.1" \
-                    and isinstance(record.get("files"), dict):
-                for name, row in record["files"].items():
-                    signature, digest = row
-                    if len(signature) == 5 and all(type(value) is int for value in signature) \
-                            and isinstance(digest, str) and len(digest) == 64 \
-                            and all(char in "0123456789abcdef" for char in digest):
-                        cache[name] = (tuple(signature), digest)
-        except (OSError, ValueError, KeyError, TypeError):
-            cache.clear()
-    token = _hash_cache.set(cache)
+def cached_file_hashes(*, progress=None):
+    """同一次实验复用未改变文件的摘要，退出后释放缓存。"""
+    token = _hash_cache.set({})
     progress_token = _hash_progress.set(progress)
     try:
         yield
     finally:
         _hash_cache.reset(token)
         _hash_progress.reset(progress_token)
-        if path is not None:
-            # 仅跨运行保存张量文件摘要；写入日志和配置仍按当前内容计算。
-            files = {name: row for name, row in cache.items() if Path(name).suffix == ".safetensors"}
-            temporary = None
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                                 prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
-                    temporary = Path(stream.name)
-                    json.dump({"version": "mdlm.file_hash_cache.1", "files": files}, stream)
-                os.replace(temporary, path)
-            except OSError:
-                # 摘要缓存只是加速；缓存写入失败不能覆盖实验原有异常。
-                if temporary is not None:
-                    try:
-                        temporary.unlink(missing_ok=True)
-                    except OSError:
-                        pass
 
 
 def file_sha256(path: str | Path) -> str:

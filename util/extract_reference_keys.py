@@ -13,10 +13,7 @@ from MDLM.contracts import (
 from MDLM.states import build_supervision, input_record, load_supervision, load_trajectories
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import tensor_sha256
-
-
-def write_json(path: Path, record: dict) -> None:
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+from util.io import write_json
 
 
 def load_reference_inputs(p1_dir: Path):

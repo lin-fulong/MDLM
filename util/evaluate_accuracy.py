@@ -13,14 +13,7 @@ from safetensors.torch import load_file
 from MDLM.contracts import file_sha256
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import MaskedEditInput, tensor_sha256
-
-
-def read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def write_json(path: Path, value: dict) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+from util.io import read_json, write_json
 
 
 def normalize_answer(value: str) -> str:
@@ -122,6 +115,9 @@ def evaluate_run(run_dir: str | Path, *, device: str | None = None) -> dict:
         raise ValueError("只有已完成的运行才能计算准确率")
     choices = read_json(run_dir / "effective_config.json")
     input_path, inputs = evaluation_inputs(run_dir, report, choices)
+    if report.get("selected_case_ids"):
+        selected = {fact for row in report["rounds"] for fact in row["fact_ids"]}
+        inputs = [item for item in inputs if item["role"] == "preservation_test" or item["case_id"] in selected]
     output = run_dir / "accuracy_report.json"
     if not inputs:
         result = {"status": "unavailable", "reason": "未配置独立测试题或保持测试题", "inputs": str(input_path) if input_path else None}

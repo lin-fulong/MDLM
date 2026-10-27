@@ -67,13 +67,15 @@ class DatasetPreparationTests(unittest.TestCase):
         second = self.prepare()
         self.assertNotEqual(first["cache_key"], second["cache_key"])
 
-    def test_corrupted_cached_file_is_rebuilt_and_preserved(self):
+    def test_corrupted_cached_file_is_rebuilt_in_place(self):
         first = self.prepare()
+        expected = {name: Path(path).read_text() for name, path in first["files"].items()}
         Path(first["files"]["keep_statistics.json"]).write_text("broken", encoding="utf-8")
         second = self.prepare()
         self.assertFalse(second["cache_hit"])
         self.assertEqual(second["cache_key"], first["cache_key"])
-        self.assertEqual(len(list((self.root / "cache/datasets").glob("*.invalid_*"))), 1)
+        self.assertEqual({name: Path(path).read_text() for name, path in second["files"].items()}, expected)
+        self.assertEqual(len(list((self.root / "cache/datasets").iterdir())), 1)
 
 
 if __name__ == "__main__":

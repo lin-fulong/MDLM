@@ -11,8 +11,7 @@ import torch
 from MDLM.contracts import AcceptanceConfig, DEVELOPMENT_KEEP_VERSION, P1RunConfig, file_sha256
 from MDLM.workflow import load_final_model, run_p5
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
-from util.extract_reference_keys import write_json
-from util.validate_matrix_artifacts import read_json, require
+from util.io import read_json, require, write_json
 
 
 def smoke(p1_dir: Path, *, residual_dir: Path | None = None, output_dir: Path | None = None,

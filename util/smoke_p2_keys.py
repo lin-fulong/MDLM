@@ -13,7 +13,8 @@ from pathlib import Path
 from MDLM.contracts import ReferenceKeyConfig, file_sha256
 from model.adapters.llada_8b_instruct import DEFAULT_MODEL_PATH
 from util.accept_p0_p1_single_case import PROJECT_ROOT
-from util.extract_reference_keys import extract_run, write_json
+from util.extract_reference_keys import extract_run
+from util.io import write_json
 
 
 def main() -> None:

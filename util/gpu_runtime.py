@@ -105,8 +105,7 @@ def execution_context(settings, layers):
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
-        with cached_file_hashes(settings.get("hash_cache_path"), force_rehash=settings.get("rehash_files", False),
-                                progress=lambda message: print(message, flush=True)), \
+        with cached_file_hashes(progress=lambda message: print(message, flush=True)), \
                 patch.object(LLaDA8BInstructAdapter, "load_model", staticmethod(pool.load)):
             yield pool
         print(f"[模型复用] 实际加载 {pool.load_count} 次，复用 {pool.reuse_count} 次", flush=True)

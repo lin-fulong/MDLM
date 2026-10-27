@@ -112,6 +112,16 @@ class AccuracyTests(unittest.TestCase):
             self.assertEqual(model.layer.weight.item(), 0.0)
             self.assertTrue((root / "accuracy_report.json").is_file())
 
+            # 单案例编辑仍复用完整数据集的划分，只统计本次选中事实的独立题。
+            report = json.loads((root / "run_report.json").read_text())
+            report.update(selected_case_ids=["one"], rounds=report["rounds"][:1])
+            accuracy.write_json(root / "run_report.json", report)
+            with patch.object(accuracy.LLaDA8BInstructAdapter, "from_local_tokenizer", return_value=Adapter()), \
+                 patch.object(accuracy, "score_probe", side_effect=fake_score):
+                selected = accuracy.evaluate_run(root)
+            self.assertEqual(selected["independent"]["unique_probe_count"], 1)
+            self.assertEqual(selected["independent"]["after"], {"correct": 1, "total": 1, "accuracy": 1.0})
+
 
 if __name__ == "__main__":
     unittest.main()

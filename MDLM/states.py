@@ -103,17 +103,6 @@ def load_trajectories(path: str | Path) -> list[FactTrajectory]:
         return [FactTrajectory.from_record(json.loads(line)) for line in stream if line.strip()]
 
 
-def complete_input_key(model_input: MaskedEditInput) -> tuple:
-    """Deduplicate full forward inputs, not just their decoded visible text."""
-    return (
-        model_input.input_ids,
-        model_input.attention_mask,
-        model_input.mask_positions,
-        model_input.subject_last_position,
-        tuple(range(len(model_input.input_ids))),
-    )
-
-
 def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[dict], dict]:
     """Formula (1): retain masked states with no conflicting revealed answer token."""
     if not trajectory.answer_positions or trajectory.answer_positions != tuple(sorted(set(trajectory.answer_positions))):
@@ -136,7 +125,7 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
 
     compatible: list[dict] = []
     discarded: list[dict] = []
-    seen: set[tuple] = set()
+    seen: set[MaskedEditInput] = set()
     previous_masks = set(trajectory.answer_positions)
     for step, state in enumerate(trajectory.trace.pre_forward_inputs):
         if len(state.input_ids) != len(initial.input_ids) or len(state.input_ids) != len(state.attention_mask) or any(value != 1 for value in state.attention_mask):
@@ -149,11 +138,11 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
         ):
             raise ValueError(f"{trajectory.case_id}: saved mask positions differ from input IDs")
         previous_masks = current_masks
-        key = complete_input_key(state)
-        if key in seen:
+        # frozen 输入已包含全部前向字段，可直接按完整输入去重。
+        if state in seen:
             discarded.append({"step": step, "reason": "duplicate_full_input"})
             continue
-        seen.add(key)
+        seen.add(state)
         if not current_masks:
             discarded.append({"step": step, "reason": "terminal"})
         elif any(

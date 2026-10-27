@@ -11,8 +11,8 @@ from MDLM.contracts import (
     WRITEBACK_FACTOR_VERSION, WritebackConfig, config_digest, file_sha256,
 )
 from MDLM.writeback import WritebackSolveError, solve_writeback_factor
-from util.extract_reference_keys import load_reference_inputs, write_json
-from util.validate_matrix_artifacts import checked_file, read_json, require
+from util.extract_reference_keys import load_reference_inputs
+from util.io import checked_file, read_json, require, write_json
 
 
 def load_matrix_bundle(p1_dir: Path, settings: WritebackConfig) -> tuple[dict, dict, dict, dict]:

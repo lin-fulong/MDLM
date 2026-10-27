@@ -17,7 +17,7 @@ from MDLM.contracts import KEEP_INPUTS_VERSION, KeepStatisticsConfig, P1RunConfi
 from model.adapters.llada_8b_instruct import DEFAULT_MODEL_PATH, LLaDA8BInstructAdapter
 from util.accept_p0_p1_single_case import PROJECT_ROOT
 from util.extract_keep_statistics import extract_run
-from util.extract_reference_keys import write_json
+from util.io import write_json
 from util.validate_matrix_artifacts import validate_run
 
 

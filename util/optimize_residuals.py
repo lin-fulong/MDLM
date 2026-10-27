@@ -23,9 +23,8 @@ from MDLM.states import edit_training_examples, load_supervision
 from MDLM.writeback import relative_residual
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import KeepModelInput, tensor_sha256
-from util.extract_reference_keys import write_json
+from util.io import checked_file, read_json, require, write_json
 from util.solve_writeback_factor import load_matrix_bundle
-from util.validate_matrix_artifacts import checked_file, read_json, require
 
 
 def bind_model_files(sources: dict, model_path: str | Path, identity: dict) -> None:

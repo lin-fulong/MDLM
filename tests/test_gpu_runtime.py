@@ -158,31 +158,19 @@ class ResidentRuntimeTests(unittest.TestCase):
                 self.assertNotEqual(first, file_sha256(path))
                 self.assertEqual(digest.call_count, 2)
 
-    def test_persistent_hash_cache_skips_reads_on_next_launch_and_can_rehash(self):
+    def test_hash_cache_does_not_survive_context_exit(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "model.safetensors"
-            cache = Path(temporary) / "file_hashes.json"
             path.write_bytes(b"weights")
-            with cached_file_hashes(cache):
+            with cached_file_hashes():
                 expected = file_sha256(path)
-            with cached_file_hashes(cache), patch("MDLM.contracts.hashlib.sha256") as digest:
+            with cached_file_hashes(), patch("MDLM.contracts.hashlib.sha256", wraps=hashlib.sha256) as digest:
                 self.assertEqual(file_sha256(path), expected)
-                digest.assert_not_called()
-            with cached_file_hashes(cache, force_rehash=True), patch("MDLM.contracts.hashlib.sha256", wraps=hashlib.sha256) as digest:
                 self.assertEqual(file_sha256(path), expected)
                 digest.assert_called_once()
-            path.write_bytes(b"changed")
-            with cached_file_hashes(cache):
-                self.assertNotEqual(file_sha256(path), expected)
-
-    def test_corrupt_persistent_hash_cache_is_rebuilt(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "model.safetensors"
-            cache = Path(temporary) / "file_hashes.json"
-            path.write_bytes(b"weights")
-            cache.write_text("broken", encoding="utf-8")
-            with cached_file_hashes(cache):
-                self.assertEqual(file_sha256(path), hashlib.sha256(b"weights").hexdigest())
+            with patch("MDLM.contracts.hashlib.sha256", wraps=hashlib.sha256) as digest:
+                self.assertEqual(file_sha256(path), expected)
+                digest.assert_called_once()
 
     def test_cuda_unavailable_fails_before_loading_instead_of_falling_back(self):
         with patch("torch.cuda.is_available", return_value=False):

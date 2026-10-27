@@ -16,7 +16,8 @@ from MDLM.contracts import (
 from MDLM.keep_statistics import SecondMomentAccumulator
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import KeepModelInput, tensor_sha256
-from util.extract_reference_keys import load_reference_inputs, write_json
+from util.extract_reference_keys import load_reference_inputs
+from util.io import write_json
 
 
 # 独立编辑时，同一原始模型与冻结保持输入产生同一个 C；仅缓存最近一次成功的结果。

@@ -19,9 +19,8 @@ from MDLM.merge import WeightMerge
 from MDLM.optimize import KeepTrainingExample, log_probabilities
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import KeepModelInput, tensor_sha256
-from util.extract_reference_keys import write_json
+from util.io import checked_file, read_json, require, write_json
 from util.optimize_residuals import bind_model_files, load_fixed_factors
-from util.validate_matrix_artifacts import checked_file, read_json, require
 
 
 def load_residual_candidate(p1_dir: Path, residual_dir: Path, settings: AcceptanceConfig):

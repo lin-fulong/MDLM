@@ -8,7 +8,7 @@ from pathlib import Path
 
 from MDLM.contracts import WritebackConfig, file_sha256
 from util.accept_p0_p1_single_case import PROJECT_ROOT
-from util.extract_reference_keys import write_json
+from util.io import write_json
 from util.solve_writeback_factor import solve_run
 
 

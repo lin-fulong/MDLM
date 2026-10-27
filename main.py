@@ -18,23 +18,14 @@ from pathlib import Path
 from MDLM.contracts import (
     AcceptanceConfig, FactSelection, KeepStatisticsConfig, P1RunConfig,
     ReferenceKeyConfig, ResidualOptimizationConfig, WritebackConfig,
-    config_digest, file_sha256, local_model_identity,
+    file_sha256, local_model_identity,
 )
 from data.readers.json_cases import load_cases
+from util.io import read_json, write_json
 from util.prepare_dataset_inputs import prepare_inputs
-from util.pipeline_cache import archive_partial, files_match, round_key, save_index, snapshot
 
 
 ROOT = Path(__file__).resolve().parent
-
-
-def read_json(path: Path) -> object:
-    with path.open(encoding="utf-8") as stream:
-        return json.load(stream)
-
-
-def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def project_path(value: str) -> Path:
@@ -60,20 +51,6 @@ def choose_run_id(configured: str | None, override: str | None) -> str:
     if not isinstance(run_id, str) or run_id in ("", ".", "..") or "/" in run_id or "\\" in run_id:
         raise ValueError("run_id must be one directory name")
     return run_id
-
-
-def config_setup_issues(choices: dict) -> list[str]:
-    """Check the two user-supplied paths; all stage inputs are derived from the dataset."""
-    paths = {"dataset": choices.get("dataset"), "model_path": choices.get("model_path")}
-    issues = []
-    for label, value in paths.items():
-        if not isinstance(value, str) or not value or value.startswith("REPLACE_WITH_"):
-            issues.append(f"{label}: specify a real path")
-        elif not project_path(value).exists():
-            issues.append(f"{label}: file or directory does not exist: {project_path(value)}")
-    if choices.get("input_preparation", {}).get("mode", "dataset") != "dataset":
-        issues.append("input_preparation.mode: only automatic dataset preparation is supported")
-    return issues
 
 
 @dataclass(frozen=True)
@@ -172,16 +149,12 @@ def load_round_inputs(config_file: Path, baseline_model: Path | None,
 
 
 def start_round(config_file: Path, inputs: RoundInputs, run_id_override: str | None,
-                round_index: int, sequential: bool, workspace: Path | None,
-                request_key: str | None) -> tuple[Path, dict]:
+                round_index: int, sequential: bool) -> tuple[Path, dict]:
     """Create the round directory and its initial report."""
     run_id = choose_run_id(inputs.choices.get("run_id"), run_id_override)
     output_root = project_path(inputs.choices.get("output_root", "runs"))
-    if workspace is not None:
-        output_root, run_id = workspace.parent.parent, workspace.parent.name
-        round_index = int(workspace.name.removeprefix("round_"))
     round_dir = output_root / run_id / f"round_{round_index}"
-    round_dir.mkdir(parents=True, exist_ok=workspace is not None)
+    round_dir.mkdir(parents=True, exist_ok=False)
     report_path = round_dir / "pipeline_report.json"
     report = {"status": "running", "phase": "freeze_inputs", "run_id": run_id,
               "round_id": round_index, "mode": "sequential" if sequential else "independent",
@@ -191,82 +164,46 @@ def start_round(config_file: Path, inputs: RoundInputs, run_id_override: str | N
               "source_keep_inputs": str(inputs.keep_inputs), "source_dev_edit_file": str(inputs.dev_edit_file),
               "source_dev_keep_file": str(inputs.dev_keep_file),
               "config_file": str(config_file.resolve()), "config_sha256": file_sha256(config_file)}
-    if workspace is not None and report_path.is_file():
-        existing = read_json(report_path)
-        if existing.get("request_key") != request_key:
-            raise ValueError("缓存运行与当前请求不匹配")
-        report["stages"] = existing.get("stages", {})
-    report["request_key"] = request_key
     write_json(report_path, report)
     return round_dir, report
 
 
-class StageRunner:
-    """Execute one stage and reuse only matching, intact artifacts."""
+def run_stage(label: str, arguments: list[str], artifact: Path,
+              accepted: tuple[str, ...] = ("complete",), *, round_dir: Path,
+              report: dict, resident: bool) -> dict:
+    """依次运行阶段，只记录状态、日志和耗时。每次实验都重新计算。"""
+    from util.gpu_runtime import execute_stage
 
-    def __init__(self, round_dir: Path, report: dict, request_key: str | None,
-                 use_cache: bool, resident: bool):
-        self.round_dir = round_dir
-        self.report = report
-        self.request_key = request_key
-        self.use_cache = use_cache
-        self.resident = resident
-        self.upstream = {}
-
-    def run(self, label: str, arguments: list[str], artifact: Path,
-            accepted: tuple[str, ...] = ("complete",)) -> dict:
-        report_path = self.round_dir / "pipeline_report.json"
-        dependency = config_digest({"arguments": arguments, "configs": {
-            str(path): file_sha256(path) for path in sorted(self.round_dir.glob("*_config.json"))},
-            "upstream": self.upstream, "request_key": self.request_key})
-        prior = self.report["stages"].get(label, {})
-        if (self.use_cache and prior.get("status") in accepted and prior.get("dependency") == dependency
-                and files_match(prior.get("files_sha256", {}))):
-            result = read_json(artifact)
-            status = result["status"] if isinstance(result, dict) else "complete"
-            if status in accepted:
-                prior["cache_hit"] = True
-                self.upstream[label] = prior["files_sha256"]
-                print(f"[{label}] 复用本地缓存：{artifact}", flush=True)
-                return result
-        self.report["phase"] = label
-        write_json(report_path, self.report)
-        log_path = self.round_dir / f"{label.lower()}.log"
-        self.report["stages"][label] = {"status": "running", "artifact": str(artifact), "log": str(log_path)}
-        write_json(report_path, self.report)
-        print(f"[{label}] {log_path}", flush=True)
-        target = artifact if artifact.parent == self.round_dir else artifact.parent
-        archive_partial(target, self.round_dir / "failed_attempts", label)
-        started = time.perf_counter()
-        with log_path.open("w", encoding="utf-8") as stream:
-            try:
-                from util.gpu_runtime import execute_stage
-                execute_stage(arguments, stream=stream, cwd=ROOT, resident=self.resident)
-            except subprocess.CalledProcessError:
-                if label != "P4" or not artifact.is_file() or read_json(artifact).get("status") != "rejected":
-                    raise
-        result = read_json(artifact)
-        status = result["status"] if isinstance(result, dict) else "complete"
-        if status not in accepted:
-            raise RuntimeError(f"{label} artifact status is {status!r}: {artifact}")
-        digests = snapshot(target)
-        self.report["stages"][label] = {"status": status, "artifact": str(artifact), "log": str(log_path),
-                                        "dependency": dependency, "files_sha256": digests, "cache_hit": False,
-                                        "elapsed_seconds": time.perf_counter() - started}
-        self.upstream[label] = digests
-        write_json(report_path, self.report)
-        print(f"[{label}] {status} | {self.report['stages'][label]['elapsed_seconds']:.1f}s", flush=True)
-        return result
+    report_path = round_dir / "pipeline_report.json"
+    log_path = round_dir / f"{label.lower()}.log"
+    report["phase"] = label
+    report["stages"][label] = {"status": "running", "artifact": str(artifact), "log": str(log_path)}
+    write_json(report_path, report)
+    print(f"[{label}] {log_path}", flush=True)
+    started = time.perf_counter()
+    with log_path.open("w", encoding="utf-8") as stream:
+        try:
+            execute_stage(arguments, stream=stream, cwd=ROOT, resident=resident)
+        except subprocess.CalledProcessError:
+            if label != "P4" or not artifact.is_file() or read_json(artifact).get("status") != "rejected":
+                raise
+    result = read_json(artifact)
+    status = result["status"] if isinstance(result, dict) else "complete"
+    if status not in accepted:
+        raise RuntimeError(f"{label} artifact status is {status!r}: {artifact}")
+    elapsed = time.perf_counter() - started
+    report["stages"][label].update(status=status, elapsed_seconds=elapsed)
+    write_json(report_path, report)
+    print(f"[{label}] {status} | {elapsed:.1f}s", flush=True)
+    return result
 
 
 def freeze_round_configs(inputs: RoundInputs, round_dir: Path, run_id: str,
                          round_index: int) -> P1RunConfig:
     """Write exactly the frozen inputs and settings consumed by P0–P5."""
-    write_json(round_dir / "model_identity.json", inputs.baseline_identity)
     case_file = round_dir / "editing_cases.json"
     write_json(case_file, inputs.cases)
     write_json(round_dir / "keep_inputs.json", read_json(inputs.keep_inputs))
-    write_json(round_dir / "source_config.json", inputs.choices)
     p1_values = dict(inputs.choices.get("p1", {}))
     p1 = P1RunConfig(
         run_id=run_id, round_id=round_index, baseline_id=inputs.baseline_identity["model_revision"],
@@ -315,47 +252,52 @@ def check_p0(rows: list[dict], facts: list[FactSelection], module: str) -> None:
         raise RuntimeError(f"P0 did not cover and replay all {len(facts)} facts at {module}")
 
 
-def run_round_stages(inputs: RoundInputs, runner: StageRunner, p1: P1RunConfig) -> dict | None:
+def run_round_stages(inputs: RoundInputs, round_dir: Path, report: dict, p1: P1RunConfig) -> dict | None:
     """Run P0 through P5 in their fixed dependency order."""
-    round_dir = runner.round_dir
+    resident = inputs.choices.get("execution", {}).get("backend") == "resident"
+
+    def stage(label, arguments, artifact, accepted=("complete",)):
+        return run_stage(label, arguments, artifact, accepted,
+                         round_dir=round_dir, report=report, resident=resident)
+
     case_file = round_dir / "editing_cases.json"
     for layer in inputs.layers:
         label = f"P0_LAYER_{layer}"
         module = f"model.transformer.blocks.{layer}.ff_out"
         artifact = round_dir / f"p0_layer_{layer}.json"
-        rows = runner.run(label, ["util.smoke_p0_llada", str(case_file), "--model-path", str(inputs.model),
+        rows = stage(label, ["util.smoke_p0_llada", str(case_file), "--model-path", str(inputs.model),
                                   "--layer", str(layer), "--forward", "--output", str(artifact),
                                   "--device-map", p1.device_map, "--torch-dtype", p1.torch_dtype], artifact)
         check_p0(rows, inputs.facts, module)
     p1_dir = round_dir / "p1"
-    runner.run("P1", ["util.collect_denoise_states", str(round_dir / "p1_config.json")],
+    stage("P1", ["util.collect_denoise_states", str(round_dir / "p1_config.json")],
                p1_dir / "coverage_report.json")
-    runner.run("P2_KEYS", ["util.extract_reference_keys", str(p1_dir),
+    stage("P2_KEYS", ["util.extract_reference_keys", str(p1_dir),
                            "--config", str(round_dir / "p2_keys_config.json")],
                round_dir / "matrices/reference_keys/manifest.json")
     keep_command = ["util.extract_keep_statistics", str(p1_dir), str(round_dir / "keep_inputs.json"),
                     "--config", str(round_dir / "p2_keep_config.json")]
-    if runner.resident and runner.report["mode"] == "independent":
+    if resident and report["mode"] == "independent":
         keep_command.append("--reuse-across-rounds")
-    batch_keep = runner.resident and inputs.keep.device.startswith("cuda")
+    batch_keep = resident and inputs.keep.device.startswith("cuda")
     if batch_keep:
         keep_command.append("--batch-keep")
-    runner.run("P2_KEEP", keep_command,
+    stage("P2_KEEP", keep_command,
                round_dir / "matrices/keep_statistics/manifest.json")
     qa_command = ["util.validate_matrix_artifacts", str(p1_dir)]
     if batch_keep:
         qa_command.append("--batch-keep")
-    runner.run("P2_QA", qa_command,
+    stage("P2_QA", qa_command,
                round_dir / "matrices/validation/manifest.json")
-    runner.run("P3", ["util.solve_writeback_factor", str(p1_dir),
+    stage("P3", ["util.solve_writeback_factor", str(p1_dir),
                       "--config", str(round_dir / "p3_config.json")],
                round_dir / "matrices/writeback_factors/manifest.json")
-    p4 = runner.run("P4", ["util.optimize_residuals", str(p1_dir),
+    p4 = stage("P4", ["util.optimize_residuals", str(p1_dir),
                             "--config", str(round_dir / "p4_config.json")],
                     round_dir / "residuals/manifest.json", ("complete", "rejected"))
     if p4["status"] == "rejected":
         return None
-    return runner.run("P5", ["util.merge_and_accept", str(p1_dir),
+    return stage("P5", ["util.merge_and_accept", str(p1_dir),
                              "--config", str(round_dir / "p5_config.json"),
                              "--residual-dir", str(round_dir / "residuals"),
                              "--output-dir", str(round_dir / "editing")],
@@ -373,16 +315,11 @@ def verify_p5(round_dir: Path, result: dict) -> str:
     return decision
 
 
-def reload_accepted_model(runner: StageRunner) -> None:
+def reload_accepted_model(round_dir: Path, report: dict) -> None:
     """Verify that an accepted P5 model can be reconstructed from disk."""
-    round_dir, report = runner.round_dir, runner.report
     p5_dir = round_dir / "editing"
     report["phase"] = "P5_RELOAD"
     write_json(round_dir / "pipeline_report.json", report)
-    dependency = config_digest(runner.upstream)
-    prior = report["stages"].get("P5_RELOAD", {})
-    if runner.use_cache and prior.get("dependency") == dependency and files_match(prior.get("files_sha256", {})):
-        return
     from MDLM.workflow import load_final_model
     adapter, edited_model = load_final_model(p5_dir)
     del adapter, edited_model
@@ -391,46 +328,35 @@ def reload_accepted_model(runner: StageRunner) -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    report["stages"]["P5_RELOAD"] = {"status": "complete", "artifact": str(p5_dir / "manifest.json"),
-                                     "dependency": dependency, "files_sha256": snapshot(p5_dir)}
+    report["stages"]["P5_RELOAD"] = {"status": "complete", "artifact": str(p5_dir / "manifest.json")}
 
 
-def export_accepted_checkpoint(inputs: RoundInputs, runner: StageRunner) -> Path:
+def export_accepted_checkpoint(inputs: RoundInputs, round_dir: Path, report: dict) -> Path:
     """Write the accepted weights as the next sequential baseline."""
-    round_dir, report = runner.round_dir, runner.report
     report["phase"] = "CHECKPOINT_EXPORT"
     write_json(round_dir / "pipeline_report.json", report)
     from util.export_edited_checkpoint import export_checkpoint
     checkpoint_dir = round_dir / "checkpoint"
-    dependency = config_digest(runner.upstream)
-    prior = report["stages"].get("CHECKPOINT_EXPORT", {})
-    if not (runner.use_cache and prior.get("dependency") == dependency
-            and files_match(prior.get("files_sha256", {}))):
-        archive_partial(checkpoint_dir, round_dir / "failed_attempts", "CHECKPOINT_EXPORT")
-        export_checkpoint(inputs.model, round_dir / "editing", checkpoint_dir)
-        report["stages"]["CHECKPOINT_EXPORT"] = {
-            "status": "complete", "artifact": str(checkpoint_dir / "export_report.json"),
-            "dependency": dependency, "files_sha256": snapshot(checkpoint_dir)}
+    export_checkpoint(inputs.model, round_dir / "editing", checkpoint_dir)
+    report["stages"]["CHECKPOINT_EXPORT"] = {
+        "status": "complete", "artifact": str(checkpoint_dir / "export_report.json")}
     return checkpoint_dir
 
 
 def one_round(config_file: Path, *, run_id_override: str | None = None,
               round_index: int = 0, baseline_model: Path | None = None,
               sequential: bool = False, original_identity: dict | None = None,
-              selected_case_ids: list[str] | None = None, workspace: Path | None = None,
-              request_key: str | None = None, use_cache: bool = True,
+              selected_case_ids: list[str] | None = None,
               baseline_identity: dict | None = None) -> dict:
     """Orchestrate one source case without implementing stage mathematics."""
     inputs = load_round_inputs(config_file, baseline_model, selected_case_ids,
                                original_identity, baseline_identity)
     round_dir, report = start_round(config_file, inputs, run_id_override, round_index,
-                                    sequential, workspace, request_key)
+                                    sequential)
     report_path = round_dir / "pipeline_report.json"
-    runner = StageRunner(round_dir, report, request_key, use_cache,
-                         inputs.choices.get("execution", {}).get("backend") == "resident")
     try:
         p1 = freeze_round_configs(inputs, round_dir, report["run_id"], report["round_id"])
-        p5 = run_round_stages(inputs, runner, p1)
+        p5 = run_round_stages(inputs, round_dir, report, p1)
         if p5 is None:
             report.update(status="complete", phase="complete", decision="rejected", selected_alpha=None,
                           decision_reason="P4 未得到合格残差候选", final_model_dir=None,
@@ -438,8 +364,8 @@ def one_round(config_file: Path, *, run_id_override: str | None = None,
         else:
             decision = verify_p5(round_dir, p5)
             if decision == "accepted":
-                reload_accepted_model(runner)
-            checkpoint = export_accepted_checkpoint(inputs, runner) if sequential and decision == "accepted" else None
+                reload_accepted_model(round_dir, report)
+            checkpoint = export_accepted_checkpoint(inputs, round_dir, report) if sequential and decision == "accepted" else None
             report.update(status="complete", phase="complete", decision=p5["decision"],
                           selected_alpha=p5["selection"]["selected_alpha"],
                           final_model_dir=str(round_dir / "editing") if p5["decision"] == "accepted" else None,
@@ -459,7 +385,7 @@ def run_dataset(config_file: Path, *, sequential: bool = False,
                 run_id_override: str | None = None, dataset_override: Path | None = None,
                 model_override: Path | None = None, cache_override: Path | None = None,
                 use_cache: bool = True, device_override: str | None = None,
-                rehash_model: bool = False) -> dict:
+                case_ids: list[str] | None = None) -> dict:
     """Keep one GPU model alive across stages and independent editing cases."""
     print("[启动] 正在初始化 PyTorch 和计算设备...", flush=True)
     from util.gpu_runtime import execution_context
@@ -468,34 +394,18 @@ def run_dataset(config_file: Path, *, sequential: bool = False,
     if device_override is not None:
         execution["device"] = device_override
         execution.setdefault("backend", "resident")
-    cache_dir = cache_override.resolve() if cache_override is not None else project_path(choices.get("cache_dir", "runs/cache"))
-    runtime_settings = {**execution, "hash_cache_path": str(cache_dir / "file_hashes.json"),
-                        "rehash_files": rehash_model or not use_cache}
-    with execution_context(runtime_settings, choices["target_layers"]):
-        return _run_dataset(config_file, sequential=sequential, run_id_override=run_id_override,
+    choices["execution"] = execution
+    with execution_context(execution, choices["target_layers"]):
+        return _run_dataset(choices, sequential=sequential, run_id_override=run_id_override,
                             dataset_override=dataset_override, model_override=model_override,
                             cache_override=cache_override, use_cache=use_cache,
-                            execution_override=execution)
+                            case_ids=case_ids)
 
 
-@dataclass(frozen=True)
-class DatasetInputs:
-    choices: dict
-    source_dataset: Path
-    original_model: Path
-    dataset: Path
-    cache_dir: Path
-    original_identity: dict
-    preparation: dict
-
-
-def prepare_dataset_run(config_file: Path, dataset_override: Path | None,
+def prepare_dataset_run(choices: dict, dataset_override: Path | None,
                         model_override: Path | None, cache_override: Path | None,
-                        use_cache: bool, execution_override: dict | None) -> DatasetInputs:
+                        use_cache: bool) -> tuple[dict, dict, dict]:
     """Prepare all stage inputs from the selected dataset before starting rounds."""
-    choices = read_json(config_file)
-    if execution_override:
-        choices["execution"] = execution_override
     execution = choices.get("execution", {})
     if "device" in execution or execution.get("backend") == "resident":
         device = execution.setdefault("device", "cuda:0")
@@ -506,16 +416,15 @@ def prepare_dataset_run(config_file: Path, dataset_override: Path | None,
         choices["dataset"] = str(dataset_override.resolve())
     if model_override is not None:
         choices["model_path"] = str(model_override.resolve())
-    issues = config_setup_issues(choices)
-    if issues:
-        raise ValueError("full-run configuration is incomplete:\n- " + "\n- ".join(issues))
+    if choices.get("input_preparation", {}).get("mode", "dataset") != "dataset":
+        raise ValueError("只支持从数据集自动准备实验输入")
     source_dataset = required_path(choices, "dataset")
     original_model = required_path(choices, "model_path")
     choices["model_path"] = str(original_model)
     choices["source_dataset"] = str(source_dataset)
     choices["source_dataset_sha256"] = file_sha256(source_dataset)
     cache_dir = cache_override.resolve() if cache_override is not None else project_path(choices.get("cache_dir", "runs/cache"))
-    print("[模型身份] 检查模型文件（未变化的权重复用本地摘要）...", flush=True)
+    print("[模型身份] 记录模型和 tokenizer 文件摘要...", flush=True)
     started = time.perf_counter()
     identity = local_model_identity(original_model)
     print(f"[模型身份] 完成 | {time.perf_counter() - started:.1f}s", flush=True)
@@ -531,10 +440,9 @@ def prepare_dataset_run(config_file: Path, dataset_override: Path | None,
                           dev_keep_file=files["development_keep.json"])
     if choices["p4"].get("beta", 0) > 0:
         choices["p4"]["keep_train_file"] = files["keep_training.json"]
-    choices["prepared_inputs"] = {"manifest": preparation["manifest"], "cache_key": preparation["cache_key"],
+    choices["prepared_inputs"] = {"manifest": preparation["manifest"],
                                   "manifest_sha256": file_sha256(preparation["manifest"])}
-    return DatasetInputs(choices, source_dataset, original_model, Path(choices["dataset"]),
-                         cache_dir, identity, preparation)
+    return choices, identity, preparation
 
 
 def record_evaluation(root: Path, report: dict, device: str | None) -> dict:
@@ -545,30 +453,34 @@ def record_evaluation(root: Path, report: dict, device: str | None) -> dict:
     report["accuracy_report"] = str(root / "accuracy_report.json")
     report["independent_accuracy"] = accuracy.get("independent")
     report["preservation_accuracy"] = accuracy.get("preservation")
-    write_json(root / "evaluation_plan.json", {"status": accuracy["status"],
-               "inputs": accuracy.get("inputs"), "report": report["accuracy_report"],
-               "mode": report["mode"]})
     write_json(root / "run_report.json", report)
     return accuracy
 
 
-def _run_dataset(config_file: Path, *, sequential: bool = False,
+def _run_dataset(choices: dict, *, sequential: bool = False,
                  run_id_override: str | None = None, dataset_override: Path | None = None,
                  model_override: Path | None = None, cache_override: Path | None = None,
-                 use_cache: bool = True, execution_override: dict | None = None) -> dict:
+                 use_cache: bool = True,
+                 case_ids: list[str] | None = None) -> dict:
     """Edit each source case and aggregate the completed rounds."""
-    config_file = config_file.resolve()
-    prepared = prepare_dataset_run(config_file, dataset_override, model_override, cache_override,
-                                   use_cache, execution_override)
-    choices, source_dataset, original_model = prepared.choices, prepared.source_dataset, prepared.original_model
-    dataset, cache_dir = prepared.dataset, prepared.cache_dir
-    theta0_identity, preparation = prepared.original_identity, prepared.preparation
+    choices, theta0_identity, preparation = prepare_dataset_run(
+        choices, dataset_override, model_override, cache_override, use_cache)
+    source_dataset, original_model = Path(choices["source_dataset"]), Path(choices["model_path"])
+    dataset = Path(choices["dataset"])
     execution = choices.get("execution", {})
     cases = load_cases(dataset)
     if not cases:
         raise ValueError("the dataset adapter selected no editing facts")
-    case_ids = [case["case_id"] for case in cases]
-    if len(set(case_ids)) != len(case_ids):
+    # 先准备完整数据集的保持题，再选编辑案例；单案例也使用相同的冻结划分。
+    if case_ids:
+        selected = set(case_ids)
+        available = {case["case_id"] for case in cases} | {case.get("source_case_id", case["case_id"]) for case in cases}
+        if selected - available:
+            raise ValueError(f"数据集中没有这些可编辑案例：{sorted(selected - available)}")
+        cases = [case for case in cases if case["case_id"] in selected
+                 or case.get("source_case_id", case["case_id"]) in selected]
+    fact_ids = [case["case_id"] for case in cases]
+    if len(set(fact_ids)) != len(fact_ids):
         raise ValueError("runtime fact IDs must be unique")
     # 同一源案例的多个编辑请求在一轮中联合执行，避免拆散链式事实。
     groups = {}
@@ -581,7 +493,8 @@ def _run_dataset(config_file: Path, *, sequential: bool = False,
     write_json(effective_config, choices)
     report_path = root / "run_report.json"
     report = {"status": "running", "mode": "sequential" if sequential else "independent",
-              "run_id": run_id, "fact_count": len(case_ids), "case_count": len(groups),
+              "run_id": run_id, "fact_count": len(fact_ids), "case_count": len(groups),
+              "selected_case_ids": case_ids,
               "source_dataset": str(source_dataset), "original_model": str(original_model),
               "source_dataset_sha256": choices["source_dataset_sha256"],
               "prepared_inputs": preparation["manifest"],
@@ -597,34 +510,18 @@ def _run_dataset(config_file: Path, *, sequential: bool = False,
             write_json(report_path, report)
             print(f"[round {index + 1}/{len(groups)}] {case_id} | baseline: {baseline}", flush=True)
             baseline_identity = theta0_identity if baseline == original_model else local_model_identity(baseline)
-            key = round_key({**choices, "_baseline_path": str(baseline), "_sequential": sequential},
-                            fact_ids, baseline_identity, theta0_identity, ROOT)
-            index_path = cache_dir / "rounds" / (key + ".json")
-            workspace, round_config = None, effective_config
-            if use_cache and index_path.is_file():
-                entry = read_json(index_path)
-                prior_workspace, prior_config = Path(entry["workspace"]), Path(entry["config"])
-                if entry.get("key") == key and (prior_workspace / "pipeline_report.json").is_file() \
-                        and prior_config.is_file() and file_sha256(prior_config) == entry.get("config_sha256") \
-                        and read_json(prior_workspace / "pipeline_report.json").get("request_key") == key:
-                    workspace, round_config = prior_workspace, prior_config
-            actual_workspace = workspace or root / f"round_{index}"
-            if use_cache:
-                save_index(index_path, {"key": key, "workspace": str(actual_workspace), "config": str(round_config),
-                                        "config_sha256": file_sha256(round_config)})
-            result = one_round(round_config, run_id_override=run_id, round_index=index,
-                               selected_case_ids=fact_ids, baseline_model=baseline, workspace=workspace,
+            result = one_round(effective_config, run_id_override=run_id, round_index=index,
+                               selected_case_ids=fact_ids, baseline_model=baseline,
                                sequential=sequential, original_identity=theta0_identity,
-                               request_key=key, use_cache=use_cache, baseline_identity=baseline_identity)
+                               baseline_identity=baseline_identity)
             report["rounds"].append({"round_id": index, "case_id": case_id,
                                      "baseline_model": str(baseline),
                                      "decision": result["decision"],
                                      "selected_alpha": result["selected_alpha"],
                                      "final_model_dir": result["final_model_dir"],
                                      "checkpoint_dir": result["checkpoint_dir"],
-                                     "fact_ids": fact_ids, "cache_workspace": workspace is not None,
-                                     "report": str(actual_workspace / "pipeline_report.json")})
-            write_json(root / f"round_{index}_reference.json", report["rounds"][-1])
+                                     "fact_ids": fact_ids,
+                                     "report": str(root / f"round_{index}/pipeline_report.json")})
             if sequential and result["decision"] == "accepted":
                 baseline = Path(result["checkpoint_dir"])
             write_json(report_path, report)
@@ -647,9 +544,9 @@ def main() -> None:
     parser.add_argument("--dataset", type=Path, help="本次实验数据集，覆盖配置中的 dataset")
     parser.add_argument("--model-path", type=Path, help="原始模型目录，覆盖配置中的 model_path")
     parser.add_argument("--device", help="计算设备，如 cuda:0（默认配置）或 cpu")
-    parser.add_argument("--rehash-model", action="store_true", help="重新读取权重计算摘要，不使用跨运行摘要缓存")
-    parser.add_argument("--cache-dir", type=Path, help="预处理和算法产物缓存目录")
-    parser.add_argument("--no-cache", action="store_true", help="本次重新计算，不读取已有缓存")
+    parser.add_argument("--cache-dir", type=Path, help="数据集输入准备缓存目录")
+    parser.add_argument("--no-cache", action="store_true", help="重新准备数据集输入；P0–P5 每次都会执行")
+    parser.add_argument("--case-id", action="append", help="选择一个源案例或事实，可重复指定；默认编辑整个数据集")
     parser.add_argument("--run-id", help="optional unique output directory name")
     parser.add_argument("--evaluate-run", type=Path,
                         help="只评价已完成实验目录，不重复执行 P0-P5")
@@ -673,18 +570,10 @@ def main() -> None:
     if not args.config.is_file():
         parser.error(f"configuration file does not exist: {args.config}. Copy "
                      "configs/full_run.template.json to configs/full_run.json and fill in the required inputs")
-    selected_choices = read_json(args.config)
-    if args.dataset is not None:
-        selected_choices["dataset"] = str(args.dataset.resolve())
-    if args.model_path is not None:
-        selected_choices["model_path"] = str(args.model_path.resolve())
-    issues = config_setup_issues(selected_choices)
-    if issues:
-        parser.error("configuration is incomplete:\n- " + "\n- ".join(issues))
     result = run_dataset(args.config, sequential=bool(args.mode or args.sequential),
                          run_id_override=args.run_id, dataset_override=args.dataset,
                          model_override=args.model_path, cache_override=args.cache_dir, use_cache=not args.no_cache,
-                         device_override=args.device, rehash_model=args.rehash_model)
+                         device_override=args.device, case_ids=args.case_id)
     print(json.dumps({key: result.get(key) for key in (
         "status", "mode", "fact_count", "accepted_count", "rejected_count", "final_checkpoint_dir",
         "evaluation_status", "independent_accuracy", "preservation_accuracy")},

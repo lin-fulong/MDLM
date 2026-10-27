@@ -69,10 +69,8 @@ P5 复用等价性验证时实际合并模型的 logits 计算开发指标，减
 连续编辑的基准会改变，因此每轮重新计算 C。
 非连续编辑在不同阶段和案例间复用同一份驻留模型，下一次使用前精确恢复目标层基线；
 连续模式切换到不同基线或原始参考时按需加载。原始模型文件不被改写。
-数据读取、分词、SHA256 和文件保存仍使用 CPU；同次运行内复用文件摘要，张量文件摘要还保存在
-`runs/cache/file_hashes.json`，下一次启动时核对设备、inode、大小、mtime 和 ctime，均未变化才复用。
-首次计算仍需读取权重；启动会打印初始化、模型身份检查及大文件摘要进度，避免长时间无输出。
-需要完整重读权重核验时添加 `--rehash-model`；`--no-cache` 同样绕过跨运行摘要缓存。
+数据读取、分词、SHA256 和文件保存仍使用 CPU；同一实验内复用文件摘要，
+每次启动会重新记录模型与 Tokenizer 的文件摘要。阶段之间保留必要的来源核对与数值检查。
 矩阵精度与验收容差保持配置值，未以降低精度替代加速。阶段结束会打印耗时，结束时打印模型加载/复用次数。
 捕获前向使用 `torch.no_grad()`，使共享 RoPE 缓存可用于后续 P4 反向传播；若预热已生成
 inference tensor，安装候选分支前会在原共享字典中以普通张量替换，保持数值、精度与设备一致。
@@ -84,7 +82,6 @@ python -u main.py --dataset data/datasets/cases.jsonl --device cuda:0
 python -u main.py --dataset data/datasets/cases.jsonl --device cpu
 ```
 
-CPU/GPU、执行后端和代码变更均参与缓存标识。首次切换 GPU 执行会生成新的算法缓存；旧运行产物保留。
 需要原有独立进程执行方式时，在自定义配置中设置 `execution.backend="subprocess"`。
 
 入口读取已审核数据，调用现有适配器选出全部 `gold_ready` 编辑事实，不再次审核数据质量。
@@ -95,8 +92,25 @@ CPU/GPU、执行后端和代码变更均参与缓存标识。首次切换 GPU �
 python -u main.py --config configs/full_run.json --dataset data/datasets/cases.jsonl
 ```
 
+`--case-id` 可选择源案例或其中一个事实，重复传入可编辑多个案例：
+
+```bash
+# 单个源案例；同一案例的多个编辑请求在一轮联合执行
+python -u main.py --dataset data/datasets/cases.jsonl --case-id cf_00001
+
+# 指定多个源案例
+python -u main.py --dataset data/datasets/cases.jsonl --case-id cf_00001 --case-id cf_00012
+
+# 双请求案例中只编辑指定事实
+python -u main.py --dataset data/datasets/cases.jsonl --case-id mq_00004:rewrite:0
+```
+
+程序先从完整数据集准备保持输入和评价划分，再选择本次编辑案例。
+因此单案例与全数据集运行使用相同的保持统计、开发保持和保留评价题划分。
+不传 `--case-id` 时编辑整个数据集。
+
 显式传入 `sequential`（或 `--sequential`）时，只有通过 P5 验收的权重才导出为
-下一条事实的基线；被拒绝的事实不改变后续基线：
+下一源案例的基线；被拒绝的案例不改变后续基线：
 
 ```bash
 python -u main.py --dataset data/datasets/cases.jsonl sequential
@@ -124,13 +138,13 @@ P5 `decision=accepted` 时，`editing/` 是可通过
 - 自动保存实际用途划分、输入 token、mask/捕获位置、权重、tokenizer 修订和数据集摘要。
   生成互不重叠的统计/开发输入至少需要两道不同保持题；用户只需提供数据集和模型路径。
 
-预处理结果保存在 `runs/cache/datasets/`，算法轮次索引在 `runs/cache/rounds/`。
-数据集内容、模型基线、tokenizer、目标层、数值配置、运行库和代码均匹配且文件摘要一致时，
-直接复用已有阶段的 P1/K/C/Q/R/P5 产物；中断后也可重新启动同一命令接续未完成阶段。
-连续模式换了基线后会重新计算对应产物。失败或损坏阶段移到原轮次的 `failed_attempts/` 后重算。
-每次实验生成新的总报告，`round_<n>_reference.json` 指向实际计算或复用的轮次目录；
-`--cache-dir` 可改变缓存目录，`--no-cache` 强制本次重新计算。
-旧的手工实验产物缺少这些缓存标识，不会自动混入新实验。
+输入准备结果保存在 `runs/cache/datasets/`。数据集内容、Tokenizer、目标层和准备参数相同，
+且输出文件摘要一致时，可复用已冻结的输入。`--cache-dir` 修改这层输入缓存的目录，
+`--no-cache` 重新准备输入；两个参数都只影响输入准备。
+每次启动实验会创建新的运行目录，并依次执行 P0～P5。独立编辑仅在同一实验内复用符合条件的 C
+和驻留模型，顺序编辑每轮使用当前基准重新计算。运行配置保存在 `effective_config.json`，
+每轮记录 `pipeline_report.json` 和阶段产物，总体结果记录在 `run_report.json`。
+执行错误时保留已有报告与产物并停止；再次启动创建新实验。
 
 只准备输入时可单独调用下列脚本（不加载 8B 模型权重）：
 
@@ -149,8 +163,6 @@ python -m util.prepare_dataset_inputs --dataset data/datasets/cases.jsonl --laye
 python -u main.py --evaluate-run runs/<实验目录> --device cuda:0
 ```
 
-显式输入模式可在配置中设置 `evaluation.inputs_file` 指向同结构的保留测试输入；未提供时报告
-`evaluation_status=unavailable`。
 `main.py` 仍拒绝 `example_only` 输入。默认目标层、优化预算和门槛都可在配置中调整，
 自动生成脚本不重新审核数据质量。
 

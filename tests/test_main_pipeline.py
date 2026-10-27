@@ -68,35 +68,34 @@ class MainPipelineTests(unittest.TestCase):
                     "keep_training.json": str(self.keep),
                     "evaluation_inputs.json": str(prepared / "evaluation_inputs.json")}}
 
-    def test_config_requires_only_dataset_and_model_paths(self):
-        template = {"dataset": "REPLACE_WITH_DATASET", "model_path": "REPLACE_WITH_MODEL"}
-        issues = pipeline.config_setup_issues(template)
-        self.assertEqual(len(issues), 2)
-        self.assertEqual(pipeline.config_setup_issues({"dataset": str(self.dataset),
-                                                       "model_path": str(self.model)}), [])
-        self.assertTrue(any("only automatic" in issue for issue in pipeline.config_setup_issues({
-            "dataset": str(self.dataset), "model_path": str(self.model),
-            "input_preparation": {"mode": "explicit"}})))
+    def test_required_paths_fail_before_model_loading(self):
+        for key in ("dataset", "model_path"):
+            with self.assertRaises(ValueError):
+                pipeline.required_path({}, key)
+            with self.assertRaises(FileNotFoundError):
+                pipeline.required_path({key: str(self.root / "missing")}, key)
+        self.assertEqual(pipeline.required_path(self.choices, "dataset"), self.dataset)
+        self.choices["input_preparation"] = {"mode": "explicit"}
+        with self.assertRaisesRegex(ValueError, "只支持从数据集"):
+            pipeline.prepare_dataset_run(self.choices, None, None, None, True)
 
     @patch.object(pipeline, "local_model_identity")
     @patch.object(pipeline.subprocess, "run")
-    def test_existing_stage_files_are_reused_and_corruption_recomputes_dependents(self, execute, identity):
+    def test_existing_experiment_is_not_overwritten(self, execute, identity):
         execute.side_effect = self.fake_stage
         identity.return_value = self.identity
-        pipeline.one_round(self.config, run_id_override="trial", request_key="same")
+        pipeline.one_round(self.config, run_id_override="trial")
         execute.reset_mock()
-        workspace = self.root / "runs/trial/round_0"
-        result = pipeline.one_round(self.config, workspace=workspace, request_key="same")
+        report = self.root / "runs/trial/round_0/pipeline_report.json"
+        saved = report.read_bytes()
+        with self.assertRaises(FileExistsError):
+            pipeline.one_round(self.config, run_id_override="trial")
         execute.assert_not_called()
-        self.assertTrue(result["stages"]["P2_KEYS"]["cache_hit"])
-        (workspace / "matrices/reference_keys/manifest.json").write_text("corrupted", encoding="utf-8")
-        pipeline.one_round(self.config, workspace=workspace, request_key="same")
-        self.assertTrue(any("util.extract_reference_keys" in call.args[0] for call in execute.call_args_list))
-        self.assertTrue(list((workspace / "failed_attempts").glob("p2_keys_*")))
+        self.assertEqual(report.read_bytes(), saved)
 
     def fake_stage(self, command, **kwargs):
         module = command[command.index("-m") + 1]
-        round_dir = self.root / "runs" / "trial" / "round_0"
+        round_dir = Path(command[command.index("-m") + 2]).parent
         outputs = {
             "util.collect_denoise_states": round_dir / "p1/coverage_report.json",
             "util.extract_reference_keys": round_dir / "matrices/reference_keys/manifest.json",
@@ -147,7 +146,7 @@ class MainPipelineTests(unittest.TestCase):
         self.choices["execution"] = {"backend": "resident", "device": "cpu"}
         self.config.write_text(json.dumps(self.choices), encoding="utf-8")
 
-        def stage(label, arguments, artifact, accepted=("complete",)):
+        def stage(label, arguments, artifact, accepted=("complete",), **kwargs):
             if label.startswith("P0_"):
                 return [{"case_id": "fact_1", "probe_id": "edit_1", "real_forward": True,
                          "replay_within_tolerance": True, "full_mask_input": True,
@@ -157,14 +156,14 @@ class MainPipelineTests(unittest.TestCase):
             return {"status": "rejected" if label == "P4" else "complete"}
 
         for sequential in (False, True):
-            with patch.object(pipeline.StageRunner, "run", side_effect=stage) as run:
+            with patch.object(pipeline, "run_stage", side_effect=stage) as run:
                 pipeline.one_round(self.config, run_id_override=f"mode_{sequential}", sequential=sequential)
             command = next(call.args[1] for call in run.call_args_list if call.args[0] == "P2_KEEP")
             self.assertEqual("--reuse-across-rounds" in command, not sequential)
             self.assertNotIn("--batch-keep", command)
         self.choices["p2_keep"]["device"] = "cuda:0"
         self.config.write_text(json.dumps(self.choices), encoding="utf-8")
-        with patch.object(pipeline.StageRunner, "run", side_effect=stage) as run:
+        with patch.object(pipeline, "run_stage", side_effect=stage) as run:
             pipeline.one_round(self.config, run_id_override="batched")
         for label in ("P2_KEEP", "P2_QA"):
             command = next(call.args[1] for call in run.call_args_list if call.args[0] == label)
@@ -245,11 +244,12 @@ class MainPipelineTests(unittest.TestCase):
         self.assertEqual(run_round.call_args.kwargs["selected_case_ids"], ["other_0", "other_1"])
         effective = json.loads((self.root / "runs/override/effective_config.json").read_text(encoding="utf-8"))
         self.assertEqual(effective["dataset"], str(selected))
-        self.assertTrue((self.root / "runs/override/evaluation_plan.json").is_file())
+        report = json.loads((self.root / "runs/override/run_report.json").read_text())
+        self.assertEqual(report["evaluation_status"], "unavailable")
 
     @patch.object(pipeline, "local_model_identity")
     @patch.object(pipeline.subprocess, "run")
-    def test_dataset_mode_prepares_inputs_and_second_run_reuses_entire_pipeline(self, execute, identity):
+    def test_input_cache_is_reused_but_each_experiment_runs_all_stages(self, execute, identity):
         from util import prepare_dataset_inputs
         for filename in ("config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
             (self.model / filename).write_text("{}", encoding="utf-8")
@@ -278,10 +278,24 @@ class MainPipelineTests(unittest.TestCase):
         with patch.object(prepare_dataset_inputs.LLaDA8BInstructAdapter, "from_local_tokenizer") as tokenize, \
              patch("util.evaluate_accuracy.evaluate_run", return_value={"status": "unavailable"}):
             second = pipeline.run_dataset(self.config, run_id_override="rerun")
-        execute.assert_not_called()
+        self.assertEqual(execute.call_count, 8)
         tokenize.assert_not_called()
-        self.assertTrue(second["rounds"][0]["cache_workspace"])
-        self.assertEqual(first["rounds"][0]["report"], second["rounds"][0]["report"])
+        self.assertNotEqual(first["rounds"][0]["report"], second["rounds"][0]["report"])
+        self.assertTrue(Path(first["rounds"][0]["report"]).is_file())
+        self.assertTrue(Path(second["rounds"][0]["report"]).is_file())
+
+    def test_single_case_selection_keeps_full_dataset_preparation(self):
+        cases = [json.loads(self.dataset.read_text()) for _ in range(2)]
+        cases[1]["case_id"] = "fact_2"
+        self.dataset.write_text(json.dumps(cases), encoding="utf-8")
+        with patch.object(pipeline, "local_model_identity", return_value=self.identity), \
+             patch.object(pipeline, "one_round", return_value={"decision": "rejected", "selected_alpha": None,
+                          "final_model_dir": None, "checkpoint_dir": None}) as run_round, \
+             patch.object(pipeline, "prepare_inputs", side_effect=self.fake_prepare) as prepare:
+            result = pipeline.run_dataset(self.config, run_id_override="single", case_ids=["fact_2"])
+        self.assertEqual(prepare.call_args.args[0], self.dataset)
+        self.assertEqual(run_round.call_args.kwargs["selected_case_ids"], ["fact_2"])
+        self.assertEqual((result["fact_count"], result["case_count"]), (1, 1))
 
     def test_default_resets_and_sequential_chains_only_accepted_edits(self):
         cases = [json.loads(self.dataset.read_text(encoding="utf-8"))]
