@@ -51,13 +51,21 @@ python -c "import torch, transformers, accelerate, tokenizers, numpy, safetensor
 
 ### P0–P5 统一算法入口
 
-项目根目录的 `main.py` 是算法入口。`--dataset` 选择本次实验的数据集，覆盖配置中的
+项目根目录的 `main.py` 是统一算法入口，`--editor mdlm` 选择 MDLM（不区分大小写，省略时默认 MDLM）。
+MDLM 的 P0～P5 编排位于 `MDLM/runner.py`。`--dataset` 选择本次实验的数据集，覆盖配置中的
 `dataset`；未指定时使用 `configs/full_run.json` 中的数据集。`--model-path` 可覆盖模型目录。
 JSON 中的相对路径按项目根目录解析，命令行路径按当前工作目录解析。
 
 ```bash
-python -u main.py --dataset data/datasets/cases.jsonl
+python -u main.py --editor mdlm --dataset data/datasets/cases.jsonl
 ```
+
+新增算法时，在对应模块中实现 `run_dataset(config_file, **options)`，并在 `main.py` 的
+`EDITORS` 中登记 `"算法名": "包名.runner"`。入口只导入选中的算法模块；
+各算法通过 `config_file` 读取自己的超参数，`options` 接收数据集、模型、设备、缓存、
+案例选择及连续编辑等公共参数。运行函数返回结果字典，入口显示 `status`、`mode`、
+`fact_count`、`accepted_count`、`rejected_count`、`final_checkpoint_dir` 等摘要字段。
+随后使用 `python main.py --editor 算法名 --config configs/对应配置.json` 启动。
 
 默认配置使用 `execution={"backend":"resident","device":"cuda:0"}`，P0–P5 在同一进程中执行。
 模型前向、P4 残差优化、P2 的 C 累计与数值检查、P3 的 Q 求解、P5 的 RQ 写回和参数变化计算均使用 GPU。
