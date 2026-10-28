@@ -1,4 +1,4 @@
-"""P1 complete denoising states and supervision from formulas (1)–(3)."""
+"""P1：按公式（1）筛选兼容状态，按公式（2）（3）建立固定编辑监督。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from model.base import DenoiseTrace, EditTarget, MaskedEditInput
 
 @dataclass(frozen=True)
 class FactSelection:
+    """事实及其问题的选择标识。"""
+
     case_id: str
     probe_id: str
 
@@ -22,7 +24,7 @@ def fact_seed(seed: int, case_id: str, probe_id: str) -> int:
 
 
 def input_record(model_input: MaskedEditInput) -> dict:
-    """Save every model-facing field and LLaDA's implicit zero-based positions."""
+    """保留完整输入字段，供状态去重后的监督结构使用；不写入文件。"""
     return {
         "input_ids": list(model_input.input_ids),
         "attention_mask": list(model_input.attention_mask),
@@ -33,6 +35,7 @@ def input_record(model_input: MaskedEditInput) -> dict:
 
 
 def input_from_record(record: dict) -> MaskedEditInput:
+    """还原模型输入，核对 LLaDA 从零开始的隐式位置编号。"""
     if record["implicit_position_ids"] != list(range(len(record["input_ids"]))):
         raise ValueError("saved implicit position IDs differ from the model input length")
     return MaskedEditInput(
@@ -45,6 +48,8 @@ def input_from_record(record: dict) -> MaskedEditInput:
 
 @dataclass(frozen=True)
 class FactTrajectory:
+    """一个事实的自主采样轨迹；目标答案独立存放，只用于筛选和监督。"""
+
     case_id: str
     probe_id: str
     answer_positions: tuple[int, ...]
@@ -53,92 +58,58 @@ class FactTrajectory:
     trace: DenoiseTrace
 
     @classmethod
-    def from_sample(
-        cls, target: EditTarget, seed: int, trace: DenoiseTrace
-    ) -> "FactTrajectory":
+    def from_sample(cls, target: EditTarget, seed: int, trace: DenoiseTrace) -> "FactTrajectory":
+        """从全 mask 初态取得答案窗口，组装事实轨迹。"""
         if not trace.pre_forward_inputs:
             raise ValueError(f"{target.case_id}: sampler returned no pre-forward input")
-        return cls(
-            target.case_id,
-            target.probe_id,
-            trace.pre_forward_inputs[0].mask_positions,
-            target.token_ids,
-            seed,
-            trace,
-        )
-
-    def as_record(self) -> dict:
-        return {
-            "case_id": self.case_id,
-            "probe_id": self.probe_id,
-            "answer_positions": list(self.answer_positions),
-            "target_token_ids": list(self.target_token_ids),
-            "seed": self.seed,
-            "pre_forward_inputs": [input_record(item) for item in self.trace.pre_forward_inputs],
-            "mask_logit_sha256": list(self.trace.mask_logit_sha256),
-            "revealed_tokens": [
-                [[position, token] for position, token in step] for step in self.trace.revealed_tokens
-            ],
-            "final_input": input_record(self.trace.final_input),
-        }
-
-    @classmethod
-    def from_record(cls, record: dict) -> "FactTrajectory":
-        trace = DenoiseTrace(
-            tuple(input_from_record(item) for item in record["pre_forward_inputs"]),
-            tuple(record["mask_logit_sha256"]),
-            tuple(
-                tuple((position, token) for position, token in step)
-                for step in record["revealed_tokens"]
-            ),
-            input_from_record(record["final_input"]),
-        )
-        return cls(
-            record["case_id"],
-            record["probe_id"],
-            tuple(record["answer_positions"]),
-            tuple(record["target_token_ids"]),
-            record["seed"],
-            trace,
-        )
+        return cls(target.case_id, target.probe_id, trace.pre_forward_inputs[0].mask_positions,
+                   target.token_ids, seed, trace)
 
 
 def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[dict], dict]:
-    """Formula (1): retain masked states with no conflicting revealed answer token."""
-    if not trajectory.answer_positions or trajectory.answer_positions != tuple(sorted(set(trajectory.answer_positions))):
+    """公式（1）：完整输入去重后，保留尚有 mask 且已揭示答案均正确的状态。"""
+    trace = trajectory.trace
+    inputs = trace.pre_forward_inputs
+    answer_positions = trajectory.answer_positions
+    targets = trajectory.target_token_ids
+
+    # 本算法使用非空答案窗口、全 mask 初态和不重新掩码的受控去噪轨迹。
+    if not answer_positions or answer_positions != tuple(sorted(set(answer_positions))):
         raise ValueError(f"{trajectory.case_id}: answer positions must be nonempty, unique and ordered")
-    if len(trajectory.answer_positions) != len(trajectory.target_token_ids):
+    if len(answer_positions) != len(targets):
         raise ValueError(f"{trajectory.case_id}: answer positions and target length differ")
-    if not trajectory.trace.pre_forward_inputs:
+    if not inputs:
         raise ValueError(f"{trajectory.case_id}: full-mask initial state is missing")
-    initial = trajectory.trace.pre_forward_inputs[0]
-    if any(position < 0 or position >= len(initial.input_ids) for position in trajectory.answer_positions):
+    initial = inputs[0]
+    if any(position < 0 or position >= len(initial.input_ids) for position in answer_positions):
         raise ValueError(f"{trajectory.case_id}: answer position is out of range")
-    if not 0 <= initial.subject_last_position < min(trajectory.answer_positions):
+    if not 0 <= initial.subject_last_position < min(answer_positions):
         raise ValueError(f"{trajectory.case_id}: subject must precede the answer window")
-    if trajectory.trace.pre_forward_inputs[0].mask_positions != trajectory.answer_positions:
+    if initial.mask_positions != answer_positions:
         raise ValueError(f"{trajectory.case_id}: first state is not the full-mask initial state")
-    if len(trajectory.trace.revealed_tokens) != len(trajectory.trace.pre_forward_inputs):
+    if len(trace.revealed_tokens) != len(inputs):
         raise ValueError(f"{trajectory.case_id}: reveal count differs from forward count")
-    if len(trajectory.trace.mask_logit_sha256) != len(trajectory.trace.pre_forward_inputs):
+    if len(trace.mask_logit_sha256) != len(inputs):
         raise ValueError(f"{trajectory.case_id}: logit digest count differs from forward count")
 
     compatible: list[dict] = []
     discarded: list[dict] = []
     seen: set[MaskedEditInput] = set()
-    previous_masks = set(trajectory.answer_positions)
-    for step, state in enumerate(trajectory.trace.pre_forward_inputs):
-        if len(state.input_ids) != len(initial.input_ids) or len(state.input_ids) != len(state.attention_mask) or any(value != 1 for value in state.attention_mask):
+    previous_masks = set(answer_positions)
+    for step, state in enumerate(inputs):
+        if (len(state.input_ids) != len(initial.input_ids)
+                or len(state.input_ids) != len(state.attention_mask)
+                or any(value != 1 for value in state.attention_mask)):
             raise ValueError(f"{trajectory.case_id}: saved attention input differs from the forward contract")
-        if not set(state.mask_positions) <= previous_masks:
-            raise ValueError(f"{trajectory.case_id}: a revealed token was masked again")
         current_masks = set(state.mask_positions)
+        if not current_masks <= previous_masks:
+            raise ValueError(f"{trajectory.case_id}: a revealed token was masked again")
         if state.mask_positions != tuple(
             position for position, token in enumerate(state.input_ids) if token == mask_token_id
         ):
             raise ValueError(f"{trajectory.case_id}: saved mask positions differ from input IDs")
         previous_masks = current_masks
-        # frozen 输入已包含全部前向字段，可直接按完整输入去重。
+        # 按全部模型输入字段去重，不能只比较剩余 mask 或可见文本。
         if state in seen:
             discarded.append({"step": step, "reason": "duplicate_full_input"})
             continue
@@ -147,24 +118,22 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
             discarded.append({"step": step, "reason": "terminal"})
         elif any(
             state.input_ids[position] != target
-            for position, target in zip(trajectory.answer_positions, trajectory.target_token_ids)
+            for position, target in zip(answer_positions, targets)
             if position not in current_masks
         ):
             discarded.append({"step": step, "reason": "conflict"})
         else:
-            compatible.append({"step": step, "input": input_record(state), "remaining_mask_positions": list(state.mask_positions)})
+            compatible.append({"step": step, "input": input_record(state),
+                               "remaining_mask_positions": list(state.mask_positions)})
 
-    if trajectory.trace.final_input.mask_positions or mask_token_id in trajectory.trace.final_input.input_ids:
+    # 核对每次揭示确实产生下一输入，保持上下文、已揭示内容和 mask 变化一致。
+    if trace.final_input.mask_positions or mask_token_id in trace.final_input.input_ids:
         raise ValueError(f"{trajectory.case_id}: denoising did not reach a terminal state")
-    for step, current in enumerate(trajectory.trace.pre_forward_inputs):
-        following = (
-            trajectory.trace.pre_forward_inputs[step + 1]
-            if step + 1 < len(trajectory.trace.pre_forward_inputs)
-            else trajectory.trace.final_input
-        )
+    for step, current in enumerate(inputs):
+        following = inputs[step + 1] if step + 1 < len(inputs) else trace.final_input
         expected_ids = list(current.input_ids)
         revealed_positions = set()
-        for position, token in trajectory.trace.revealed_tokens[step]:
+        for position, token in trace.revealed_tokens[step]:
             if position not in current.mask_positions or position in revealed_positions or token == mask_token_id:
                 raise ValueError(f"{trajectory.case_id}: invalid revealed token at step {step}")
             expected_ids[position] = token
@@ -180,7 +149,7 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
     report = {
         "case_id": trajectory.case_id,
         "probe_id": trajectory.probe_id,
-        "pre_forward_count": len(trajectory.trace.pre_forward_inputs),
+        "pre_forward_count": len(inputs),
         "unique_input_count": len(seen),
         "compatible_count": len(compatible),
         "full_mask_initial_compatible": bool(compatible and compatible[0]["step"] == 0),
@@ -194,7 +163,7 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
 
 
 def build_supervision(trajectories: list[FactTrajectory], mask_token_id: int) -> tuple[list[dict], dict]:
-    """Formulas (2)–(3): normalize by fact, compatible state, then remaining mask."""
+    """公式（2）（3）：为事实、兼容状态、剩余 mask 三级平均准备位置权重。"""
     fact_count = len(trajectories)
     if not fact_count:
         raise ValueError("no selected facts were collected")
@@ -206,7 +175,7 @@ def build_supervision(trajectories: list[FactTrajectory], mask_token_id: int) ->
         total_states = len(states)
         for state in states:
             positions = state["remaining_mask_positions"]
-            # 公式（3）：每个监督位置的权重是 1/(N·|T_i|·|M_i,t|)。
+            # 公式（3）：w_i,t,j = 1 / (N·|T_i|·|M_i,t|)，不再对样本另取平均。
             weight = 1.0 / (fact_count * total_states * len(positions))
             state["supervision"] = [
                 {"position": position, "target_token_id": answer_by_position[position], "weight": weight}
@@ -223,6 +192,7 @@ def build_supervision(trajectories: list[FactTrajectory], mask_token_id: int) ->
             "states": states,
         })
         reports.append(report)
+    # 每个事实总权重为 1/N，全体为 1；合法的全 mask 初态保证 T_i 非空。
     total_weight = math.fsum(item["weight_sum"] for item in reports)
     formula_checks_passed = all(
         item["full_mask_initial_compatible"]
@@ -244,6 +214,8 @@ def build_supervision(trajectories: list[FactTrajectory], mask_token_id: int) ->
 
 @dataclass(frozen=True)
 class EditTrainingExample:
+    """一个固定兼容状态及其监督；模型输入与目标 token 分开存放。"""
+
     case_id: str
     model_input: MaskedEditInput
     positions: tuple[int, ...]
@@ -252,7 +224,7 @@ class EditTrainingExample:
 
 
 def edit_training_examples(facts: list[dict]) -> list[EditTrainingExample]:
-    """Reuse P1 formula (3) weights unchanged; never insert targets into inputs."""
+    """沿用公式（3）的权重，交给 optimize.py 计算公式（2）的损失。"""
     return [EditTrainingExample(
         fact["case_id"], input_from_record(state["input"]),
         tuple(term["position"] for term in state["supervision"]),
