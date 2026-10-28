@@ -54,7 +54,7 @@ def edit_round(model, adapter, trajectories, statistics, dev_edits, dev_keeps, o
     # P2/P3：K 的列顺序保持事实顺序，C 逐层计算并按原存储精度交给 Q。
     keys = extract_keys(model, adapter, trajectories, **(p2_keys or {}))
     factors, solve_reports = {}, {}
-    for name, matrix, _ in keep_matrices(model, adapter, statistics, **(p2_keep or {})):
+    for name, matrix in keep_matrices(model, adapter, statistics, **(p2_keep or {})):
         factors[name], solve_reports[name] = solve_writeback_factor(
             keys[name], matrix, writeback.ridge_by_layer[name], writeback)
         del matrix

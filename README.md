@@ -57,8 +57,7 @@ python -u main.py --editor mdlm --sequential
 - `MDLM/runner.py`：加载模型、数据和参数，执行独立或连续编辑，保存最终结果。
 - `MDLM/states.py`：去噪状态的兼容性筛选与三级监督权重，公式（1）～（3）。
 - `util/extract_reference_keys.py`：从本轮全 mask 初态提取 K，公式（4）。
-- `MDLM/keep_statistics.py` 与 `util/extract_keep_statistics.py`：逐层累计 C，公式（5）。
-- `util/validate_matrix_artifacts.py`：在内存中独立重放保持输入，核对 C 的 trace、外积、投影和半正定性。
+- `MDLM/keep_statistics.py` 与 `util/extract_keep_statistics.py`：每批保持输入前向一次，按公式（5）逐层累计 C；直接返回矩阵。
 - `MDLM/writeback.py`：以原有 λ 和 Cholesky 方法求解 Q，公式（6）～（9）。
 - `MDLM/candidate.py` 与 `MDLM/optimize.py`：安装 R(Qk) 分支，联合优化 R，公式（10）～（12）。
 - `MDLM/merge.py` 与 `MDLM/acceptance.py`：实际合并、开发门槛和精确回退，公式（13）～（18）。
