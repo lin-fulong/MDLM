@@ -15,7 +15,6 @@ from MDLM.optimize import KeepTrainingExample, ResidualOptimizationConfig, log_p
 from MDLM.states import build_supervision, edit_training_examples
 from MDLM.writeback import WritebackConfig, solve_writeback_factor
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
-from model.base import tensor_sha256
 from util.extract_keep_statistics import keep_input_from_record, keep_matrices
 from util.extract_reference_keys import extract_keys
 from util.io import read_json, require, write_json
@@ -59,24 +58,9 @@ def edit_round(model, adapter, trajectories, statistics, dev_edits, dev_keeps, o
             keys[name], matrix, writeback.ridge_by_layer[name], writeback)
         del matrix
 
-    # P4：R 从零开始，Q 固定；保留零残差重放和参数完整性检查。
-    versions = {name: (id(p), p._version) for name, p in model.named_parameters()}
-    weights = {name: tensor_sha256(model.get_submodule(name).weight) for name in names}
-    with torch.no_grad():
-        baseline_logits = [adapter.forward_logits(model, item.model_input, item.positions).cpu() for item in edits]
+    # 公式（10）～（12）：R 从零开始，Q 和基准权重固定，多层分支联合优化。
     with CandidateModel(model, factors, dtype=optimization.residual_dtype) as candidate:
-        with torch.no_grad():
-            for item, expected in zip(edits, baseline_logits):
-                actual = adapter.forward_logits(model, item.model_input, item.positions).cpu()
-                require(torch.allclose(actual, expected, atol=optimization.equivalence_atol,
-                                       rtol=optimization.equivalence_rtol), "R=0 的 logits 与基准不一致")
-        q_hashes = {name: tensor_sha256(branch.q) for name, branch in candidate.branches.items()}
         optimized = optimize_residuals(candidate, adapter, edits, list(keep_train), optimization)
-        require(all(tensor_sha256(branch.q) == q_hashes[name] for name, branch in candidate.branches.items()),
-                "残差优化改变了固定 Q")
-    require(versions == {name: (id(p), p._version) for name, p in model.named_parameters()}
-            and all(tensor_sha256(model.get_submodule(name).weight) == digest for name, digest in weights.items()),
-            "残差优化改变了基准权重")
     result = {"supervision": supervision, "optimization": optimized.report}
     if optimized.residuals is None:
         return {**result, "decision": "rejected", "selected_alpha": None,

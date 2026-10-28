@@ -103,7 +103,7 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
         q_values["device"] = keep_values["device"] = device
     keep_values["batch_keep"] = execution.get("backend") == "resident" and keep_values.get("device", "cpu").startswith("cuda")
     q = WritebackConfig(**q_values)
-    optimization = stage_settings(ResidualOptimizationConfig, choices["p4"])
+    optimization = ResidualOptimizationConfig(**choices["p4"])
     acceptance = stage_settings(AcceptanceConfig, choices["p5"])
 
     run_id = choose_run_id(choices.get("run_id"), run_id_override)
