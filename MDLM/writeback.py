@@ -4,10 +4,50 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import dataclass
 
 import torch
 
-from MDLM.contracts import WritebackConfig
+@dataclass(frozen=True)
+class WritebackConfig:
+    """公式（9）的逐层 λ、求解精度及数值容差。"""
+
+    ridge_by_layer: dict[str, float]
+    compute_dtype: str = "float64"
+    storage_dtype: str = "float32"
+    device: str = "cpu"
+    solver: str = "cholesky"
+    failure_policy: str = "stop"
+    symmetry_atol: float = 1e-7
+    symmetry_rtol: float = 1e-6
+    residual_tolerance: float = 1e-8
+    stored_residual_tolerance: float = 1e-5
+    residual_epsilon: float = 1e-12
+    chunk_size: int = 256
+
+    def check(self) -> None:
+        if not isinstance(self.ridge_by_layer, dict) or not self.ridge_by_layer or any(
+            not isinstance(name, str) or not name or isinstance(value, bool)
+            or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+            for name, value in self.ridge_by_layer.items()
+        ):
+            raise ValueError("one explicit finite positive ridge is required per target layer")
+        if any(dtype not in ("float32", "float64") for dtype in (self.compute_dtype, self.storage_dtype)):
+            raise ValueError("writeback compute/storage dtype must be float32 or float64")
+        if self.solver != "cholesky" or self.failure_policy != "stop":
+            raise ValueError("writeback supports only frozen cholesky with stop-on-failure")
+        if not isinstance(self.device, str) or (self.device not in ("cpu", "cuda") and not (
+            self.device.startswith("cuda:") and self.device[5:].isdigit()
+        )):
+            raise ValueError("writeback device must be cpu, cuda or cuda:<index>")
+        for name in ("symmetry_atol", "symmetry_rtol", "residual_tolerance", "stored_residual_tolerance", "residual_epsilon"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"writeback {name} must be finite and nonnegative")
+        if self.residual_epsilon == 0:
+            raise ValueError("writeback residual_epsilon must be positive")
+        if type(self.chunk_size) is not int or self.chunk_size < 1:
+            raise ValueError("writeback chunk_size must be a positive integer")
 
 
 class WritebackSolveError(ValueError):

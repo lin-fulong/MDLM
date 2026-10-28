@@ -13,10 +13,48 @@ import torch
 from torch.nn import functional as F
 
 from MDLM.candidate import CandidateModel
-from MDLM.contracts import ResidualOptimizationConfig
 from MDLM.states import EditTrainingExample
 from MDLM.writeback import stable_frobenius_norm
 from model.base import KeepModelInput, ModelAdapter
+
+
+@dataclass(frozen=True)
+class ResidualOptimizationConfig:
+    """公式（10）的优化参数；保持参考直接以 theta_0 的 log-probabilities 传入。"""
+
+    rho_by_layer: dict[str, float]
+    beta: float = 0.0
+    learning_rate: float = 0.01
+    max_steps: int = 20
+    checkpoints: tuple[int, ...] = (1, 5, 10, 20)
+    microbatch_size: int = 1
+    residual_dtype: str = "float32"
+    seed: int = 2026
+    optimizer: str = "adam"
+    equivalence_atol: float = 0.01
+    equivalence_rtol: float = 0.001
+
+    def check(self) -> None:
+        if not isinstance(self.rho_by_layer, dict) or not self.rho_by_layer or any(
+            not isinstance(name, str) or not name or isinstance(value, bool)
+            or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+            for name, value in self.rho_by_layer.items()
+        ):
+            raise ValueError("one finite positive rho is required per target layer")
+        for name in ("beta", "learning_rate", "equivalence_atol", "equivalence_rtol"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"P4 {name} must be finite and nonnegative")
+        if self.learning_rate == 0 or self.optimizer != "adam":
+            raise ValueError("P4 uses explicitly configured Adam with a positive learning rate and no weight decay")
+        if any(type(value) is not int or value < 1 for value in (self.max_steps, self.microbatch_size)):
+            raise ValueError("P4 step and microbatch sizes must be positive integers")
+        if not self.checkpoints or tuple(sorted(set(self.checkpoints))) != self.checkpoints or any(
+            type(step) is not int or not 1 <= step <= self.max_steps for step in self.checkpoints
+        ) or self.checkpoints[-1] != self.max_steps:
+            raise ValueError("P4 checkpoints must be ordered unique steps including max_steps")
+        if self.residual_dtype not in ("float32", "float64") or type(self.seed) is not int or self.seed < 0:
+            raise ValueError("P4 requires float32/float64 residuals and a nonnegative integer seed")
 
 
 @dataclass(frozen=True)

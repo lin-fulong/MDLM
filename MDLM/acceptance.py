@@ -3,15 +3,46 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 import math
 
 import torch
 
-from MDLM.contracts import AcceptanceConfig
 from MDLM.merge import EquivalenceError, WeightMerge, merge_with_equivalence
 from MDLM.optimize import edit_loss, edit_loss_from_logits, keep_loss, keep_loss_from_logits
 from MDLM.states import EditTrainingExample
 from MDLM.writeback import stable_frobenius_norm
+
+
+@dataclass(frozen=True)
+class AcceptanceConfig:
+    """公式（15）～（18）的公共 α 顺序、开发门槛与合并精度。"""
+
+    alphas: tuple[float, ...] = (1.0, 0.5, 0.25)
+    delta: float = 0.001
+    tau_g: float = 0.05
+    tau_u: float = 0.05
+    epsilon: float = 1e-12
+    compute_dtype: str = "float32"
+    equivalence_atol: float = 0.125
+    equivalence_rtol: float = 0.02
+    chunk_size: int = 256
+    edit_protocol: str = "full_mask_mean_fact_probe_token_v1"
+
+    def check(self) -> None:
+        if not self.alphas or any(isinstance(a, bool) or not isinstance(a, (int, float))
+                                 or not math.isfinite(a) or a <= 0 for a in self.alphas):
+            raise ValueError("P5 requires a finite ordered sequence of positive common alphas")
+        for name in ("delta", "tau_g", "tau_u", "epsilon", "equivalence_atol", "equivalence_rtol"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"P5 {name} must be finite and nonnegative")
+        if self.delta == 0 or self.epsilon == 0:
+            raise ValueError("P5 delta and epsilon must be positive")
+        if self.compute_dtype not in ("float32", "float64") or type(self.chunk_size) is not int or self.chunk_size < 1:
+            raise ValueError("P5 requires float32/float64 merge arithmetic and positive chunk_size")
+        if self.edit_protocol != "full_mask_mean_fact_probe_token_v1":
+            raise ValueError("unsupported P5 development protocol")
 
 
 class AcceptanceError(RuntimeError):

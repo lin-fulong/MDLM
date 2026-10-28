@@ -3,7 +3,6 @@
   "model_path": "model/models/LLaDA-8B-Instruct",
   "output_root": "runs",
   "target_layers": [0],
-  "cache_dir": "runs/cache",
   "execution": {"backend": "resident", "device": "cuda:0"},
   "input_preparation": {
     "settings": {"seed": 2026, "dev_fraction": 0.25, "test_fraction": 0.25,

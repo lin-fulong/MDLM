@@ -1,130 +1,53 @@
-"""Collect real-model P1 trajectories, then build fixed formula (1)–(3) supervision."""
+"""P0 输入重放与 P1 去噪轨迹采样，结果直接留在内存中。"""
 
 from __future__ import annotations
 
-import argparse
-import json
+import math
 import random
-from pathlib import Path
 
-from MDLM.contracts import P1_ARTIFACT_VERSION, P1RunConfig, file_sha256
-from MDLM.states import FactTrajectory, load_trajectories
-from data.readers.json_cases import case_purpose, load_cases
-from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
-from util.filter_compatible_states import filter_run
+import torch
+
+from MDLM.states import FactTrajectory, fact_seed
 
 
-def collect_run(config: P1RunConfig) -> dict:
-    """Load trusted cases, sample each selected fact, and save every pre-forward input."""
-    config.check()
-    if config.model_name != "LLaDA-8B-Instruct":
-        raise ValueError("P1 currently has a sampler only for LLaDA-8B-Instruct")
-    run_dir = config.p1_dir()
-    # 加载大模型之前先占用独立运行目录；成功与失败产物均不覆盖。
-    run_dir.mkdir(parents=True, exist_ok=False)
-    manifest = {
-        "artifact_version": P1_ARTIFACT_VERSION,
-        "collection_status": "partial",
-        "config": config.as_record(),
-        "config_sha256": config.digest(),
-        "forward_conditions": {
-            "attention_mask": "all_ones",
-            "position_ids": "implicit_zero_based",
-            "attention_bias": None,
-            "use_cache": False,
-            "model_mode": "eval",
-        },
-        "fact_order": [item.case_id for item in config.facts],
-        "replay_fact_indices": sorted(random.Random(config.seed).sample(range(len(config.facts)), config.replay_count)),
-    }
-    manifest_path = run_dir / "manifest.json"
-    report_path = run_dir / "collection_report.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    completed: list[dict] = []
-    phase = "setup"
-    current_case_id = None
-    try:
-        cases = {case["case_id"]: case for case in load_cases(config.case_file)}
-        model_path = Path(config.model_path)
-        manifest["case_file_sha256"] = file_sha256(config.case_file)
-        manifest["model_config_sha256"] = file_sha256(model_path / "config.json")
-        manifest["tokenizer_sha256"] = file_sha256(model_path / "tokenizer.json")
-        adapter = LLaDA8BInstructAdapter.from_local_tokenizer(
-            model_path=config.model_path, target_layers=config.target_layers
-        )
-        manifest["mask_token_id"] = adapter.mask_token_id
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        model = adapter.load_model(config.model_path, torch_dtype=config.torch_dtype, device_map=config.device_map)
-        phase = "sampling"
-        with (run_dir / "trajectories.jsonl").open("w", encoding="utf-8") as stream:
-            for fact in config.facts:
-                current_case_id = fact.case_id
-                case = cases[fact.case_id]
-                masked_input, target = adapter.prepare_edit_input(case, fact.probe_id)
-                seed = config.fact_seed(fact)
-                steps = config.steps or len(masked_input.mask_positions)
-                # 采样接口没有 target 参数；目标 token 仅在轨迹完成后写入监督侧。
-                trace = adapter.sample_denoise(
-                    model, masked_input, steps=steps, temperature=config.temperature, seed=seed
-                )
-                trajectory = FactTrajectory.from_sample(target, seed, trace)
-                stream.write(json.dumps(trajectory.as_record(), ensure_ascii=False) + "\n")
-                stream.flush()
-                completed.append({
-                    "case_id": fact.case_id,
-                    "probe_id": fact.probe_id,
-                    "purpose": case_purpose(case),
-                    "pre_forward_count": len(trace.pre_forward_inputs),
-                    "forward_logits_finite": True,
-                    "replayed": False,
-                    "logits_replayed": False,
-                })
-        phase = "replay"
-        saved_trajectories = load_trajectories(run_dir / "trajectories.jsonl")
-        for index in manifest["replay_fact_indices"]:
-            saved = saved_trajectories[index]
-            current_case_id = saved.case_id
-            # 从磁盘读取首态重新采样，核对保存后的完整前向输入轨迹。
-            replay = adapter.sample_denoise(
-                model,
-                saved.trace.pre_forward_inputs[0],
-                steps=len(saved.trace.pre_forward_inputs),
-                temperature=config.temperature,
-                seed=saved.seed,
-            )
-            if replay != saved.trace:
-                raise ValueError(f"{saved.case_id}: saved inputs, reveals, or mask logits did not replay")
-            completed[index]["replayed"] = True
-            completed[index]["logits_replayed"] = True
-    except Exception as error:
-        manifest["collection_status"] = "failed"
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        report_path.write_text(
-            json.dumps({"completed": completed, "failure": str(error), "phase": phase,
-                        "failed_case_id": current_case_id}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        raise
-
-    report_path.write_text(
-        json.dumps({"completed": completed, "failure": None}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    manifest["collection_status"] = "complete"
-    manifest["trajectories_sha256"] = file_sha256(run_dir / "trajectories.jsonl")
-    manifest["collection_report_sha256"] = file_sha256(report_path)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return filter_run(run_dir)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", type=Path, help="P1 JSON run configuration")
-    args = parser.parse_args()
-    config = P1RunConfig.from_file(args.config)
-    report = collect_run(config)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-
-
-if __name__ == "__main__":
-    main()
+def collect_trajectories(model, adapter, cases: list[dict], *, seed=2026, steps=None,
+                         temperature=0.0, replay_count=1) -> list[FactTrajectory]:
+    if type(seed) is not int or seed < 0 or (steps is not None and (type(steps) is not int or steps < 1)):
+        raise ValueError("seed 必须为非负整数，steps 必须为正整数或 null")
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature 必须为有限非负数")
+    if type(replay_count) is not int or not 0 <= replay_count <= len(cases):
+        raise ValueError("replay_count 必须在 0 与本轮事实数之间")
+    names = set(adapter.inspect_target_modules(model))
+    trajectories = []
+    for case in cases:
+        probes = case["prompts"]["edit"]
+        if len(probes) != 1:
+            raise ValueError("每个编辑事实必须且只能选择一个编辑探针")
+        probe_id = probes[0]["probe_id"]
+        initial, target = adapter.prepare_edit_input(case, probe_id)
+        if len(initial.mask_positions) != len(target.token_ids) or any(
+            initial.input_ids[p] != adapter.mask_token_id for p in initial.mask_positions
+        ):
+            raise ValueError("P0 要求完整短答案 mask 输入")
+        captured = adapter.forward_with_capture(model, initial)
+        repeated = adapter.forward_with_capture(model, initial)
+        if set(captured.module_inputs) != names or set(repeated.module_inputs) != names:
+            raise ValueError("P0 捕获层与目标层不一致")
+        if not torch.allclose(captured.mask_logits, repeated.mask_logits, atol=1e-2, rtol=1e-3) or any(
+            not torch.allclose(captured.module_inputs[name], repeated.module_inputs[name], atol=1e-2, rtol=1e-3)
+            for name in names
+        ):
+            raise ValueError("P0 前向未能在原有容差内重放")
+        selected_seed = fact_seed(seed, case["case_id"], probe_id)
+        trace = adapter.sample_denoise(model, initial, steps=steps or len(initial.mask_positions),
+                                       temperature=temperature, seed=selected_seed)
+        trajectories.append(FactTrajectory.from_sample(target, selected_seed, trace))
+    for index in sorted(random.Random(seed).sample(range(len(trajectories)), replay_count)):
+        saved = trajectories[index]
+        replay = adapter.sample_denoise(model, saved.trace.pre_forward_inputs[0],
+                                       steps=len(saved.trace.pre_forward_inputs),
+                                       temperature=temperature, seed=saved.seed)
+        if replay != saved.trace:
+            raise ValueError(f"{saved.case_id}: 去噪轨迹或 logits 未能重放")
+    return trajectories

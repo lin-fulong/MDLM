@@ -23,8 +23,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", type=Path, help="覆盖配置中的数据集路径")
     parser.add_argument("--model-path", type=Path, help="覆盖配置中的原始模型目录")
     parser.add_argument("--device", help="计算设备，如 cuda:0 或 cpu")
-    parser.add_argument("--cache-dir", type=Path, help="数据集输入缓存目录")
-    parser.add_argument("--no-cache", action="store_true", help="重新准备数据集输入")
     parser.add_argument("--case-id", action="append", help="选择源案例或事实，可重复指定")
     parser.add_argument("--run-id", help="本次实验的输出目录名")
     parser.add_argument("--sequential", action="store_true", help="将已接受的编辑作为下一轮基准")
@@ -46,8 +44,6 @@ def main(argv: list[str] | None = None) -> None:
         run_id_override=args.run_id,
         dataset_override=args.dataset,
         model_override=args.model_path,
-        cache_override=args.cache_dir,
-        use_cache=not args.no_cache,
         device_override=args.device,
         case_ids=args.case_id,
     )

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
-
-from MDLM.contracts import file_sha256
-
 
 def read_json(path: Path) -> dict:
     with path.open(encoding="utf-8") as stream:
@@ -22,5 +20,7 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-def checked_file(path: Path, digest: str) -> None:
-    require(file_sha256(path) == digest, f"artifact digest differs: {path}")
+def config_digest(values: dict) -> str:
+    """稳定的内容排序键，沿用原有数据划分算法。"""
+    payload = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
-import json
+import hashlib
 import math
 from dataclasses import dataclass
-from pathlib import Path
 
 from model.base import DenoiseTrace, EditTarget, MaskedEditInput
+
+
+@dataclass(frozen=True)
+class FactSelection:
+    case_id: str
+    probe_id: str
+
+
+def fact_seed(seed: int, case_id: str, probe_id: str) -> int:
+    """沿用逐事实随机流：改变处理顺序不改变采样种子。"""
+    key = f"{seed}:{case_id}:{probe_id}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(key).digest()[:8], "big") % (2**63)
 
 
 def input_record(model_input: MaskedEditInput) -> dict:
@@ -90,17 +101,6 @@ class FactTrajectory:
             record["seed"],
             trace,
         )
-
-
-def save_trajectories(path: str | Path, trajectories: list[FactTrajectory]) -> None:
-    with Path(path).open("w", encoding="utf-8") as stream:
-        for trajectory in trajectories:
-            stream.write(json.dumps(trajectory.as_record(), ensure_ascii=False) + "\n")
-
-
-def load_trajectories(path: str | Path) -> list[FactTrajectory]:
-    with Path(path).open(encoding="utf-8") as stream:
-        return [FactTrajectory.from_record(json.loads(line)) for line in stream if line.strip()]
 
 
 def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[dict], dict]:
@@ -240,17 +240,6 @@ def build_supervision(trajectories: list[FactTrajectory], mask_token_id: int) ->
         "formula_checks_passed": formula_checks_passed,
         "facts": reports,
     }
-
-
-def save_supervision(path: str | Path, facts: list[dict]) -> None:
-    with Path(path).open("w", encoding="utf-8") as stream:
-        for fact in facts:
-            stream.write(json.dumps(fact, ensure_ascii=False) + "\n")
-
-
-def load_supervision(path: str | Path) -> list[dict]:
-    with Path(path).open(encoding="utf-8") as stream:
-        return [json.loads(line) for line in stream if line.strip()]
 
 
 @dataclass(frozen=True)
