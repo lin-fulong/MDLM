@@ -53,9 +53,9 @@ def edit_round(model, adapter, trajectories, statistics, dev_edits, dev_keeps, o
 
     # P2/P3：K 的列顺序保持事实顺序，C 逐层计算并按原存储精度交给 Q。
     keys = extract_keys(model, adapter, trajectories, **(p2_keys or {}))
-    factors, solve_reports = {}, {}
+    factors = {}
     for name, matrix in keep_matrices(model, adapter, statistics, **(p2_keep or {})):
-        factors[name], solve_reports[name] = solve_writeback_factor(
+        factors[name] = solve_writeback_factor(
             keys[name], matrix, writeback.ridge_by_layer[name], writeback)
         del matrix
 
@@ -77,7 +77,7 @@ def edit_round(model, adapter, trajectories, statistics, dev_edits, dev_keeps, o
     require(versions == {name: (id(p), p._version) for name, p in model.named_parameters()}
             and all(tensor_sha256(model.get_submodule(name).weight) == digest for name, digest in weights.items()),
             "残差优化改变了基准权重")
-    result = {"supervision": supervision, "optimization": optimized.report, "solve": solve_reports}
+    result = {"supervision": supervision, "optimization": optimized.report}
     if optimized.residuals is None:
         return {**result, "decision": "rejected", "selected_alpha": None,
                 "baseline_restored": True, "selection": None}

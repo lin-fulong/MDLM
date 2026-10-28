@@ -102,7 +102,7 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
         device = execution.get("device", "cuda:0")
         q_values["device"] = keep_values["device"] = device
     keep_values["batch_keep"] = execution.get("backend") == "resident" and keep_values.get("device", "cpu").startswith("cuda")
-    q = stage_settings(WritebackConfig, q_values)
+    q = WritebackConfig(**q_values)
     optimization = stage_settings(ResidualOptimizationConfig, choices["p4"])
     acceptance = stage_settings(AcceptanceConfig, choices["p5"])
 
