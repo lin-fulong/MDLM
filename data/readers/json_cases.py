@@ -1,4 +1,4 @@
-"""Read trusted case data and prepare answer-free evaluation inputs."""
+"""Read trusted case data."""
 
 from __future__ import annotations
 
@@ -31,28 +31,3 @@ def case_purpose(case: dict) -> str:
     if case.get("split") in ("gold", "pilot", "dev"):
         return "development"
     return "edit"
-
-
-def evaluation_inputs(case: dict) -> list[dict]:
-    """Expose held-out questions without passing answer references to the model."""
-    inputs = []
-    for probes in case["prompts"].values():
-        for probe in probes:
-            if probe["used_for_edit"]:
-                continue
-            if "role" in probe:
-                role = probe["role"]
-            elif case.get("split") == "test":
-                role = "independent_test"
-            elif case.get("split") == "train":
-                role = "edit_diagnostic"
-            else:
-                role = "development_validation"
-            inputs.append({
-                "case_id": case["case_id"],
-                "probe_id": probe["probe_id"],
-                "prompt": probe["prompt"],
-                "role": role,
-                "example_only": case["quality_control"]["status"] == "example_only",
-            })
-    return inputs

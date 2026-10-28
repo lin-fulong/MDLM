@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from data.readers.json_cases import case_purpose, evaluation_inputs, load_cases
+from data.readers.json_cases import case_purpose, load_cases
 from data.schema import CaseValidationError, check_dataset, validate_case
 from data.validation.alignment import AlignmentError, align_edit_prompt
 from model.registry import get_adapter
@@ -42,7 +42,6 @@ class P0DataTests(unittest.TestCase):
     def test_read_and_case_roles(self):
         self.assertEqual(load_cases(FIXTURE), [self.case])
         self.assertEqual(case_purpose(self.case), "example_only")
-        self.assertEqual(evaluation_inputs(self.case)[0]["role"], "development_validation")
         self.assertEqual(check_dataset(FIXTURE), 1)
 
     def test_reader_skips_quality_checks_and_manual_check_rejects_duplicates(self):
@@ -78,7 +77,6 @@ class P0DataTests(unittest.TestCase):
         bad = copy.deepcopy(self.case)
         bad["prompts"]["paraphrase"][0]["used_for_edit"] = True
         validate_case(bad)
-        self.assertEqual(evaluation_inputs(bad), [])
 
     def test_old_answer_alias_and_prompt_target_are_rejected(self):
         bad = copy.deepcopy(self.case)
@@ -89,9 +87,6 @@ class P0DataTests(unittest.TestCase):
         bad["prompts"]["edit"][0]["prompt"] += "海岚市"
         with self.assertRaisesRegex(CaseValidationError, "prompt contains target"):
             validate_case(bad)
-        bad = copy.deepcopy(self.case)
-        bad["prompts"]["paraphrase"][0]["prompt"] += "海岚市"
-        self.assertEqual(evaluation_inputs(bad)[0]["prompt"], bad["prompts"]["paraphrase"][0]["prompt"])
 
     def test_edit_target_separate_from_model_input(self):
         adapter = get_adapter("LLaDA-8B-Instruct", tokenizer=CharacterTokenizer(), mask_token_id=126336, target_layers=(0,))
@@ -101,9 +96,6 @@ class P0DataTests(unittest.TestCase):
         self.assertEqual(target.token_ids, tuple(map(ord, "海岚市")))
         self.assertEqual(model_input.input_ids[model_input.subject_last_position], ord("舟"))
         self.assertEqual(adapter.target_module_names(), ("model.transformer.blocks.0.ff_out",))
-        self.assertNotIn("answer", evaluation_inputs(self.case)[0])
-        self.assertNotIn("target_proposition", evaluation_inputs(self.case)[0])
-        self.assertTrue(evaluation_inputs(self.case)[0]["example_only"])
 
     def test_alignment_rejects_ambiguous_subject(self):
         for prompt, subject in (("林舟问林舟", "林舟"), ("哈哈哈", "哈哈")):
@@ -161,12 +153,6 @@ class P0DataTests(unittest.TestCase):
         adapter = get_adapter("LLaDA-8B-Instruct", tokenizer=PromptMaskTokenizer(), mask_token_id=126336, target_layers=(0,))
         with self.assertRaisesRegex(ValueError, "already contains"):
             adapter.prepare_edit_input(self.case, "birth_edit")
-
-    def test_independent_test_probe_role(self):
-        other = copy.deepcopy(self.case)
-        other["split"] = "test"
-        self.assertEqual(evaluation_inputs(other)[0]["role"], "independent_test")
-
 
 if __name__ == "__main__":
     unittest.main()

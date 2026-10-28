@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from data.readers.json_cases import case_purpose, evaluation_inputs, load_cases
+from data.readers.json_cases import case_purpose, load_cases
 from data.readers.reviewed_cases import adapt_reviewed_cases
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from tests.test_p0_data import CharacterTokenizer
@@ -46,16 +46,15 @@ class ReviewedCasesAdapterTests(unittest.TestCase):
         self.assertEqual([case["case_id"] for case in cases], ["one"])
         self.assertEqual(case_purpose(cases[0]), "edit")
         self.assertEqual(cases[0]["prompts"]["edit"][0]["probe_id"], "one:edit:0")
-        self.assertEqual([x["role"] for x in evaluation_inputs(cases[0])],
-                         ["independent_test", "preservation"])
-        self.assertTrue(all("answer" not in x for x in evaluation_inputs(cases[0])))
+        self.assertEqual(cases[0]["prompts"]["portability"], [])
+        self.assertEqual(len(cases[0]["prompts"]["preservation"]), 1)
 
     def test_multi_request_expands_facts_without_duplicating_chain_probes(self):
         cases = adapt_reviewed_cases([row("chain", 2)])
         self.assertEqual([case["case_id"] for case in cases],
                          ["chain:rewrite:0", "chain:rewrite:1"])
         self.assertEqual([case["fact_core"]["subject"] for case in cases], ["Alice", "Bob"])
-        self.assertEqual([len(evaluation_inputs(case)) for case in cases], [2, 0])
+        self.assertEqual([len(case["prompts"]["preservation"]) for case in cases], [1, 0])
         adapter = LLaDA8BInstructAdapter(CharacterTokenizer(), mask_token_id=126336, target_layers=(0,))
         for case in cases:
             masked, target = adapter.prepare_edit_input(case, case["prompts"]["edit"][0]["probe_id"])

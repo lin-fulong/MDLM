@@ -445,18 +445,6 @@ def prepare_dataset_run(choices: dict, dataset_override: Path | None,
     return choices, identity, preparation
 
 
-def record_evaluation(root: Path, report: dict, device: str | None) -> dict:
-    """Evaluate completed rounds and save the two summary reports."""
-    from util.evaluate_accuracy import evaluate_run
-    accuracy = evaluate_run(root, device=device)
-    report["evaluation_status"] = accuracy["status"]
-    report["accuracy_report"] = str(root / "accuracy_report.json")
-    report["independent_accuracy"] = accuracy.get("independent")
-    report["preservation_accuracy"] = accuracy.get("preservation")
-    write_json(root / "run_report.json", report)
-    return accuracy
-
-
 def _run_dataset(choices: dict, *, sequential: bool = False,
                  run_id_override: str | None = None, dataset_override: Path | None = None,
                  model_override: Path | None = None, cache_override: Path | None = None,
@@ -499,7 +487,7 @@ def _run_dataset(choices: dict, *, sequential: bool = False,
               "source_dataset_sha256": choices["source_dataset_sha256"],
               "prepared_inputs": preparation["manifest"],
               "execution": execution,
-              "rounds": [], "current_case_id": None, "evaluation_status": "pending"}
+              "rounds": [], "current_case_id": None}
     write_json(report_path, report)
     baseline = original_model
     try:
@@ -530,7 +518,6 @@ def _run_dataset(choices: dict, *, sequential: bool = False,
                       rejected_count=sum(row["decision"] == "rejected" for row in report["rounds"]),
                       final_checkpoint_dir=str(baseline) if sequential else None)
         write_json(report_path, report)
-        record_evaluation(root, report, execution.get("device"))
         return report
     except Exception as error:
         report.update(status="failed", failure=str(error))
@@ -548,25 +535,10 @@ def main() -> None:
     parser.add_argument("--no-cache", action="store_true", help="重新准备数据集输入；P0–P5 每次都会执行")
     parser.add_argument("--case-id", action="append", help="选择一个源案例或事实，可重复指定；默认编辑整个数据集")
     parser.add_argument("--run-id", help="optional unique output directory name")
-    parser.add_argument("--evaluate-run", type=Path,
-                        help="只评价已完成实验目录，不重复执行 P0-P5")
     parser.add_argument("mode", nargs="?", choices=("sequential",),
                         help="chain accepted edits; default resets to the original model for each fact")
     parser.add_argument("--sequential", action="store_true", help="same as positional sequential")
     args = parser.parse_args()
-    if args.evaluate_run is not None:
-        from util.gpu_runtime import execution_context
-        run_dir = args.evaluate_run.resolve()
-        prior = read_json(run_dir / "run_report.json")
-        choices = read_json(run_dir / "effective_config.json")
-        execution = dict(choices.get("execution", {}))
-        if args.device:
-            execution.update(backend="resident", device=args.device)
-        with execution_context(execution, choices["target_layers"]):
-            accuracy = record_evaluation(run_dir, prior, args.device)
-        print(json.dumps({key: accuracy.get(key) for key in ("status", "independent", "preservation")},
-                         ensure_ascii=False, indent=2))
-        return
     if not args.config.is_file():
         parser.error(f"configuration file does not exist: {args.config}. Copy "
                      "configs/full_run.template.json to configs/full_run.json and fill in the required inputs")
@@ -575,8 +547,7 @@ def main() -> None:
                          model_override=args.model_path, cache_override=args.cache_dir, use_cache=not args.no_cache,
                          device_override=args.device, case_ids=args.case_id)
     print(json.dumps({key: result.get(key) for key in (
-        "status", "mode", "fact_count", "accepted_count", "rejected_count", "final_checkpoint_dir",
-        "evaluation_status", "independent_accuracy", "preservation_accuracy")},
+        "status", "mode", "fact_count", "accepted_count", "rejected_count", "final_checkpoint_dir")},
         ensure_ascii=False, indent=2))
 
 

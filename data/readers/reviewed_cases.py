@@ -38,12 +38,7 @@ def adapt_reviewed_cases(rows: list[dict]) -> list[dict]:
                                         used_for_edit=True, role="edit")],
                        "free_form_qa": [], "portability": [], "preservation": []}
             if index == 0:
-                # Chain-level probes are attached once, never duplicated across
-                # the component facts of a multi-request MQuAKE case.
-                for source in row["independent_test_questions"]:
-                    group = "portability" if ":portability:" in source["probe_id"] else "free_form_qa"
-                    prompts[group].append(_probe(source, answer_field="expected_new_answer",
-                                                 used_for_edit=False, role="independent_test"))
+                # Shared preservation probes are attached once across a multi-request case.
                 prompts["preservation"] = [
                     _probe(source, answer_field="expected_unchanged_answer",
                            used_for_edit=False, role="preservation")

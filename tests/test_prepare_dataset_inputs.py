@@ -1,4 +1,4 @@
-"""Dataset preparation, held-out partitions, and content-addressed cache checks."""
+"""Dataset preparation, disjoint partitions, and content-addressed cache checks."""
 
 import json
 import tempfile
@@ -35,7 +35,7 @@ class DatasetPreparationTests(unittest.TestCase):
         with patch.object(preparation.LLaDA8BInstructAdapter, "from_local_tokenizer", return_value=self.adapter):
             return preparation.prepare_inputs(self.dataset, self.model, (0,), self.root / "cache", **kwargs)
 
-    def test_builds_disjoint_keep_inputs_and_reserves_independent_test(self):
+    def test_builds_disjoint_keep_inputs(self):
         result = self.prepare(settings={"statistics_scale": 2.0})
         self.assertFalse(result["cache_hit"])
         files = result["files"]
@@ -52,8 +52,7 @@ class DatasetPreparationTests(unittest.TestCase):
                 self.assertTrue(all(row["input"]["input_ids"][p] == 99999 for p in row["positions"]))
         probes = json.loads(Path(files["development_probes.json"]).read_text())
         self.assertEqual(probes, [{"case_id": "fact", "probe_id": "edit"}])
-        evaluation = json.loads(Path(files["evaluation_inputs.json"]).read_text())
-        self.assertIn("independent", [probe["probe_id"] for probe in evaluation["inputs"]])
+        self.assertNotIn("evaluation_inputs.json", files)
 
     def test_cache_hit_avoids_tokenizing_and_dataset_change_misses(self):
         first = self.prepare()

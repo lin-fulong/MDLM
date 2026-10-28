@@ -1,4 +1,4 @@
-"""Freeze dataset-derived P2/P4/P5 inputs and reserve independent evaluation probes."""
+"""Freeze dataset-derived P2/P4/P5 inputs."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from util.io import write_json
 
 
 # 修改分词、划分或权重规则时递增版本，避免复用旧输入。
-PREPARATION_VERSION = "mdlm.dataset_inputs.1"
+PREPARATION_VERSION = "mdlm.dataset_inputs.2"
 DEFAULT_SETTINGS = {"seed": 2026, "dev_fraction": 0.25, "test_fraction": 0.25,
                     "statistics_scale": 1.0, "dev_edit_policy": "edit_probe"}
 
@@ -95,16 +95,11 @@ def prepare_inputs(dataset: Path, model_path: Path, layers: tuple[int, ...], cac
     adapter = LLaDA8BInstructAdapter.from_local_tokenizer(model_path=model_path, target_layers=layers)
     # 按题目内容分组后划分用途，重复题目不会同时进入保持训练和开发保持。
     pool = {}
-    evaluation = []
     for case in cases:
         for probe in case["prompts"].get("preservation", []):
             prompt_key = config_digest({"prompt": probe["prompt"].strip()})
             item = pool.setdefault(prompt_key, {"prompt": probe["prompt"], "answer": probe["answer"], "sources": []})
             item["sources"].append({"case_id": case["case_id"], "probe_id": probe["probe_id"]})
-        for group, probes in case["prompts"].items():
-            if group in ("edit", "preservation"):
-                continue
-            evaluation.extend({"case_id": case["case_id"], **probe} for probe in probes)
     ordered = sorted(pool, key=lambda key_: config_digest({"seed": policy["seed"], "prompt": key_}))
     if len(ordered) < 2:
         raise ValueError("自动生成保持统计和开发保持输入至少需要两道不同的 preservation 题")
@@ -152,13 +147,8 @@ def prepare_inputs(dataset: Path, model_path: Path, layers: tuple[int, ...], cac
                                   "purpose": "keep_dev", "inputs": development},
         "partitions.json": {"policy": policy, "preservation": partition,
                             "sources": {key_: pool[key_]["sources"] for key_ in pool},
-                            "dev_edit_policy": "复用编辑题计算 P5 短答案损失；独立测试题留给后续评价"},
+                            "dev_edit_policy": "复用编辑题计算 P5 短答案损失"},
     }
-    for key_ in partition["test"]:
-        evaluation.append({"case_id": pool[key_]["sources"][0]["case_id"],
-                           "probe_id": pool[key_]["sources"][0]["probe_id"], "role": "preservation_test",
-                           "prompt": pool[key_]["prompt"], "answer": pool[key_]["answer"]})
-    payloads["evaluation_inputs.json"] = {"status": "pending_evaluation", "inputs": evaluation}
     for filename, payload in payloads.items():
         write_json(output / filename, payload)
     if file_sha256(dataset) != source_digest or tokenizer_identity(model_path) != identity:

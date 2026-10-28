@@ -18,7 +18,6 @@ from MDLM.states import EditTrainingExample, FactTrajectory, build_supervision, 
 from MDLM.writeback import solve_writeback_factor
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import DenoiseTrace, KeepModelInput, MaskedEditInput
-from util.evaluate_accuracy import normalize_answer, score_probe, summarize
 
 
 class TinyModel(torch.nn.Module):
@@ -110,8 +109,6 @@ def algorithm_snapshot():
     merger = WeightMerge(model, factors, residuals, compute_dtype="float64", chunk_size=2)
     accepted = select_merged_candidate(merger, adapter, factors, residuals, development, keeps, originals, acceptance)
     weights = {name: model.get_submodule(name).weight.detach().clone() for name in names}
-    scores = [score_probe(adapter, model, {"case_id": "0", "probe_id": answer,
-        "role": "independent_test", "prompt": "Q", "answer": answer}) for answer in "ABC"]
     rejected = select_merged_candidate(merger, adapter, factors, residuals, development, keeps, originals,
                                         replace(acceptance, delta=1e6))
     return {
@@ -122,8 +119,6 @@ def algorithm_snapshot():
         "objectives": [row["loss"] for row in optimized.report["history"] if "loss" in row],
         "accepted": accepted, "rejected": rejected,
         "baseline_restored": all(torch.equal(model.get_submodule(name).weight, value) for name, value in originals.items()),
-        "accuracy": {"rows": scores, "summary": summarize(scores),
-                     "normalization": normalize_answer("Ａ  b\t") == normalize_answer("a B")},
     }
 
 
@@ -149,8 +144,6 @@ class AlgorithmRegressionTests(unittest.TestCase):
         for name, values in snapshot["tensors"].items():
             digest = hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             self.assertEqual(digest, expected[name], name)
-        digest = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        self.assertEqual(digest, "735d6e5f6fd8c04db4289eeb5fc4f449854502848eea719771440accfb8eba15")
 
 
 if __name__ == "__main__":

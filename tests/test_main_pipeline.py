@@ -53,20 +53,14 @@ class MainPipelineTests(unittest.TestCase):
         probes = [{"case_id": case["case_id"], "probe_id": case["prompts"]["edit"][0]["probe_id"]}
                   for case in load_cases(dataset)]
         (prepared / "development_probes.json").write_text(json.dumps(probes), encoding="utf-8")
-        (prepared / "evaluation_inputs.json").write_text('{"inputs": []}', encoding="utf-8")
         manifest = prepared / "manifest.json"
-        evaluation_file = prepared / "evaluation_inputs.json"
-        manifest.write_text(json.dumps({"status": "complete",
-                                        "files": {"evaluation_inputs.json": str(evaluation_file)},
-                                        "files_sha256": {str(evaluation_file): pipeline.file_sha256(evaluation_file)}}),
-                            encoding="utf-8")
+        manifest.write_text('{"status": "complete"}', encoding="utf-8")
         return {"cache_hit": False, "manifest": str(manifest), "cache_key": "test",
                 "recipe_id": "frozen_keep", "files": {
                     "editing_cases.json": str(dataset), "keep_statistics.json": str(self.keep),
                     "development_probes.json": str(prepared / "development_probes.json"),
                     "development_keep.json": str(self.dev_keep),
-                    "keep_training.json": str(self.keep),
-                    "evaluation_inputs.json": str(prepared / "evaluation_inputs.json")}}
+                    "keep_training.json": str(self.keep)}}
 
     def test_required_paths_fail_before_model_loading(self):
         for key in ("dataset", "model_path"):
@@ -245,7 +239,7 @@ class MainPipelineTests(unittest.TestCase):
         effective = json.loads((self.root / "runs/override/effective_config.json").read_text(encoding="utf-8"))
         self.assertEqual(effective["dataset"], str(selected))
         report = json.loads((self.root / "runs/override/run_report.json").read_text())
-        self.assertEqual(report["evaluation_status"], "unavailable")
+        self.assertNotIn("evaluation_status", report)
 
     @patch.object(pipeline, "local_model_identity")
     @patch.object(pipeline.subprocess, "run")
@@ -270,13 +264,11 @@ class MainPipelineTests(unittest.TestCase):
         adapter = SimpleNamespace(tokenizer=tokenizer, mask_token_id=99999)
         identity.return_value = self.identity
         execute.side_effect = self.fake_stage
-        with patch.object(prepare_dataset_inputs.LLaDA8BInstructAdapter, "from_local_tokenizer", return_value=adapter), \
-             patch("util.evaluate_accuracy.evaluate_run", return_value={"status": "unavailable"}):
+        with patch.object(prepare_dataset_inputs.LLaDA8BInstructAdapter, "from_local_tokenizer", return_value=adapter):
             first = pipeline.run_dataset(self.config, run_id_override="trial")
         self.assertEqual(first["status"], "complete")
         execute.reset_mock()
-        with patch.object(prepare_dataset_inputs.LLaDA8BInstructAdapter, "from_local_tokenizer") as tokenize, \
-             patch("util.evaluate_accuracy.evaluate_run", return_value={"status": "unavailable"}):
+        with patch.object(prepare_dataset_inputs.LLaDA8BInstructAdapter, "from_local_tokenizer") as tokenize:
             second = pipeline.run_dataset(self.config, run_id_override="rerun")
         self.assertEqual(execute.call_count, 8)
         tokenize.assert_not_called()
