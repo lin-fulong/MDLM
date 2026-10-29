@@ -60,7 +60,7 @@ python -u main.py --editor mdlm --sequential
 - `model/adapters/llada_8b_instruct.py`：LLaDA 本地加载、模板对齐、单条/批量实际 FFN 输入捕获、可微完整词表读出、自主去噪与本轮权重恢复。
 - `data/validation/alignment.py`：按实际 tokenizer 偏移定位主体 token，取得稳定边界的监督答案；为公式（1）～（4）和开发编辑提供位置与目标。
 - `data/readers/reviewed_cases.py`：按 gold_ready 筛选源案例、逐请求展开事实，保留联合编辑来源；共享保持题只附到首个事实，监督答案取编辑题字段。
-- `data/readers/json_cases.py`：读取 JSON/JSONL 并统一列表形式，按首条记录识别是否调用审核源格式转换；用途标签仅供 P0 冒烟显示。
+- `data/readers/json_cases.py`：读取 JSON/JSONL 并统一列表形式，按首条记录识别是否调用审核源格式转换；用途标签辅助函数目前没有正式调用方。
 - `MDLM/runner.py`：按源案例分组、加载一次模型，固定最初 θ₀/W₀ 参照，控制独立/连续编辑与本轮恢复，保存最终结果。
 - `MDLM/states.py`：去噪状态的兼容性筛选与三级监督权重，公式（1）～（3）。
 - `util/prepare_dataset_inputs.py`：固定保持题划分、全 mask 上下文及题/位置权重，为公式（5）（10）（16）和开发编辑准备输入；统计与训练共用训练分区，开发保持单独划分。

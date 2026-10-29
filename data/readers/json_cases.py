@@ -24,7 +24,7 @@ def load_cases(path: str | Path) -> list[dict]:
 
 
 def case_purpose(case: dict) -> str:
-    """供 P0 冒烟显示用途：示例优先，再看 split；不参与选例或保持数据划分。"""
+    """返回旧用途标签；当前无正式调用方，不参与选例或保持数据划分。"""
     if case["quality_control"]["status"] == "example_only":
         return "example_only"
     if case.get("split") == "test":
