@@ -1,0 +1,12 @@
+{
+  "dataset": "data/datasets/cases.jsonl",
+  "input_preparation": {
+    "settings": {
+      "seed": 2026,
+      "dev_fraction": 0.25,
+      "test_fraction": 0.25,
+      "statistics_scale": 1.0,
+      "dev_edit_policy": "edit_probe"
+    }
+  }
+}

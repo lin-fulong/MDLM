@@ -14,7 +14,7 @@ from data.readers.json_cases import load_cases
 from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from util.collect_denoise_states import collect_trajectories
 from util.gpu_runtime import execution_context
-from util.io import read_json, write_json
+from util.io import read_config, write_json
 from util.prepare_dataset_inputs import prepare_inputs
 
 
@@ -48,13 +48,20 @@ def select_cases(cases, case_ids):
             or case.get("source_case_id", case["case_id"]) in selected]
 
 
+def layer_coefficients(value, names) -> dict:
+    """λ/ρ 标量用于全部目标层；列表按模型目标层顺序逐项对应。"""
+    if isinstance(value, (int, float)):
+        return dict.fromkeys(names, value)
+    return dict(zip(names, value, strict=True))
+
+
 def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, dataset_override=None,
                 model_override=None, device_override=None, case_ids=None) -> dict:
     """独立模式每案例从 theta_0 开始；连续模式接续上一案例的接受结果。
 
     每案例执行一次固定监督、残差优化与写回验收，不执行同一事实集的可选刷新。
     """
-    choices = read_json(config_file)
+    choices = read_config(config_file)
     dataset = dataset_override.resolve() if dataset_override is not None else project_path(choices["dataset"])
     model_path = model_override.resolve() if model_override is not None else project_path(choices["model_path"])
     layers = tuple(choices["target_layers"])
@@ -69,19 +76,26 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
     if device_override is not None:
         execution["device"] = device_override
         execution.setdefault("backend", "resident")
-    p1 = dict(choices.get("p1", {}))
-    dtype = p1.pop("torch_dtype", "auto")
-    device = p1.pop("device_map", "auto")
-    q_values, keep_values = dict(choices["p3"]), dict(choices.get("p2_keep", {}))
-    keep_values.pop("recipe_id", None)
-    # 执行设备优先于 p1.device_map，并沿用 C/Q 的设备与保持批处理设置。
+    sampling = {name: choices[key] for name, key in (
+        ("seed", "sampling_seed"), ("steps", "denoise_steps"),
+        ("temperature", "temperature"), ("replay_count", "replay_count")) if key in choices}
+    key_options = {name: choices["key_" + name] for name in ("replay_atol", "replay_rtol")
+                   if "key_" + name in choices}
+    dtype, device = choices.get("torch_dtype", "auto"), choices.get("device_map", "auto")
+    compute_device = "cpu"
+    # 执行设备优先于模型 device_map；C/Q 沿用同一设备与保持批处理规则。
     if "device" in execution or execution.get("backend") == "resident":
         device = execution.get("device", "cuda:0")
-        q_values["device"] = keep_values["device"] = device
-    keep_values["batch_keep"] = execution.get("backend") == "resident" and keep_values.get("device", "cpu").startswith("cuda")
-    q = WritebackConfig(**q_values)
-    optimization = ResidualOptimizationConfig(**choices["p4"])
-    acceptance = AcceptanceConfig(**choices["p5"])
+        compute_device = device
+    keep_options = {"device": compute_device,
+                    "batch_keep": execution.get("backend") == "resident" and compute_device.startswith("cuda")}
+    optimization_values = {key: choices[key] for key in (
+        "beta", "learning_rate", "max_steps", "checkpoints", "microbatch_size") if key in choices}
+    if "optimization_seed" in choices:
+        optimization_values["seed"] = choices["optimization_seed"]
+    acceptance = AcceptanceConfig(**{key: choices[key] for key in (
+        "alphas", "delta", "tau_g", "tau_u", "epsilon", "equivalence_atol", "equivalence_rtol", "chunk_size")
+        if key in choices})
 
     run_id = choose_run_id(choices.get("run_id"), run_id_override)
     output = project_path(choices.get("output_root", "runs")) / run_id
@@ -94,6 +108,11 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
     try:
         with execution_context(execution):
             adapter = LLaDA8BInstructAdapter.from_local_tokenizer(model_path=model_path, target_layers=layers)
+            # 公式（6）（10）：算法提供 λ/ρ，具体模块名由模型适配器确定。
+            names = adapter.target_module_names()
+            q = WritebackConfig(layer_coefficients(choices["ridge"], names), device=compute_device)
+            optimization = ResidualOptimizationConfig(
+                layer_coefficients(choices["rho"], names), **optimization_values)
             # 用完整 cases 划分保持输入，不让 --case-id 改变训练/开发集合。
             prepared = prepare_inputs(cases, adapter, settings=choices.get("input_preparation", {}).get("settings"))
             model = adapter.load_model(model_path, torch_dtype=dtype, device_map=device)
@@ -109,7 +128,7 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
                 baseline = adapter.snapshot_target_weights(model)
                 try:
                     # 公式（1）～（3）的前置采样：使用本轮 theta_b，自主生成固定轨迹。
-                    trajectories = collect_trajectories(model, adapter, group, **p1)
+                    trajectories = collect_trajectories(model, adapter, group, **sampling)
                     fact_ids = {case["case_id"] for case in group}
                     probes = tuple(item for item in prepared["development_probes"] if item.case_id in fact_ids)
                     dev_edits = development_edits(group, probes, adapter)
@@ -117,7 +136,7 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
                     result = edit_round(
                         model, adapter, trajectories, prepared["statistics"], dev_edits, dev_keeps, originals,
                         writeback=q, optimization=optimization, acceptance=acceptance, keep_train=train_keeps,
-                        p2_keys=choices.get("p2_keys"), p2_keep=keep_values)
+                        key_options=key_options, keep_options=keep_options)
                     final_dir = None
                     if not sequential and result["decision"] == "accepted":
                         final_dir = save_final_model(model, adapter, output / f"case_{index}",

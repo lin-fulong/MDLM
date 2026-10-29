@@ -1,0 +1,8 @@
+{
+  "model_path": "model/models/LLaDA-8B-Instruct",
+  "target_layers": [0],
+  "execution": {
+    "backend": "resident",
+    "device": "cuda:0"
+  }
+}

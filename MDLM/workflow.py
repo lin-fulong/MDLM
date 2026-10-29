@@ -36,16 +36,16 @@ def reference_examples(model, adapter, rows) -> list[KeepTrainingExample]:
 
 def edit_round(model, adapter, trajectories, statistics, dev_edits, dev_keeps, originals, *,
                writeback: WritebackConfig, optimization: ResidualOptimizationConfig,
-               acceptance: AcceptanceConfig, keep_train=(), p2_keys=None, p2_keep=None) -> dict:
+               acceptance: AcceptanceConfig, keep_train=(), key_options=None, keep_options=None) -> dict:
     """执行一轮编辑：theta_b 为传入模型，originals 始终为最初 W_0。"""
     # 公式（1）～（3）：筛选固定兼容状态，沿用事实/状态/位置的全局监督权重。
     facts, supervision = build_supervision(trajectories, adapter.mask_token_id)
     edits = edit_training_examples(facts)
 
     # 公式（4）～（9）：按事实顺序提取 K，逐层累计 C、解 HX=K，得到固定 Q=Xᵀ。
-    keys = extract_keys(model, adapter, trajectories, **(p2_keys or {}))
+    keys = extract_keys(model, adapter, trajectories, **(key_options or {}))
     factors = {}
-    for name, matrix in keep_matrices(model, adapter, statistics, **(p2_keep or {})):
+    for name, matrix in keep_matrices(model, adapter, statistics, **(keep_options or {})):
         factors[name] = solve_writeback_factor(
             keys[name], matrix, writeback.ridge_by_layer[name], writeback)
         del matrix

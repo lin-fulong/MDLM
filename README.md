@@ -21,14 +21,16 @@ python -m pip check
 
 ## 启动
 
-`configs/` 仅保留 `full_run.json`。直接修改其中的数据集、模型、目标层和算法超参数，逐项含义见[配置参数说明](docs/配置参数说明.md)，然后运行：
+`configs/main.json` 组合模型、数据集和算法配置。分别在 `models/llada_8b_instruct.json` 修改模型与目标层，在 `datasets/cases.json` 修改数据路径与输入划分，在 `editors/mdlm.json` 修改算法超参数；逐项含义见[配置参数说明](docs/配置参数说明.md)。然后运行：
 
 ```bash
-python -u main.py --editor mdlm --config configs/full_run.json
+python -u main.py --config configs/main.json
 ```
 
-`--editor` 不区分大小写，省略时默认 MDLM。
-命令行路径相对当前目录，JSON 中的相对路径相对项目根目录。
+算法默认读取主配置的 `editor`；`--editor` 可覆盖，不区分大小写，均未指定时使用 MDLM。
+命令行路径相对当前目录，三个配置引用相对主配置目录，数据、模型和输出路径相对项目根目录。
+λ/ρ 为标量时应用到全部目标层，也可按 `target_layers` 顺序填写等长列表；无需在算法配置中重复模型模块名。
+`mdlm.json` 使用平铺参数名：`sampling_seed`、`denoise_steps`、`ridge`、`rho`、`learning_rate`、`optimization_seed` 等；不再使用 P1～P5 分组。采样步数与优化步数、采样种子与优化种子分别配置。
 
 ```bash
 # 覆盖数据集或模型目录
@@ -71,7 +73,7 @@ python -u main.py --editor mdlm --sequential
 - `MDLM/merge.py` 与 `MDLM/acceptance.py`：按公共 α 从基准重建实际权重，核对因子/合并前向，按三个独立开发门槛接受或精确回退，公式（13）～（18）。
 - `MDLM/workflow.py`：准备最初 θ₀ 的保持参考，串联单轮监督 → K/C → Q → R → 开发接受，并保存、重载最终目标权重。
 - `util/gpu_runtime.py`：选择运行设备；resident 模式关闭 TF32，退出时恢复原设置。它不实现编号公式，只固定公式（1）～（18）的共同运行环境。
-- `util/io.py`：读取配置、保存运行摘要和最终模型元数据，并为保持输入生成确定性划分摘要；摘要服务公式（5）（10）（16）的输入准备，本身不计算公式。
+- `util/io.py`：组合主配置引用的模型、数据集与算法参数，保存运行摘要和最终模型元数据，并为保持输入生成确定性划分摘要；摘要服务公式（5）（10）（16）的输入准备，本身不计算公式。
 
 `contracts.py` 已删除。数学参数放在对应算法模块的参数类中；
 不再需要阶段 manifest、文件摘要、版本合同或临时 JSON 配置来衔接计算。
@@ -108,10 +110,10 @@ adapter, model = load_final_model("runs/<run_id>/final_model", device_map="cuda:
 ## 增加其他编辑算法
 
 在新模块中实现 `run_dataset(config_file, **options)`，并在 `main.py` 的
-`EDITORS` 中登记 `"算法名": "包名.runner"`。各算法读取自己的配置，入口按需导入对应模块：
+`EDITORS` 中登记 `"算法名": "包名.runner"`。主配置中同步选择 `editor` 和 `editor_config`；新算法可用 `util.io.read_config` 读取组合后的配置，入口按需导入对应模块：
 
 ```bash
-python main.py --editor 算法名 --config configs/对应配置.json
+python main.py --editor 算法名 --config configs/对应主配置.json
 ```
 
 ## 本地验证
@@ -120,7 +122,7 @@ python main.py --editor 算法名 --config configs/对应配置.json
 K、C、Q、R、最终权重、优化损失和验收决策，并检查连续编辑、失败回退、CUDA 与最终结果重载：
 
 ```bash
-python -m unittest tests.test_memory_pipeline tests.test_memory_runner tests.test_memory_preparation tests.test_memory_gpu -b -q
+python -m unittest tests.test_split_config tests.test_main_cli tests.test_memory_pipeline tests.test_memory_runner tests.test_memory_preparation tests.test_memory_gpu -b -q
 ```
 
 原始算法推导和历史联调记录保留在 `docs/`；其中的阶段文件和旧命令描述对应当时版本。
