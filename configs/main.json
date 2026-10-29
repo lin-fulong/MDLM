@@ -1,5 +1,6 @@
 {
   "editor": "mdlm",
+  "seed": 2026,
   "editor_config": "editors/mdlm.json",
   "model_config": "models/llada_8b_instruct.json",
   "dataset_config": "datasets/cases.json",

@@ -62,6 +62,9 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
     每案例执行一次固定监督、残差优化与写回验收，不执行同一事实集的可选刷新。
     """
     choices = read_config(config_file)
+    seed = choices.get("seed", 2026)
+    # 主配置种子统一控制保持划分、去噪采样和残差优化。
+    input_settings = {**choices.get("input_preparation", {}).get("settings", {}), "seed": seed}
     dataset = dataset_override.resolve() if dataset_override is not None else project_path(choices["dataset"])
     model_path = model_override.resolve() if model_override is not None else project_path(choices["model_path"])
     layers = tuple(choices["target_layers"])
@@ -76,9 +79,8 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
     if device_override is not None:
         execution["device"] = device_override
         execution.setdefault("backend", "resident")
-    sampling = {name: choices[key] for name, key in (
-        ("seed", "sampling_seed"), ("steps", "denoise_steps"),
-        ("temperature", "temperature"), ("replay_count", "replay_count")) if key in choices}
+    sampling = {"seed": seed, "steps": choices.get("denoise_steps"),
+                **{key: choices[key] for key in ("temperature", "replay_count") if key in choices}}
     key_options = {name: choices["key_" + name] for name in ("replay_atol", "replay_rtol")
                    if "key_" + name in choices}
     dtype, device = choices.get("torch_dtype", "auto"), choices.get("device_map", "auto")
@@ -91,8 +93,6 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
                     "batch_keep": execution.get("backend") == "resident" and compute_device.startswith("cuda")}
     optimization_values = {key: choices[key] for key in (
         "beta", "learning_rate", "max_steps", "checkpoints", "microbatch_size") if key in choices}
-    if "optimization_seed" in choices:
-        optimization_values["seed"] = choices["optimization_seed"]
     acceptance = AcceptanceConfig(**{key: choices[key] for key in (
         "alphas", "delta", "tau_g", "tau_u", "epsilon", "equivalence_atol", "equivalence_rtol", "chunk_size")
         if key in choices})
@@ -100,7 +100,7 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
     run_id = choose_run_id(choices.get("run_id"), run_id_override)
     output = project_path(choices.get("output_root", "runs")) / run_id
     output.mkdir(parents=True, exist_ok=False)
-    report = {"editor": "mdlm", "status": "running", "run_id": run_id,
+    report = {"editor": "mdlm", "status": "running", "run_id": run_id, "seed": seed,
               "mode": "sequential" if sequential else "independent",
               "fact_count": len(selected), "case_count": len(groups),
               "source_dataset": str(dataset), "original_model": str(model_path),
@@ -112,9 +112,9 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
             names = adapter.target_module_names()
             q = WritebackConfig(layer_coefficients(choices["ridge"], names), device=compute_device)
             optimization = ResidualOptimizationConfig(
-                layer_coefficients(choices["rho"], names), **optimization_values)
+                layer_coefficients(choices["rho"], names), seed=seed, **optimization_values)
             # 用完整 cases 划分保持输入，不让 --case-id 改变训练/开发集合。
-            prepared = prepare_inputs(cases, adapter, settings=choices.get("input_preparation", {}).get("settings"))
+            prepared = prepare_inputs(cases, adapter, settings=input_settings)
             model = adapter.load_model(model_path, torch_dtype=dtype, device_map=device)
             # 公式（10）（16）（17）：W_0 与 p_theta_0 在首次编辑前固定，之后不刷新。
             originals = {name: model.get_submodule(name).weight.detach().cpu().clone()

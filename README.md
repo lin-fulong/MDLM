@@ -30,7 +30,8 @@ python -u main.py --config configs/main.json
 算法默认读取主配置的 `editor`；`--editor` 可覆盖，不区分大小写，均未指定时使用 MDLM。
 命令行路径相对当前目录，三个配置引用相对主配置目录，数据、模型和输出路径相对项目根目录。
 λ/ρ 为标量时应用到全部目标层，也可按 `target_layers` 顺序填写等长列表；无需在算法配置中重复模型模块名。
-`mdlm.json` 使用平铺参数名：`sampling_seed`、`denoise_steps`、`ridge`、`rho`、`learning_rate`、`optimization_seed` 等；不再使用 P1～P5 分组。采样步数与优化步数、采样种子与优化种子分别配置。
+`mdlm.json` 使用平铺参数名：`denoise_steps`、`ridge`、`rho`、`learning_rate` 等；不再使用 P1～P5 分组，采样步数与优化步数分别配置。
+随机种子统一在 `configs/main.json` 设置 `seed`，默认为 `2026`，共同控制保持数据划分、轨迹采样与残差优化；子配置不再设置种子。`run_report.json` 记录本次使用的种子。
 
 ```bash
 # 覆盖数据集或模型目录

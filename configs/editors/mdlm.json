@@ -1,5 +1,4 @@
 {
-  "sampling_seed": 2026,
   "denoise_steps": null,
   "temperature": 0.0,
   "replay_count": 1,
@@ -13,7 +12,6 @@
   "max_steps": 20,
   "checkpoints": [1, 5, 10, 20],
   "microbatch_size": 1,
-  "optimization_seed": 2026,
 
   "alphas": [1.0, 0.5, 0.25],
   "delta": 0.001,
