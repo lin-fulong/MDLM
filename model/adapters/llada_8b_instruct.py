@@ -1,4 +1,4 @@
-"""LLaDA P0 alignment/capture and P1 autonomous denoising."""
+"""LLaDA 的短答案输入、实际 FFN 输入捕获、可微前向与自主去噪。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,10 @@ DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "LLaDA-8B-
 
 
 class LLaDA8BInstructAdapter(ModelAdapter):
+    """将 LLaDA 的模型调用转换为 MDLM 所需的输入、激活、轨迹与本轮快照。"""
+
     def __init__(self, tokenizer: Any, *, mask_token_id: int, target_layers: tuple[int, ...]):
+        """固定 tokenizer、mask 标记及可编辑层；目标为独立的 ff_out 线性层。"""
         if not target_layers or len(set(target_layers)) != len(target_layers) or any(
             type(layer) is not int or layer < 0 for layer in target_layers
         ):
@@ -29,6 +32,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
     def from_local_tokenizer(
         cls, *, model_path: str | Path = DEFAULT_MODEL_PATH, target_layers: tuple[int, ...]
     ) -> "LLaDA8BInstructAdapter":
+        """从本地 tokenizer/config 读取模板与 mask ID，不下载模型文件。"""
         from transformers import AutoConfig, AutoTokenizer
 
         model_path = str(Path(model_path))
@@ -40,6 +44,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
 
     @staticmethod
     def load_model(model_path: str | Path = DEFAULT_MODEL_PATH, **kwargs):
+        """按调用方的精度和设备设置加载本地权重，并固定为 eval 模式。"""
         from transformers import AutoModelForCausalLM
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -49,14 +54,17 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         return model
 
     def prepare_edit_input(self, case: dict, probe_id: str) -> tuple[MaskedEditInput, EditTarget]:
+        """公式（1）～（4）：选择编辑探针，分别构造全 mask 初态与监督答案。"""
         probe = next(p for p in case["prompts"]["edit"] if p["probe_id"] == probe_id)
         return self._prepare_short_answer(case, probe)
 
     def prepare_development_input(self, case: dict, probe_id: str) -> tuple[MaskedEditInput, EditTarget]:
+        """公式（18）：从各探针组查找固定开发题，沿用短答案对齐。"""
         probe = next(p for group in case["prompts"].values() for p in group if p["probe_id"] == probe_id)
         return self._prepare_short_answer(case, probe)
 
     def _prepare_short_answer(self, case: dict, probe: dict) -> tuple[MaskedEditInput, EditTarget]:
+        """按真实聊天模板定位主体；答案只决定窗口长度并单独返回为监督。"""
         rendered = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": probe["prompt"]}], tokenize=False, add_generation_prompt=True
         )
@@ -79,10 +87,11 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         )
 
     def target_module_names(self) -> tuple[str, ...]:
+        """公式（4）～（15）的目标模块 ℓ，顺序沿用 target_layers。"""
         return tuple(f"model.transformer.blocks.{layer}.ff_out" for layer in self.target_layers)
 
     def inspect_target_modules(self, model: Any) -> dict[str, dict[str, int | bool]]:
-        """Verify actual FFN linears and record the (out, in) weight direction."""
+        """确认独立的 FFN 输出线性层，返回 W 为 [d_out, d_in] 的实际维度。"""
         import torch
 
         if getattr(model.config, "block_group_size", None) != 1:
@@ -111,7 +120,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         return result
 
     def snapshot_target_weights(self, model: Any) -> TargetWeightSnapshot:
-        """Keep the selected baseline W tensors for a later exact restore."""
+        """文档 10.4：复制本轮 W_b 到 CPU，并绑定原模型及参数对象。"""
         self.inspect_target_modules(model)
         modules = dict(model.named_modules())
         weights = {}
@@ -125,7 +134,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         return TargetWeightSnapshot(id(model), parameter_ids, weights)
 
     def restore_target_weights(self, model: Any, snapshot: TargetWeightSnapshot) -> None:
-        """Restore exactly the selected W tensors; never accumulate updates."""
+        """文档 10.4：将 W_b 精确复制回原参数对象，保留参数身份和精度。"""
         import torch
 
         self.inspect_target_modules(model)
@@ -149,6 +158,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
                 weight.copy_(snapshot.weights[name].to(weight.device))
 
     def forward_with_capture(self, model: Any, model_input: MaskedEditInput) -> ForwardCapture:
+        """公式（4）：读取原始 mask logits 和主体末 token 的实际 ff_out 输入。"""
         descriptions = self.inspect_target_modules(model)
         if getattr(model.config, "mask_token_id", None) != self.mask_token_id:
             raise ValueError("model and adapter mask_token_id disagree")
@@ -173,24 +183,25 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         if model_input.subject_last_position >= min(model_input.mask_positions):
             raise ValueError("subject token must precede the answer mask window")
         result = self._forward_capture(
-            model, model_input, (model_input.subject_last_position,), descriptions,
+            model, ((model_input, (model_input.subject_last_position,)),), descriptions,
             require_all_logits_finite=False,
-        )
-        # 编辑键维持原来的 d_in 向量接口；保持统计使用下方的多位置矩阵接口。
+        )[0]
+        # 公式（4）的单事实键为 [d_in]；公式（5）的保持激活保留位置维。
         return ForwardCapture(result.mask_logits, {name: value[0] for name, value in result.module_inputs.items()})
 
     def forward_keep_with_capture(
         self, model: Any, model_input: KeepModelInput, capture_positions: tuple[int, ...]
     ) -> ForwardCapture:
-        """Capture formula (5) inputs at the frozen positions in their given order."""
+        """公式（5）：按指定位置顺序捕获保持激活，返回 [位置数, d_in]。"""
         descriptions = self.inspect_target_modules(model)
         self._check_keep_capture_input(model, model_input, capture_positions)
         return self._forward_capture(
-            model, model_input, capture_positions, descriptions, require_all_logits_finite=True,
-        )
+            model, ((model_input, capture_positions),), descriptions, require_all_logits_finite=True,
+        )[0]
 
     def _check_keep_capture_input(self, model: Any, model_input: KeepModelInput,
                                   capture_positions: tuple[int, ...]) -> None:
+        """核对保持前向的输入条件及捕获位置，允许没有 mask 的保持上下文。"""
         if getattr(model.config, "mask_token_id", None) != self.mask_token_id:
             raise ValueError("model and adapter mask_token_id disagree")
         if model.training:
@@ -215,70 +226,38 @@ class LLaDA8BInstructAdapter(ModelAdapter):
     def forward_keep_batch_with_capture(
         self, model: Any, requests: tuple[tuple[KeepModelInput, tuple[int, ...]], ...]
     ) -> list[ForwardCapture]:
-        """Capture equal-length preservation inputs together without padding or changing positions."""
-        import torch
-
+        """公式（5）：等长保持输入共同前向，不 padding，保持原位置与请求顺序。"""
         if not requests:
             raise ValueError("preservation batch must be nonempty")
         if len(requests) == 1:
             model_input, positions = requests[0]
             return [self.forward_keep_with_capture(model, model_input, positions)]
         descriptions = self.inspect_target_modules(model)
-        lengths = {len(model_input.input_ids) for model_input, positions in requests}
-        if len(lengths) != 1:
+        if len({len(item.input_ids) for item, _ in requests}) != 1:
             raise ValueError("preservation batch requires equal input lengths")
         for model_input, positions in requests:
             self._check_keep_capture_input(model, model_input, positions)
-        names = self.target_module_names()
-        captured: dict[str, list[torch.Tensor]] = {}
-        call_counts = {name: 0 for name in names}
-        handles = []
+        return self._forward_capture(model, requests, descriptions, require_all_logits_finite=True)
 
-        def hook_for(name):
-            def capture(_module, inputs):
-                call_counts[name] += 1
-                values = inputs[0]
-                captured[name] = [values[index, list(positions)].detach().clone()
-                                  for index, (_, positions) in enumerate(requests)]
-            return capture
-
-        try:
-            for name in names:
-                handles.append(model.get_submodule(name).register_forward_pre_hook(hook_for(name)))
-            device = model.get_input_embeddings().weight.device
-            input_ids = torch.tensor([item.input_ids for item, _ in requests], dtype=torch.long, device=device)
-            attention = torch.tensor([item.attention_mask for item, _ in requests], dtype=torch.long, device=device)
-            with torch.no_grad():
-                logits = model(input_ids=input_ids, attention_mask=attention,
-                               use_cache=False, return_dict=True).logits
-            if logits.ndim != 3 or logits.shape[:2] != (len(requests), lengths.pop()):
-                raise ValueError("unexpected batched preservation logits shape")
-            if not torch.isfinite(logits).all() or any(call_counts[name] != 1 for name in names):
-                raise ValueError("invalid batched preservation forward")
-            results = []
-            for index, (model_input, positions) in enumerate(requests):
-                mask_logits = logits[index, list(model_input.mask_positions)].detach().clone()
-                module_inputs = {name: captured[name][index] for name in names}
-                if not torch.isfinite(mask_logits).all() or any(
-                    value.shape != (len(positions), descriptions[name]["in_features"])
-                    or not torch.isfinite(value).all() for name, value in module_inputs.items()
-                ):
-                    raise ValueError("invalid batched preservation capture")
-                results.append(ForwardCapture(mask_logits, module_inputs))
-            return results
-        finally:
-            for handle in handles:
-                handle.remove()
-
-    def _forward_capture(
-        self, model: Any, model_input: MaskedEditInput | KeepModelInput,
-        capture_positions: tuple[int, ...], descriptions: dict,
-        *, require_all_logits_finite: bool,
-    ) -> ForwardCapture:
-        """Run the shared forward and hook the actual FFN output-linear inputs."""
+    def _forward(self, model: Any, model_inputs: tuple[MaskedEditInput | KeepModelInput, ...]):
+        """同位置读取完整词表 logits；梯度模式由调用方决定，不进行因果移位。"""
         import torch
 
-        modules = dict(model.named_modules())
+        device = model.get_input_embeddings().weight.device
+        return model(
+            input_ids=torch.tensor([item.input_ids for item in model_inputs], dtype=torch.long, device=device),
+            attention_mask=torch.tensor([item.attention_mask for item in model_inputs], dtype=torch.long, device=device),
+            use_cache=False, return_dict=True,
+        ).logits
+
+    def _forward_capture(
+        self, model: Any,
+        requests: tuple[tuple[MaskedEditInput | KeepModelInput, tuple[int, ...]], ...], descriptions: dict,
+        *, require_all_logits_finite: bool,
+    ) -> list[ForwardCapture]:
+        """公式（4）（5）：单条/批量共用 pre-hook，复制实际 FFN 输入并及时移除 hook。"""
+        import torch
+
         names = self.target_module_names()
         captured: dict[str, Any] = {}
         call_counts = {name: 0 for name in names}
@@ -287,35 +266,37 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         def hook_for(name: str):
             def capture(_module, inputs):
                 call_counts[name] += 1
-                value = inputs[0]
-                captured[name] = value[0, list(capture_positions)].detach().clone()
-
+                captured[name] = [inputs[0][index, list(positions)].detach().clone()
+                                  for index, (_, positions) in enumerate(requests)]
             return capture
 
         try:
             for name in names:
-                handles.append(modules[name].register_forward_pre_hook(hook_for(name)))
-            device = model.get_input_embeddings().weight.device
-            input_ids = torch.tensor([model_input.input_ids], dtype=torch.long, device=device)
-            attention_mask = torch.tensor([model_input.attention_mask], dtype=torch.long, device=device)
+                handles.append(model.get_submodule(name).register_forward_pre_hook(hook_for(name)))
             # 同一模型后续要优化 R；no_grad 生成的 RoPE 缓存可安全用于反向传播。
             with torch.no_grad():
-                logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True).logits
-            if logits.ndim != 3 or logits.shape[1] != len(model_input.input_ids):
+                logits = self._forward(model, tuple(item for item, _ in requests))
+            if logits.ndim != 3 or logits.shape[:2] != (len(requests), len(requests[0][0].input_ids)):
                 raise ValueError("unexpected LLaDA logits shape")
             if require_all_logits_finite and not torch.isfinite(logits).all():
                 raise ValueError("nonfinite preservation logits")
-            mask_logits = logits[0, list(model_input.mask_positions)].detach().clone()
-            if not torch.isfinite(mask_logits).all():
-                raise ValueError("nonfinite mask logits")
             if any(call_counts[name] != 1 for name in names):
                 raise ValueError(f"target FFN call counts are not one: {call_counts}")
-            if any(tuple(captured[name].shape) != (len(capture_positions), descriptions[name]["in_features"])
-                   for name in names):
-                raise ValueError("captured FFN input dimension differs from linear in_features")
-            if any(not torch.isfinite(value).all() for value in captured.values()):
-                raise ValueError("nonfinite target module input")
-            return ForwardCapture(mask_logits, captured)
+            results = []
+            for index, (model_input, positions) in enumerate(requests):
+                mask_logits = logits[index, list(model_input.mask_positions)].detach().clone()
+                # 沿用原返回顺序：单条按实际调用顺序，批量按配置的目标层顺序。
+                module_inputs = {name: captured[name][index]
+                                 for name in (captured if len(requests) == 1 else names)}
+                if not torch.isfinite(mask_logits).all():
+                    raise ValueError("nonfinite mask logits")
+                if any(value.shape != (len(positions), descriptions[name]["in_features"])
+                       for name, value in module_inputs.items()):
+                    raise ValueError("captured FFN input dimension differs from linear in_features")
+                if any(not torch.isfinite(value).all() for value in module_inputs.values()):
+                    raise ValueError("nonfinite target module input")
+                results.append(ForwardCapture(mask_logits, module_inputs))
+            return results
         finally:
             for handle in handles:
                 handle.remove()
@@ -323,7 +304,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
     def forward_logits(
         self, model: Any, model_input: MaskedEditInput | KeepModelInput, positions: tuple[int, ...]
     ):
-        """P4: eval-mode forward without inference_mode, detach, or target injection."""
+        """公式（2）（10）～（12）（16）（17）：完整词表读出，保留 R 的跨层计算图。"""
         import torch
 
         length = len(model_input.input_ids)
@@ -335,12 +316,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
             type(position) is not int or not 0 <= position < length for position in positions
         ):
             raise ValueError("P4 requires all-ones attention and in-range readout positions")
-        device = model.get_input_embeddings().weight.device
-        logits = model(
-            input_ids=torch.tensor([model_input.input_ids], dtype=torch.long, device=device),
-            attention_mask=torch.tensor([model_input.attention_mask], dtype=torch.long, device=device),
-            use_cache=False, return_dict=True,
-        ).logits
+        logits = self._forward(model, (model_input,))
         if logits.ndim != 3 or logits.shape[:2] != (1, length):
             raise ValueError("unexpected P4 logits shape")
         selected = logits[0, list(positions)]
@@ -351,7 +327,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
     def sample_denoise(
         self, model: Any, model_input: MaskedEditInput, *, steps: int, temperature: float, seed: int
     ) -> DenoiseTrace:
-        """Reveal only existing answer masks, choosing the most confident positions."""
+        """公式（1）的状态来源：自主采样并按置信度揭示现有答案 mask，不接收目标答案。"""
         import torch
 
         mask_count = len(model_input.mask_positions)
@@ -375,12 +351,13 @@ class LLaDA8BInstructAdapter(ModelAdapter):
             )
             states.append(current)
             raw_logits = self.forward_with_capture(model, current).mask_logits
-            # 保存原始 mask logits 摘要，供磁盘轨迹重放时逐次前向核对。
+            # 原精度 logits 摘要留在内存，用于采样/取键重放；采样副本才转 float32。
             logit_digests.append(tensor_sha256(raw_logits))
             logits = raw_logits.float().clone()
             logits[:, [token for token in blocked_ids if 0 <= token < logits.shape[-1]]] = -torch.inf
             if not torch.isfinite(logits).any(dim=-1).all():
                 raise ValueError("no finite non-special token can be sampled")
+            # 当前采样约定（无独立公式编号）：屏蔽特殊 token 后，T>0 按 softmax(logits/T) 抽样。
             probabilities = torch.softmax(logits / temperature if temperature else logits, dim=-1)
             if not torch.isfinite(probabilities).all():
                 raise ValueError("nonfinite sampling probabilities")
@@ -393,6 +370,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
                 predicted = logits.argmax(dim=-1)
             confidence = probabilities.gather(1, predicted[:, None]).squeeze(1)
 
+            # 每步揭示 floor(M/S) 个，前 M%S 步多一个；置信度并列时按原位置排序。
             count = mask_count // steps + (step < mask_count % steps)
             ranked = sorted(range(len(remaining)), key=lambda i: (-float(confidence[i]), remaining[i]))
             selected = sorted(ranked[:count])
