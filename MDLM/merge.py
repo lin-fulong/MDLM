@@ -9,8 +9,9 @@ import math
 import torch
 
 from MDLM.optimize import CandidateModel, edit_loss, edit_loss_from_logits, keep_loss, keep_loss_from_logits
-from MDLM.states import EditTrainingExample
+from MDLM.states import EditTrainingExample, prepare_development_input
 from MDLM.writeback import stable_frobenius_norm
+from util.nethook import capture_module_outputs
 
 
 @dataclass(frozen=True)
@@ -80,19 +81,12 @@ class WeightMerge:
 
 @torch.no_grad()
 def capture_outputs(adapter, model, model_input, positions, names):
-    """记录目标层每次调用的全位置输出及指定位置 logits，退出时移除捕获 hook。"""
-    outputs, handles = {name: [] for name in names}, []
-    try:
-        for name in names:
-            handles.append(model.get_submodule(name).register_forward_hook(
-                lambda module, inputs, output, name=name: outputs[name].append(output.detach().clone())))
+    """记录因子/实际合并模型的读出；通用 hook 只负责逐次复制目标层输出。"""
+    with capture_module_outputs(model, names) as outputs:
         logits = adapter.forward_logits(model, model_input, positions).detach().clone()
         if any(not values for values in outputs.values()):
             raise RuntimeError("a P5 target module was not called")
         return logits, outputs
-    finally:
-        for handle in handles:
-            handle.remove()
 
 
 @torch.no_grad()
@@ -136,7 +130,7 @@ def development_edits(cases: list[dict], selections: tuple, adapter) -> list[Edi
     counts = Counter(item.case_id for item in selections)
     examples = []
     for item in selections:
-        model_input, target = adapter.prepare_development_input(by_id[item.case_id], item.probe_id)
+        model_input, target = prepare_development_input(adapter, by_id[item.case_id], item.probe_id)
         positions = model_input.mask_positions
         # F_dev 沿用公式（2）（3）的分级均值形式，此处用开发探针替代训练状态。
         weight = 1 / (len(counts) * counts[item.case_id] * len(positions))

@@ -1,4 +1,4 @@
-"""自主采样去噪轨迹，按公式（1）～（3）筛选兼容状态并建立固定监督。"""
+"""MDLM 输入与状态：固定保持划分，自主去噪，筛选兼容状态并建立监督。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,32 @@ from dataclasses import dataclass
 
 import torch
 
-from model.base import DenoiseTrace, EditTarget, MaskedEditInput
+from data.validation.alignment import align_edit_prompt
+from model.base import ForwardCapture, KeepModelInput, MaskedEditInput
+from util.io import config_digest
+from util.nethook import tensor_sha256
+
+
+@dataclass(frozen=True)
+class EditTarget:
+    """公式（1）～（3）的目标短答案 a_i*；仅用于筛选和监督，不传入自主采样器。"""
+
+    case_id: str
+    probe_id: str
+    token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DenoiseTrace:
+    """公式（1）的采样来源：逐步前向前输入、logits 摘要、揭示记录及终态。
+
+    前三项按采样步一一对应；终态单独保存，不作为非空 mask 监督状态。
+    """
+
+    pre_forward_inputs: tuple[MaskedEditInput, ...]
+    mask_logit_sha256: tuple[str, ...]
+    revealed_tokens: tuple[tuple[tuple[int, int], ...], ...]  # 每步的 (位置, token_id)。
+    final_input: MaskedEditInput
 
 
 @dataclass(frozen=True)
@@ -20,10 +45,35 @@ class FactSelection:
     probe_id: str
 
 
-def fact_seed(seed: int, case_id: str, probe_id: str) -> int:
-    """沿用逐事实随机流：改变处理顺序不改变采样种子。"""
-    key = f"{seed}:{case_id}:{probe_id}".encode("utf-8")
-    return int.from_bytes(hashlib.sha256(key).digest()[:8], "big") % (2**63)
+@dataclass(frozen=True)
+class FactTrajectory:
+    """一个事实的自主采样轨迹；目标答案独立存放，只用于筛选和监督。"""
+
+    case_id: str
+    probe_id: str
+    answer_positions: tuple[int, ...]
+    target_token_ids: tuple[int, ...]
+    seed: int
+    trace: DenoiseTrace
+
+    @classmethod
+    def from_sample(cls, target: EditTarget, seed: int, trace: DenoiseTrace) -> "FactTrajectory":
+        """从全 mask 初态取得答案窗口，组装事实轨迹。"""
+        if not trace.pre_forward_inputs:
+            raise ValueError(f"{target.case_id}: sampler returned no pre-forward input")
+        return cls(target.case_id, target.probe_id, trace.pre_forward_inputs[0].mask_positions,
+                   target.token_ids, seed, trace)
+
+
+@dataclass(frozen=True)
+class EditTrainingExample:
+    """一个固定兼容状态及其监督；模型输入与目标 token 分开存放。"""
+
+    case_id: str
+    model_input: MaskedEditInput
+    positions: tuple[int, ...]
+    targets: tuple[int, ...]
+    weights: tuple[float, ...]
 
 
 def input_record(model_input: MaskedEditInput) -> dict:
@@ -49,24 +99,209 @@ def input_from_record(record: dict) -> MaskedEditInput:
     )
 
 
-@dataclass(frozen=True)
-class FactTrajectory:
-    """一个事实的自主采样轨迹；目标答案独立存放，只用于筛选和监督。"""
+def keep_input_from_record(record):
+    """还原已准备的保持输入，核对从零开始的隐式位置编号。"""
+    position_ids = list(range(len(record["input_ids"])))
+    if record.get("implicit_position_ids", position_ids) != position_ids:
+        raise ValueError("保持输入的位置编号与序列长度不一致")
+    return KeepModelInput(tuple(record["input_ids"]), tuple(record["attention_mask"]), tuple(record["mask_positions"]))
 
-    case_id: str
-    probe_id: str
-    answer_positions: tuple[int, ...]
-    target_token_ids: tuple[int, ...]
-    seed: int
-    trace: DenoiseTrace
 
-    @classmethod
-    def from_sample(cls, target: EditTarget, seed: int, trace: DenoiseTrace) -> "FactTrajectory":
-        """从全 mask 初态取得答案窗口，组装事实轨迹。"""
-        if not trace.pre_forward_inputs:
-            raise ValueError(f"{target.case_id}: sampler returned no pre-forward input")
-        return cls(target.case_id, target.probe_id, trace.pre_forward_inputs[0].mask_positions,
-                   target.token_ids, seed, trace)
+def prepare_edit_input(adapter, case: dict, probe_id: str) -> tuple[MaskedEditInput, EditTarget]:
+    """公式（1）～（4）：选择编辑探针，分别构造全 mask 初态与监督答案。"""
+    probe = next(p for p in case["prompts"]["edit"] if p["probe_id"] == probe_id)
+    return _prepare_short_answer(adapter, case, probe)
+
+
+def prepare_development_input(adapter, case: dict, probe_id: str) -> tuple[MaskedEditInput, EditTarget]:
+    """公式（18）：从各探针组查找固定开发题，沿用短答案对齐。"""
+    probe = next(p for group in case["prompts"].values() for p in group if p["probe_id"] == probe_id)
+    return _prepare_short_answer(adapter, case, probe)
+
+
+def _prepare_short_answer(adapter, case: dict, probe: dict) -> tuple[MaskedEditInput, EditTarget]:
+    """按真实聊天模板定位主体；答案只决定窗口长度并单独返回为监督。"""
+    rendered = adapter.render_prompt(probe["prompt"])
+    alignment = align_edit_prompt(
+        adapter.tokenizer, rendered, case["fact_core"]["subject"], probe["answer"]
+    )
+    if adapter.mask_token_id in alignment.prompt_ids:
+        raise ValueError(f"{case['case_id']}: edit prompt already contains the model mask token")
+    begin = len(alignment.prompt_ids)
+    positions = tuple(range(begin, begin + len(alignment.answer_ids)))
+    token_ids = alignment.prompt_ids + (adapter.mask_token_id,) * len(positions)
+    return (
+        MaskedEditInput(
+            input_ids=token_ids,
+            attention_mask=(1,) * len(token_ids),
+            mask_positions=positions,
+            subject_last_position=alignment.subject_last_position,
+        ),
+        EditTarget(case["case_id"], probe["probe_id"], alignment.answer_ids),
+    )
+
+
+DEFAULT_SETTINGS = {"seed": 2026, "dev_fraction": 0.25, "test_fraction": 0.25,
+                    "statistics_scale": 1.0, "dev_edit_policy": "edit_probe"}
+
+
+def encode_keep(adapter, prompt: str, answer: str) -> tuple[dict, list[int], list[int]]:
+    """编码全 mask 短答案上下文，返回输入、KL 读出位置和 C 的激活捕获位置。"""
+    rendered = adapter.render_prompt(prompt)
+    prompt_ids = list(adapter.tokenizer.encode(rendered, add_special_tokens=False))
+    full_ids = list(adapter.tokenizer.encode(rendered + answer, add_special_tokens=False))
+    begin = len(prompt_ids)
+    answer_ids = full_ids[begin:]
+    if not prompt_ids or full_ids[:begin] != prompt_ids or not answer_ids:
+        raise ValueError("保持题无法建立稳定的短答案 mask 边界")
+    if adapter.mask_token_id in prompt_ids or set(answer_ids) & set(adapter.tokenizer.all_special_ids):
+        raise ValueError("保持题含有不允许的预置 mask 或答案特殊 token")
+    # 公式（10）（16）（17）：KL 只读答案 mask；答案内容不进入模型输入。
+    positions = list(range(begin, begin + len(answer_ids)))
+    tokens = prompt_ids + [adapter.mask_token_id] * len(answer_ids)
+    return {"input_ids": tokens, "attention_mask": [1] * len(tokens),
+            "mask_positions": positions, "implicit_position_ids": list(range(len(tokens)))}, positions, [begin - 1, *positions]
+
+
+def prepare_inputs(cases: list[dict], adapter, *, settings: dict | None = None) -> dict:
+    """从完整案例集去重并固定保持划分，按题/位置均分权重，返回内存记录。"""
+    policy = {**DEFAULT_SETTINGS, **(settings or {})}
+    if set(policy) != set(DEFAULT_SETTINGS) or policy["dev_edit_policy"] != "edit_probe":
+        raise ValueError("不支持的输入生成参数；dev_edit_policy 当前支持 edit_probe")
+    if type(policy["seed"]) is not int or policy["seed"] < 0:
+        raise ValueError("seed 必须为非负整数")
+    fractions = (policy["dev_fraction"], policy["test_fraction"])
+    if any(not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(x) or not 0 <= x < 1
+           for x in fractions) or not 0 < fractions[0] or sum(fractions) >= 1:
+        raise ValueError("保持题划分比例必须满足 dev>0、test>=0、dev+test<1")
+    scale = policy["statistics_scale"]
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("statistics_scale 必须为有限正数")
+    if not cases:
+        raise ValueError("所选数据集没有可执行的编辑案例")
+
+    # 按 strip 后的题目摘要去重，保留首次出现的原始 prompt 和 answer。
+    pool = {}
+    for case in cases:
+        for probe in case["prompts"].get("preservation", []):
+            key = config_digest({"prompt": probe["prompt"].strip()})
+            pool.setdefault(key, {"prompt": probe["prompt"], "answer": probe["answer"]})
+    ordered = sorted(pool, key=lambda key: config_digest({"seed": policy["seed"], "prompt": key}))
+    count = len(ordered)
+    if count < 2:
+        raise ValueError("自动生成保持统计和开发保持输入至少需要两道不同的 preservation 题")
+    # 摘要排序不使用全局随机状态；计数沿用截断、至少一条开发题及一条训练题的规则。
+    dev_count = min(count - 1, max(1, int(count * policy["dev_fraction"])))
+    test_count = min(count - dev_count - 1, max(1, int(count * policy["test_fraction"]))) \
+        if policy["test_fraction"] > 0 and count >= 3 else 0
+    train_begin = dev_count + test_count
+    partition = {"dev": ordered[:dev_count], "test": ordered[dev_count:train_begin],
+                 "statistics_train": ordered[train_begin:]}
+    names = adapter.target_module_names()
+    statistics, training, development = [], [], []
+    # test 仅保留划分编号；先编码训练再编码开发，C 与保持训练共用训练上下文。
+    for group, readouts in (("statistics_train", training), ("dev", development)):
+        selected = partition[group]
+        sample_count = len(selected)
+        for key in selected:
+            record, positions, captures = encode_keep(adapter, pool[key]["prompt"], pool[key]["answer"])
+            # 公式（10）（16）的 b_{h,j}=1/(题数×该题答案 mask 数)，各组总权重为 1。
+            readouts.append({"input": record, "positions": positions,
+                             "weights": [1 / (sample_count * len(positions))] * len(positions)})
+            if group == "statistics_train":
+                # 公式（5）的 ω=scale/(题数×捕获位置数)；包含提示末位置，总尺度为 scale。
+                statistics.append({"input": record, "capture_positions": captures,
+                                   "weights_by_layer": {name: [scale / (sample_count * len(captures))] * len(captures)
+                                                        for name in names}})
+    # 公式（18）的 F_dev：沿用 edit_probe，按原案例/探针顺序选择，不自动改为留出题。
+    return {"statistics": statistics, "training": training, "development": development,
+            "development_probes": [FactSelection(case["case_id"], probe["probe_id"])
+                                   for case in cases for probe in case["prompts"]["edit"]],
+            "partition": partition}
+
+
+def fact_seed(seed: int, case_id: str, probe_id: str) -> int:
+    """沿用逐事实随机流：改变处理顺序不改变采样种子。"""
+    key = f"{seed}:{case_id}:{probe_id}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(key).digest()[:8], "big") % (2**63)
+
+
+def capture_edit(model, adapter, model_input: MaskedEditInput) -> ForwardCapture:
+    """公式（4）：由算法选择主体末位置，适配器只捕获指定位置的实际输入。"""
+    if not 0 <= model_input.subject_last_position < len(model_input.input_ids):
+        raise ValueError("subject token position is out of range")
+    if not model_input.mask_positions:
+        raise ValueError("mask positions do not contain the model mask token")
+    if model_input.subject_last_position >= min(model_input.mask_positions):
+        raise ValueError("subject token must precede the answer mask window")
+    result = adapter.forward_with_capture(
+        model, ((model_input, (model_input.subject_last_position,)),),
+        require_all_logits_finite=False,
+    )[0]
+    return ForwardCapture(result.mask_logits, {name: value[0] for name, value in result.module_inputs.items()})
+
+
+def sample_denoise(
+    model, adapter, model_input: MaskedEditInput, *, steps: int, temperature: float, seed: int
+) -> DenoiseTrace:
+    """公式（1）的状态来源：自主采样并按置信度揭示现有答案 mask，不接收目标答案。"""
+    mask_count = len(model_input.mask_positions)
+    if type(steps) is not int or not 1 <= steps <= mask_count:
+        raise ValueError("denoising steps must be between 1 and the answer mask count")
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature must be finite and nonnegative")
+
+    generator = None
+    current_ids = list(model_input.input_ids)
+    remaining = list(model_input.mask_positions)
+    states: list[MaskedEditInput] = []
+    logit_digests: list[str] = []
+    reveals: list[tuple[tuple[int, int], ...]] = []
+    blocked_ids = sorted(set(adapter.tokenizer.all_special_ids) | {adapter.mask_token_id})
+
+    for step in range(steps):
+        # 公式（1）的候选状态必须是每次前向之前的独立快照。
+        current = MaskedEditInput(
+            tuple(current_ids), model_input.attention_mask, tuple(remaining), model_input.subject_last_position
+        )
+        states.append(current)
+        raw_logits = capture_edit(model, adapter, current).mask_logits
+        # 原精度 logits 摘要留在内存，用于采样/取键重放；采样副本才转 float32。
+        logit_digests.append(tensor_sha256(raw_logits))
+        logits = raw_logits.float().clone()
+        logits[:, [token for token in blocked_ids if 0 <= token < logits.shape[-1]]] = -torch.inf
+        if not torch.isfinite(logits).any(dim=-1).all():
+            raise ValueError("no finite non-special token can be sampled")
+        # 当前采样约定（无独立公式编号）：屏蔽特殊 token 后，T>0 按 softmax(logits/T) 抽样。
+        probabilities = torch.softmax(logits / temperature if temperature else logits, dim=-1)
+        if not torch.isfinite(probabilities).all():
+            raise ValueError("nonfinite sampling probabilities")
+        if temperature:
+            if generator is None:
+                generator = torch.Generator(device=logits.device)
+                generator.manual_seed(seed)
+            predicted = torch.multinomial(probabilities, 1, generator=generator).squeeze(1)
+        else:
+            predicted = logits.argmax(dim=-1)
+        confidence = probabilities.gather(1, predicted[:, None]).squeeze(1)
+
+        # 每步揭示 floor(M/S) 个，前 M%S 步多一个；置信度并列时按原位置排序。
+        count = mask_count // steps + (step < mask_count % steps)
+        ranked = sorted(range(len(remaining)), key=lambda i: (-float(confidence[i]), remaining[i]))
+        selected = sorted(ranked[:count])
+        revealed = tuple((remaining[i], int(predicted[i])) for i in selected)
+        for position, token_id in revealed:
+            current_ids[position] = token_id
+        reveals.append(revealed)
+        selected_set = set(selected)
+        remaining = [position for i, position in enumerate(remaining) if i not in selected_set]
+
+    return DenoiseTrace(
+        tuple(states),
+        tuple(logit_digests),
+        tuple(reveals),
+        MaskedEditInput(tuple(current_ids), model_input.attention_mask, (), model_input.subject_last_position),
+    )
 
 
 def collect_trajectories(model, adapter, cases: list[dict], *, seed=2026, steps=None,
@@ -85,7 +320,7 @@ def collect_trajectories(model, adapter, cases: list[dict], *, seed=2026, steps=
         if len(probes) != 1:
             raise ValueError("每个编辑事实必须且只能选择一个编辑探针")
         probe_id = probes[0]["probe_id"]
-        initial, target = adapter.prepare_edit_input(case, probe_id)
+        initial, target = prepare_edit_input(adapter, case, probe_id)
         answer_positions = initial.mask_positions
         if len(answer_positions) != len(target.token_ids) or any(
             initial.input_ids[p] != adapter.mask_token_id for p in answer_positions
@@ -93,8 +328,8 @@ def collect_trajectories(model, adapter, cases: list[dict], *, seed=2026, steps=
             raise ValueError("P0 要求完整短答案 mask 输入")
 
         # P0：同一全 mask 输入前向两次，核对目标层、logits 和捕获输入。
-        captured = adapter.forward_with_capture(model, initial)
-        repeated = adapter.forward_with_capture(model, initial)
+        captured = capture_edit(model, adapter, initial)
+        repeated = capture_edit(model, adapter, initial)
         if set(captured.module_inputs) != target_names or set(repeated.module_inputs) != target_names:
             raise ValueError("P0 捕获层与目标层不一致")
         if not torch.allclose(captured.mask_logits, repeated.mask_logits, atol=1e-2, rtol=1e-3) or any(
@@ -105,14 +340,14 @@ def collect_trajectories(model, adapter, cases: list[dict], *, seed=2026, steps=
 
         # 目标答案只附在监督侧；采样器仅接收 initial，不接收 target。
         selected_seed = fact_seed(seed, case["case_id"], probe_id)
-        trace = adapter.sample_denoise(model, initial, steps=steps or len(answer_positions),
+        trace = sample_denoise(model, adapter, initial, steps=steps or len(answer_positions),
                                        temperature=temperature, seed=selected_seed)
         trajectories.append(FactTrajectory.from_sample(target, selected_seed, trace))
 
     # 重放使用实际轨迹步数及逐事实种子，保持原抽样顺序和比较规则。
     for index in sorted(random.Random(seed).sample(range(len(trajectories)), replay_count)):
         saved = trajectories[index]
-        replay = adapter.sample_denoise(model, saved.trace.pre_forward_inputs[0],
+        replay = sample_denoise(model, adapter, saved.trace.pre_forward_inputs[0],
                                        steps=len(saved.trace.pre_forward_inputs),
                                        temperature=temperature, seed=saved.seed)
         if replay != saved.trace:
@@ -264,17 +499,6 @@ def build_supervision(trajectories: list[FactTrajectory], mask_token_id: int) ->
         "formula_checks_passed": formula_checks_passed,
         "facts": reports,
     }
-
-
-@dataclass(frozen=True)
-class EditTrainingExample:
-    """一个固定兼容状态及其监督；模型输入与目标 token 分开存放。"""
-
-    case_id: str
-    model_input: MaskedEditInput
-    positions: tuple[int, ...]
-    targets: tuple[int, ...]
-    weights: tuple[float, ...]
 
 
 def edit_training_examples(facts: list[dict]) -> list[EditTrainingExample]:

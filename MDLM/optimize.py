@@ -9,18 +9,7 @@ from torch.nn import functional as F
 
 from MDLM.states import EditTrainingExample
 from model.base import KeepModelInput, ModelAdapter
-
-
-def prepare_autograd(model: nn.Module) -> None:
-    """将推理预热产生的缓存转为普通张量，使 LLaDA 缓存可参与反向传播。"""
-    # 原位替换缓存值，保留共享缓存字典、数值、精度与设备。
-    with torch.inference_mode(False), torch.no_grad():
-        for module in model.modules():
-            for name, cache in vars(module).items():
-                if isinstance(cache, dict) and (name == "_buffers" or "cache" in name.lower()):
-                    for key, value in cache.items():
-                        if isinstance(value, torch.Tensor) and torch.is_inference(value):
-                            cache[key] = value.clone()
+from util.nethook import prepare_autograd, register_output_hooks, remove_hooks
 
 
 class ResidualBranch(nn.Module):
@@ -53,10 +42,16 @@ class CandidateModel:
         model.eval()
         for parameter, _ in self.original_flags:
             parameter.requires_grad_(False)
-        for name, branch in self.branches.items():
-            modules[name]._mdlm_candidate_owner = self
-            self.handles.append(modules[name].register_forward_hook(
-                lambda module, inputs, output, branch=branch: branch(inputs[0], output)))
+        try:
+            for name in self.branches:
+                modules[name]._mdlm_candidate_owner = self
+            self.handles = register_output_hooks(model, {
+                name: (lambda module, inputs, output, branch=branch: branch(inputs[0], output))
+                for name, branch in self.branches.items()
+            })
+        except Exception:
+            self.close()
+            raise
 
     def parameters(self) -> list[nn.Parameter]:
         """公式（10）：优化器只接收 R，Q 和基准参数保持固定。"""
@@ -77,9 +72,7 @@ class CandidateModel:
         if self.closed:
             return
         self.closed = True
-        for handle in self.handles:
-            handle.remove()
-        self.handles.clear()
+        remove_hooks(self.handles)
         for name in self.branches:
             module = self.model.get_submodule(name)
             if getattr(module, "_mdlm_candidate_owner", None) is self:

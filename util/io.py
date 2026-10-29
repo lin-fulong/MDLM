@@ -1,8 +1,13 @@
-"""读取配置、保存结果，并生成确定性数据划分所需的摘要。"""
+"""配置与结果 JSON、项目路径、运行目录名及稳定摘要。"""
 
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import uuid
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def read_json(path: Path) -> dict:
@@ -29,3 +34,18 @@ def config_digest(values: dict) -> str:
     """生成稳定排序键，固定公式（5）（10）（16）所用保持输入的划分。"""
     payload = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def project_path(value) -> Path:
+    """配置内的相对路径以项目根目录为起点。"""
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else ROOT / path).resolve()
+
+
+def choose_run_id(configured: str | None, override: str | None) -> str:
+    """按命令行、配置、自动生成的优先级选取单层输出目录名。"""
+    run_id = override or configured or (
+        "edit_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
+    if not isinstance(run_id, str) or run_id in ("", ".", "..") or "/" in run_id or "\\" in run_id:
+        raise ValueError("run_id must be one directory name")
+    return run_id

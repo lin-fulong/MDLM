@@ -63,18 +63,19 @@ python -u main.py --mode independent
 
 ## 算法代码
 
-- `model/base.py`：模型输入、监督答案、前向捕获、去噪轨迹与本轮权重快照，以及适配器接口；其中的公式编号说明数据和接口用途。
-- `model/adapters/llada_8b_instruct.py`：LLaDA 本地加载、模板对齐、单条/批量实际 FFN 输入捕获、可微完整词表读出、自主去噪与本轮权重恢复。
+- `model/base.py`：共用模型输入、前向捕获结果与适配接口；监督答案和去噪轨迹由 MDLM 管理。
+- `model/adapters/llada_8b_instruct.py`：LLaDA 本地加载、聊天模板、目标层名、指定位置的单条/等长批量捕获、可微读出与通用快照工具的调用。
 - `data/validation/alignment.py`：按实际 tokenizer 偏移定位主体 token，取得稳定边界的监督答案；为公式（1）～（4）和开发编辑提供位置与目标。
-- `model/registry.py`：模型适配器选择入口，目前保留供后续模型接入，现行 runner 直接使用 LLaDA 适配器。
-- `data/dataset.py`：读取 JSON/JSONL、展开 gold_ready 源案例，并准备固定保持划分、全 mask 上下文与题/位置权重；统计与训练共用训练分区，开发保持单独划分。
+- `model/registry.py`：runner 和最终结果重载共用的适配器工厂，默认加载 LLaDA 的本地 tokenizer。
+- `data/dataset.py`：读取 JSON/JSONL、展开 gold_ready 源案例，提供可选格式转换命令。
 - `MDLM/runner.py`：组合配置、按源案例运行独立/连续编辑，固定最初 θ₀/W₀；`edit_round` 串联单轮算法，并提供最终权重保存和重载函数。
-- `MDLM/states.py`：自主采集去噪轨迹、筛选兼容状态、构造三级监督权重，公式（1）～（3）。
+- `MDLM/states.py`：编辑/开发/保持输入与固定分区、自主去噪、兼容筛选、三级监督权重；公式（1）～（3）及后续 K/C/KL 的输入配方。
 - `MDLM/writeback.py`：提取 K、逐层累计 C，以 Cholesky 求解固定 Q，公式（4）～（9）；每层 C 求解后释放。
 - `MDLM/optimize.py`：安装全位置 R(Qk) 分支，固定 Q、联合优化多层 R，按预定检查点选择优于 J(0) 的候选，公式（10）～（12）。
 - `MDLM/merge.py`：按公共 α 从基准重建实际权重，核对因子/合并前向，按三个独立开发门槛接受或精确回退，公式（13）～（18）。
 - `util/gpu_runtime.py`：选择运行设备；resident 模式关闭 TF32，退出时恢复原设置。它不实现编号公式，只固定公式（1）～（18）的共同运行环境。
-- `util/io.py`：组合主配置引用的模型、数据集与算法参数，保存运行摘要和最终模型元数据，并为保持输入生成确定性划分摘要；摘要服务公式（5）（10）（16）的输入准备，本身不计算公式。
+- `util/nethook.py`：通用 hook、指定位置输入/逐次输出捕获、权重快照/恢复、推理缓存转换与原精度摘要；不决定算法策略。
+- `util/io.py`：配置/JSON、项目相对路径、运行目录名和确定性 JSON 摘要。
 
 `contracts.py` 已删除。数学参数放在对应算法模块的参数类中；
 不再需要阶段 manifest、文件摘要、版本合同或临时 JSON 配置来衔接计算。
@@ -84,13 +85,15 @@ Adam 预算与检查点、公共 α 的尝试顺序、KL(theta_0 || candidate) �
 C 按层累计并立即交给 Q 求解，避免同时保留所有层的大方阵。
 保持题按 keep_dev_fraction/keep_test_fraction 留出：开发保持题不参与 C 统计/保持训练，用于已有的接受门槛；额外留出题不参与训练或候选选择，预留独立检验，当前不执行评价。其余保持题用于 C 统计和可选保持训练，原比例与权重保持不变。
 
-原有数据读取和准备脚本已合并到 `data/dataset.py`，可选格式转换命令为：
+`data/dataset.py` 负责读取和源格式转换；MDLM 专用的保持划分、输入编码和位置权重在 `MDLM/states.py`。可选格式转换命令为：
 
 ```bash
 python -m data.dataset data/datasets/cases.jsonl /tmp/edit_cases.jsonl --case-id cf_00001
 ```
 
 通常直接启动 `main.py` 即可自动读取和转换，无需先生成转换文件。
+
+`MDLM/` 保留五个核心文件。算法决定捕获哪些层和位置，model 提供模型操作，util 只提供通用机制；model/data/util 均不反向依赖 MDLM。
 
 ## 最终结果
 
@@ -131,7 +134,7 @@ python main.py --editor 算法名 --config configs/对应主配置.json
 K、C、Q、R、最终权重、优化损失和验收决策，并检查连续编辑、失败回退、CUDA 与最终结果重载：
 
 ```bash
-python -m unittest tests.test_module_merge tests.test_split_config tests.test_main_cli tests.test_memory_pipeline tests.test_memory_runner tests.test_memory_preparation tests.test_memory_gpu -b -q
+python -m unittest tests.test_relocation tests.test_module_merge tests.test_split_config tests.test_main_cli tests.test_memory_pipeline tests.test_memory_runner tests.test_memory_preparation tests.test_memory_gpu -b -q
 ```
 
 原始算法推导和历史联调记录保留在 `docs/`；其中的阶段文件和旧命令描述对应当时版本。

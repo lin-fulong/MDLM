@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
-import uuid
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -12,31 +10,13 @@ from safetensors.torch import load_file, save_file
 from MDLM.merge import AcceptanceConfig, WeightMerge, development_edits, select_merged_candidate
 from MDLM.optimize import (CandidateModel, KeepTrainingExample, ResidualOptimizationConfig,
                            log_probabilities, optimize_residuals)
-from MDLM.states import build_supervision, collect_trajectories, edit_training_examples
-from MDLM.writeback import (WritebackConfig, extract_keys, keep_input_from_record,
-                            keep_matrices, solve_writeback_factor)
-from data.dataset import load_cases, prepare_inputs
-from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
+from MDLM.states import (build_supervision, collect_trajectories, edit_training_examples,
+                         keep_input_from_record, prepare_inputs)
+from MDLM.writeback import WritebackConfig, extract_keys, keep_matrices, solve_writeback_factor
+from data.dataset import load_cases
+from model.registry import get_adapter
 from util.gpu_runtime import execution_context
-from util.io import read_config, read_json, write_json
-
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def project_path(value) -> Path:
-    """配置内的相对路径以项目根目录为起点。"""
-    path = Path(value).expanduser()
-    return (path if path.is_absolute() else ROOT / path).resolve()
-
-
-def choose_run_id(configured: str | None, override: str | None) -> str:
-    """按命令行、配置、自动生成的优先级选取单层输出目录名。"""
-    run_id = override or configured or (
-        "edit_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
-    if not isinstance(run_id, str) or run_id in ("", ".", "..") or "/" in run_id or "\\" in run_id:
-        raise ValueError("run_id must be one directory name")
-    return run_id
+from util.io import choose_run_id, project_path, read_config, read_json, write_json
 
 
 def select_cases(cases, case_ids):
@@ -125,7 +105,7 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
               "selected_case_ids": case_ids, "rounds": [], "current_case_id": None}
     try:
         with execution_context(execution):
-            adapter = LLaDA8BInstructAdapter.from_local_tokenizer(model_path=model_path, target_layers=layers)
+            adapter = get_adapter(model_path=model_path, target_layers=layers)
             # 公式（6）（10）：算法提供 λ/ρ，具体模块名由模型适配器确定。
             names = adapter.target_module_names()
             q = WritebackConfig(layer_coefficients(choices["ridge"], names), device=compute_device)
@@ -251,7 +231,7 @@ def load_final_model(output_dir: str | Path, *, device_map: str | None = None):
     """加载原始模型，再覆盖已保存的最终目标权重；仍需 model.json 指向的原模型。"""
     output = Path(output_dir)
     metadata = read_json(output / "model.json")
-    adapter = LLaDA8BInstructAdapter.from_local_tokenizer(
+    adapter = get_adapter(
         model_path=metadata["model_path"], target_layers=tuple(metadata["target_layers"]))
     model = adapter.load_model(metadata["model_path"], torch_dtype=metadata["torch_dtype"],
                                device_map=device_map or metadata["device_map"])

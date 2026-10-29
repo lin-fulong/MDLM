@@ -4,7 +4,8 @@ from dataclasses import dataclass
 
 import torch
 
-from model.base import KeepModelInput, tensor_sha256
+from MDLM.states import capture_edit, keep_input_from_record
+from util.nethook import tensor_sha256
 
 
 @dataclass(frozen=True)
@@ -29,8 +30,8 @@ def extract_keys(model, adapter, trajectories, *, storage_dtype="float32",
     for trajectory in trajectories:
         # 每事实只取全 mask 初态；适配器捕获主体末 token 处 FFN 输出线性层的输入。
         initial = trajectory.trace.pre_forward_inputs[0]
-        captured = adapter.forward_with_capture(model, initial)
-        repeated = adapter.forward_with_capture(model, initial)
+        captured = capture_edit(model, adapter, initial)
+        repeated = capture_edit(model, adapter, initial)
 
         # 两次前向都须与 P1 初态的原始精度 logits 摘要一致。
         initial_digest = trajectory.trace.mask_logit_sha256[0]
@@ -95,26 +96,16 @@ def equal_length_groups(records, *, enabled=False):
         start = end
 
 
-def keep_input_from_record(record):
-    """还原已准备的保持输入，核对从零开始的隐式位置编号。"""
-    position_ids = list(range(len(record["input_ids"])))
-    if record.get("implicit_position_ids", position_ids) != position_ids:
-        raise ValueError("保持输入的位置编号与序列长度不一致")
-    return KeepModelInput(tuple(record["input_ids"]), tuple(record["attention_mask"]), tuple(record["mask_positions"]))
-
-
 def keep_matrices(model, adapter, rows, *, accumulation_dtype="float64", storage_dtype="float32",
                   device="cpu", batch_keep=False):
     """公式（5）：每层返回 (模块名, C)，每批保持输入只前向一次。"""
     records = [(row, keep_input_from_record(row["input"]), tuple(row["capture_positions"])) for row in rows]
-    for layer in adapter.target_layers:
-        name = f"model.transformer.blocks.{layer}.ff_out"
-        layer_adapter = type(adapter)(adapter.tokenizer, mask_token_id=adapter.mask_token_id, target_layers=(layer,))
+    for name in adapter.target_module_names():
         accumulator = SecondMomentAccumulator(
             model.get_submodule(name).in_features, accumulation_dtype=accumulation_dtype, device=device)
         for group in equal_length_groups(records, enabled=batch_keep):
             requests = tuple((model_input, positions) for _, model_input, positions in group)
-            captures = layer_adapter.forward_keep_batch_with_capture(model, requests)
+            captures = adapter.forward_with_capture(model, requests, module_names=(name,))
             activations = torch.cat([captured.module_inputs[name] for captured in captures])
             weights = [weight for row, _, _ in group for weight in row["weights_by_layer"][name]]
             accumulator.add(activations, weights)
