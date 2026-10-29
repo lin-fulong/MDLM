@@ -9,8 +9,8 @@
   "rho": 0.001,
   "beta": 0.0,
   "learning_rate": 0.01,
-  "max_steps": 20,
-  "checkpoints": [1, 5, 10, 20],
+  "optimization_steps": 20,
+  "selection_steps": [1, 5, 10, 20],
   "microbatch_size": 1,
 
   "alphas": [1.0, 0.5, 0.25],

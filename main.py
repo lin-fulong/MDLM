@@ -26,8 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=Path, help="覆盖配置中的原始模型目录")
     parser.add_argument("--device", help="计算设备，如 cuda:0 或 cpu")
     parser.add_argument("--case-id", action="append", help="选择源案例或事实，可重复指定")
+    parser.add_argument("--max-cases", type=int, help="最多编辑的源案例数，覆盖主配置")
     parser.add_argument("--run-id", help="本次实验的输出目录名")
-    parser.add_argument("--sequential", action="store_true", help="将已接受的编辑作为下一轮基准")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--mode", dest="edit_mode", choices=("independent", "sequential"), help="覆盖主配置的编辑模式")
+    modes.add_argument("--sequential", action="store_true", help="将已接受的编辑作为下一轮基准")
     parser.add_argument("mode", nargs="?", choices=("sequential",),
                         help="兼容原有连续编辑命令；默认每轮从原始模型开始")
     return parser
@@ -38,6 +41,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if not args.config.is_file():
         parser.error(f"配置文件不存在：{args.config}；请通过 --config 指定主配置")
+    if args.mode and args.edit_mode == "independent":
+        parser.error("sequential 与 --mode independent 不能同时使用")
 
     editor = args.editor or read_json(args.config).get("editor", "mdlm").lower()
     if editor not in EDITORS:
@@ -45,12 +50,14 @@ def main(argv: list[str] | None = None) -> None:
     run = import_module(EDITORS[editor]).run_dataset
     result = run(
         args.config,
-        sequential=bool(args.mode or args.sequential),
+        sequential=True if args.mode or args.sequential else (
+            args.edit_mode == "sequential" if args.edit_mode is not None else None),
         run_id_override=args.run_id,
         dataset_override=args.dataset,
         model_override=args.model_path,
         device_override=args.device,
         case_ids=args.case_id,
+        max_cases_override=args.max_cases,
     )
     summary = {key: result.get(key) for key in (
         "status", "mode", "fact_count", "accepted_count", "rejected_count", "final_checkpoint_dir")}

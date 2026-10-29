@@ -1,8 +1,10 @@
-"""公式（6）～（9）：由 K、C 和 λ 预先求固定写回因子 Q，供后续 ΔW = RQ 使用。"""
+"""公式（4）～（9）：提取参考键 K，逐层累计保持矩阵 C，并求固定写回因子 Q。"""
 
 from dataclasses import dataclass
 
 import torch
+
+from model.base import KeepModelInput, tensor_sha256
 
 
 @dataclass(frozen=True)
@@ -13,6 +15,112 @@ class WritebackConfig:
     compute_dtype: str = "float64"
     storage_dtype: str = "float32"
     device: str = "cpu"
+
+
+def extract_keys(model, adapter, trajectories, *, storage_dtype="float32",
+                 replay_atol=1e-2, replay_rtol=1e-3) -> dict:
+    """公式（4）：K_ell = [k_1,ell, ..., k_N,ell]，形状为 [输入维度, 事实数]。"""
+    if storage_dtype not in ("float32", "float64"):
+        raise ValueError("K 精度必须为 float32 或 float64")
+    descriptions = adapter.inspect_target_modules(model)
+    target_names = set(descriptions)
+    dtype = getattr(torch, storage_dtype)
+    columns = {name: [] for name in descriptions}
+    for trajectory in trajectories:
+        # 每事实只取全 mask 初态；适配器捕获主体末 token 处 FFN 输出线性层的输入。
+        initial = trajectory.trace.pre_forward_inputs[0]
+        captured = adapter.forward_with_capture(model, initial)
+        repeated = adapter.forward_with_capture(model, initial)
+
+        # 两次前向都须与 P1 初态的原始精度 logits 摘要一致。
+        initial_digest = trajectory.trace.mask_logit_sha256[0]
+        if any(tensor_sha256(value.mask_logits) != initial_digest
+               for value in (captured, repeated)):
+            raise ValueError("K 初态 logits 与 P1 基准不一致")
+        if set(captured.module_inputs) != target_names or set(repeated.module_inputs) != target_names:
+            raise ValueError("K 捕获层与目标层不一致")
+        for name, info in descriptions.items():
+            key, replay = captured.module_inputs[name], repeated.module_inputs[name]
+            if key.shape != (info["in_features"],) or not torch.isfinite(key).all() or not torch.allclose(
+                key, replay, atol=replay_atol, rtol=replay_rtol
+            ):
+                raise ValueError(f"K 的形状、有限性或重放检查失败：{name}")
+            stored = key.detach().to(device="cpu", dtype=dtype)
+            if not torch.allclose(key.double().cpu(), stored.double(), atol=replay_atol, rtol=replay_rtol):
+                raise ValueError("K 的配置精度超出原有重放容差")
+            columns[name].append(stored)
+    # 沿第 1 维堆叠，保持与 trajectories 完全相同的事实列序，不作状态平均或归一化。
+    return {name: torch.stack(values, dim=1).contiguous() for name, values in columns.items()}
+
+
+class SecondMomentAccumulator:
+    """逐批累计一层的 C，不保存激活或生成诊断报告。"""
+
+    def __init__(self, width: int, *, accumulation_dtype: str = "float64", device: str = "cpu"):
+        self.matrix = torch.zeros((width, width), dtype=getattr(torch, accumulation_dtype), device=device)
+
+    @torch.no_grad()
+    def add(self, activations: torch.Tensor, weights: list[float]) -> None:
+        """activations 每行是 u_mᵀ；weights 是对应的非负统计权重。"""
+        values = activations.detach().to(device=self.matrix.device, dtype=torch.float64)
+        weights = torch.as_tensor(weights, dtype=torch.float64, device=self.matrix.device)
+        positive = weights > 0
+
+        # 公式（5）：v_m = sqrt(ω_m)u_m，C += VᵀV；不去均值、不归一化。
+        weighted = (values[positive] * weights[positive].sqrt()[:, None]).to(self.matrix.dtype)
+        self.matrix.addmm_(weighted.T, weighted)
+
+        # 沿用原有分块计算：上三角复制到下三角，消除 BLAS 归约产生的非对称舍入。
+        if len(weighted):
+            width = self.matrix.shape[0]
+            for start in range(0, width, 256):
+                end = min(width, start + 256)
+                if start:
+                    self.matrix[start:end, :start].copy_(self.matrix[:start, start:end].T)
+                block = self.matrix[start:end, start:end]
+                lower = torch.tril_indices(end - start, end - start, offset=-1, device=self.matrix.device)
+                block[lower[0], lower[1]] = block[lower[1], lower[0]]
+
+
+def equal_length_groups(records, *, enabled=False):
+    """按原顺序对连续等长输入分批：至多 4 条、256 token 预算，超长单条保留。"""
+    start = 0
+    while start < len(records):
+        length = len(records[start][1].input_ids)
+        limit = min(4, max(1, 256 // max(length, 1))) if enabled else 1
+        end = start + 1
+        while end < len(records) and end - start < limit and len(records[end][1].input_ids) == length:
+            end += 1
+        yield records[start:end]
+        start = end
+
+
+def keep_input_from_record(record):
+    """还原已准备的保持输入，核对从零开始的隐式位置编号。"""
+    position_ids = list(range(len(record["input_ids"])))
+    if record.get("implicit_position_ids", position_ids) != position_ids:
+        raise ValueError("保持输入的位置编号与序列长度不一致")
+    return KeepModelInput(tuple(record["input_ids"]), tuple(record["attention_mask"]), tuple(record["mask_positions"]))
+
+
+def keep_matrices(model, adapter, rows, *, accumulation_dtype="float64", storage_dtype="float32",
+                  device="cpu", batch_keep=False):
+    """公式（5）：每层返回 (模块名, C)，每批保持输入只前向一次。"""
+    records = [(row, keep_input_from_record(row["input"]), tuple(row["capture_positions"])) for row in rows]
+    for layer in adapter.target_layers:
+        name = f"model.transformer.blocks.{layer}.ff_out"
+        layer_adapter = type(adapter)(adapter.tokenizer, mask_token_id=adapter.mask_token_id, target_layers=(layer,))
+        accumulator = SecondMomentAccumulator(
+            model.get_submodule(name).in_features, accumulation_dtype=accumulation_dtype, device=device)
+        for group in equal_length_groups(records, enabled=batch_keep):
+            requests = tuple((model_input, positions) for _, model_input, positions in group)
+            captures = layer_adapter.forward_keep_batch_with_capture(model, requests)
+            activations = torch.cat([captured.module_inputs[name] for captured in captures])
+            weights = [weight for row, _, _ in group for weight in row["weights_by_layer"][name]]
+            accumulator.add(activations, weights)
+        matrix = accumulator.matrix.to(dtype=getattr(torch, storage_dtype))
+        yield name, matrix
+        del accumulator, matrix
 
 
 def stable_frobenius_norm(value: torch.Tensor) -> torch.Tensor:

@@ -1,11 +1,6 @@
 {
-  "dataset": "data/datasets/cases.jsonl",
-  "input_preparation": {
-    "settings": {
-      "dev_fraction": 0.25,
-      "test_fraction": 0.25,
-      "statistics_scale": 1.0,
-      "dev_edit_policy": "edit_probe"
-    }
-  }
+  "dataset_path": "data/datasets/cases.jsonl",
+  "keep_dev_fraction": 0.25,
+  "keep_test_fraction": 0.25,
+  "statistics_scale": 1.0
 }
