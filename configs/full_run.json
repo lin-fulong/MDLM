@@ -3,27 +3,57 @@
   "model_path": "model/models/LLaDA-8B-Instruct",
   "output_root": "runs",
   "target_layers": [0],
-  "execution": {"backend": "resident", "device": "cuda:0"},
-  "input_preparation": {
-    "settings": {"seed": 2026, "dev_fraction": 0.25, "test_fraction": 0.25,
-                 "statistics_scale": 1.0, "dev_edit_policy": "edit_probe"}
+
+  "execution": {
+    "backend": "resident",
+    "device": "cuda:0"
   },
-  "p1": {"seed": 2026, "steps": null, "temperature": 0.0, "replay_count": 1},
-  "p2_keys": {"storage_dtype": "float32", "replay_atol": 0.01, "replay_rtol": 0.001},
+  "input_preparation": {
+    "settings": {
+      "seed": 2026,
+      "dev_fraction": 0.25,
+      "test_fraction": 0.25,
+      "statistics_scale": 1.0,
+      "dev_edit_policy": "edit_probe"
+    }
+  },
+
+  "p1": {
+    "seed": 2026,
+    "steps": null,
+    "temperature": 0.0,
+    "replay_count": 1
+  },
+  "p2_keys": {
+    "replay_atol": 0.01,
+    "replay_rtol": 0.001
+  },
   "p2_keep": {},
-  "p3": {"ridge_by_layer": {"model.transformer.blocks.0.ff_out": 0.01}},
+
+  "p3": {
+    "ridge_by_layer": {
+      "model.transformer.blocks.0.ff_out": 0.01
+    }
+  },
   "p4": {
-    "rho_by_layer": {"model.transformer.blocks.0.ff_out": 0.001},
+    "rho_by_layer": {
+      "model.transformer.blocks.0.ff_out": 0.001
+    },
     "beta": 0.0,
     "learning_rate": 0.01,
     "max_steps": 20,
     "checkpoints": [1, 5, 10, 20],
-    "microbatch_size": 1
+    "microbatch_size": 1,
+    "seed": 2026
   },
   "p5": {
     "alphas": [1.0, 0.5, 0.25],
     "delta": 0.001,
     "tau_g": 0.05,
-    "tau_u": 0.05
+    "tau_u": 0.05,
+    "epsilon": 1e-12,
+    "equivalence_atol": 0.125,
+    "equivalence_rtol": 0.02,
+    "chunk_size": 256
   }
 }

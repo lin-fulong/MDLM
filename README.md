@@ -21,7 +21,7 @@ python -m pip check
 
 ## 启动
 
-按 `configs/full_run.template.json` 填写 `configs/full_run.json`，冻结目标层和算法超参数后运行：
+`configs/` 仅保留 `full_run.json`。直接修改其中的数据集、模型、目标层和算法超参数，逐项含义见[配置参数说明](docs/配置参数说明.md)，然后运行：
 
 ```bash
 python -u main.py --editor mdlm --config configs/full_run.json

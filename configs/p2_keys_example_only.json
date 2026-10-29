@@ -1,5 +1,0 @@
-{
-  "storage_dtype": "float32",
-  "replay_atol": 0.01,
-  "replay_rtol": 0.001
-}
