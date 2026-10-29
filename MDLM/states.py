@@ -163,8 +163,9 @@ def encode_keep(adapter, prompt: str, answer: str) -> tuple[dict, list[int], lis
             "mask_positions": positions, "implicit_position_ids": list(range(len(tokens)))}, positions, [begin - 1, *positions]
 
 
-def prepare_inputs(cases: list[dict], adapter, *, settings: dict | None = None) -> dict:
-    """从完整案例集去重并固定保持划分，按题/位置均分权重，返回内存记录。"""
+def prepare_inputs(cases: list[dict], adapter, *, settings: dict | None = None,
+                   keep_pool: list[dict] | None = None) -> dict:
+    """从显式保持池或完整案例集准备输入；沿用原去重、划分和位置权重。"""
     policy = {**DEFAULT_SETTINGS, **(settings or {})}
     if set(policy) != set(DEFAULT_SETTINGS) or policy["dev_edit_policy"] != "edit_probe":
         raise ValueError("不支持的输入生成参数；dev_edit_policy 当前支持 edit_probe")
@@ -182,10 +183,11 @@ def prepare_inputs(cases: list[dict], adapter, *, settings: dict | None = None) 
 
     # 按 strip 后的题目摘要去重，保留首次出现的原始 prompt 和 answer。
     pool = {}
-    for case in cases:
-        for probe in case["prompts"].get("preservation", []):
-            key = config_digest({"prompt": probe["prompt"].strip()})
-            pool.setdefault(key, {"prompt": probe["prompt"], "answer": probe["answer"]})
+    probes = keep_pool if keep_pool is not None else (
+        probe for case in cases for probe in case["prompts"].get("preservation", []))
+    for probe in probes:
+        key = config_digest({"prompt": probe["prompt"].strip()})
+        pool.setdefault(key, {"prompt": probe["prompt"], "answer": probe["answer"]})
     ordered = sorted(pool, key=lambda key: config_digest({"seed": policy["seed"], "prompt": key}))
     count = len(ordered)
     if count < 2:

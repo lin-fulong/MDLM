@@ -1,0 +1,10 @@
+{
+  "dataset_reader": "wikibigedit",
+  "dataset_path": "UltraEdit/data/raw/wikibigedit/wikibigedit_eval_17k.json",
+  "keep_path": "UltraEdit/data/raw/wikibigedit/wikibigedit_train_17k.json",
+  "source_limit": 17000,
+  "keep_limit": 512,
+  "keep_dev_fraction": 0.25,
+  "keep_test_fraction": 0.25,
+  "statistics_scale": 1.0
+}

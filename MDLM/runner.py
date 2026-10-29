@@ -13,7 +13,8 @@ from MDLM.optimize import (CandidateModel, KeepTrainingExample, ResidualOptimiza
 from MDLM.states import (build_supervision, collect_trajectories, edit_training_examples,
                          keep_input_from_record, prepare_inputs)
 from MDLM.writeback import WritebackConfig, extract_keys, keep_matrices, solve_writeback_factor
-from data.dataset import load_cases
+from data.dataset import load_dataset
+from data.readers.base import validate_edit_subjects
 from model.registry import get_adapter
 from util.gpu_runtime import execution_context
 from util.io import choose_run_id, project_path, read_config, read_json, write_json
@@ -62,7 +63,8 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
     dataset = dataset_override.resolve() if dataset_override is not None else project_path(choices["dataset_path"])
     model_path = model_override.resolve() if model_override is not None else project_path(choices["model_path"])
     layers = tuple(choices["target_layers"])
-    cases = load_cases(dataset)
+    dataset_bundle = load_dataset(choices, dataset_path_override=dataset)
+    cases = dataset_bundle.cases
     # 同一源案例的事实联合编辑；分组顺序沿用数据集，不按编号排序。
     selected = select_cases(cases, case_ids)
     groups = {}
@@ -71,6 +73,8 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
     # 先选例、再按源案例限量；不拆散同源事实，也不截断保持输入的数据源。
     if max_cases is not None:
         groups = dict(list(groups.items())[:max_cases])
+    if dataset_bundle.metadata["reader"] != "native":
+        validate_edit_subjects(case for group in groups.values() for case in group)
 
     execution = dict(choices.get("execution", {}))
     if device_override is not None:
@@ -102,6 +106,7 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
               "mode": mode, "max_cases": max_cases,
               "fact_count": sum(len(group) for group in groups.values()), "case_count": len(groups),
               "source_dataset": str(dataset), "original_model": str(model_path),
+              "dataset_reading": dataset_bundle.metadata,
               "selected_case_ids": case_ids, "rounds": [], "current_case_id": None}
     try:
         with execution_context(execution):
@@ -111,8 +116,9 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
             q = WritebackConfig(layer_coefficients(choices["ridge"], names), device=compute_device)
             optimization = ResidualOptimizationConfig(
                 layer_coefficients(choices["rho"], names), seed=seed, **optimization_values)
-            # 用完整 cases 划分保持输入，不让 case_ids/max_cases 改变训练/开发集合。
-            prepared = prepare_inputs(cases, adapter, settings=input_settings)
+            # 保持池来自显式 keep_path 或完整 cases，不随 case_ids/max_cases 改变。
+            prepared = prepare_inputs(cases, adapter, settings=input_settings,
+                                      keep_pool=dataset_bundle.keep_pool)
             model = adapter.load_model(model_path, torch_dtype=dtype, device_map=device)
             # 公式（10）（16）（17）：W_0 与 p_theta_0 在首次编辑前固定，之后不刷新。
             originals = {name: model.get_submodule(name).weight.detach().cpu().clone()

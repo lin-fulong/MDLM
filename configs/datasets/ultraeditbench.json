@@ -1,0 +1,10 @@
+{
+  "dataset_reader": "ultraeditbench",
+  "dataset_path": "UltraEdit/data/raw/ultraeditbench/UltraEditBench_2M.json",
+  "keep_path": "UltraEdit/data/raw/ultraeditbench/UltraEditBench_train_20k.json",
+  "source_limit": 20000,
+  "keep_limit": 512,
+  "keep_dev_fraction": 0.25,
+  "keep_test_fraction": 0.25,
+  "statistics_scale": 1.0
+}

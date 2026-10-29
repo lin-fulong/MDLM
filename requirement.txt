@@ -19,6 +19,9 @@ safetensors==0.4.5
 # Transformers 的间接依赖，用于权重分片加载进度显示。
 tqdm==4.67.1
 
+# 外部数据集 JSON 数组的流式读取；原生读取接口继续使用标准库。
+ijson==3.3.0
+
 # 矩阵求解使用 torch.linalg，无需 SciPy；测试使用标准库 unittest，无需 pytest。
 # 其他三个模型尚未适配，P6 裁判尚未实现，相关可选依赖待实际接入时确定。
 
