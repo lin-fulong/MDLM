@@ -30,6 +30,7 @@ tests/
 
 # Experiment runs and generated intermediate data
 runs/*
+evaluations/*
 
 # Logs and temporary files
 *.log

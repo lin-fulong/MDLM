@@ -122,6 +122,44 @@ from MDLM.runner import load_final_model
 adapter, model = load_final_model("runs/<run_id>/final_model", device_map="cuda:0")
 ```
 
+## 独立 UltraEdit 评估
+
+完成编辑后，在 WSL 的 `mdlm` 环境中执行（将目录名替换为实际运行目录）：
+
+```bash
+python -u evaluate.py --run-dir "runs/<run_id>" --config configs/evaluation/ultraedit.json
+```
+
+这是独立评估入口，读取已经完成的编辑报告和最终目标层权重。`evaluation/` 不调用编辑、取键、残差优化或合并验收；现有 MDLM 算法文件、模型适配器和数据读取器保持原实现。评估使用独立模型实例，串行切换案例时先恢复原始权重。原始 JSON/JSONL 和编辑产物只读，输出放在 `evaluations/<eval_id>/`。
+
+当前仅实现 `ultraedit` 框架及 `diffusion_short_v1` 协议。对应指标为 edit→ES、generalization→GS、preservation→LS、persona→person_score、portability→mhop_score。它们均为逐题答案 token 正确比例；LS 相对于无关题标准答案计算。另记录整段 token 完全匹配率和编辑前后输出一致率。
+
+推理输入采用模型原聊天模板和全 mask 答案窗口，参考答案仅决定窗口长度并独立用于评分，不输入答案前缀。每步预测剩余位置，按预测置信度揭示 token，并列时按位置排序。`generation.steps: null` 表示每步揭示一个 token；指定正整数时实际步数取 min(steps, 答案 token 数)，各步均分揭示数量，余数优先分配给前几步。`temperature: 0.0` 为贪心预测，正数使用任务专属随机流；特殊 token 全部屏蔽。基线与编辑后使用同一任务派生种子。该协议是有目标长度条件的扩散短答案诊断，不能将其数值视为原 UltraEdit 自回归 teacher forcing 的直接复现，也不用于长答案自由生成。
+
+`summary.json` 同时提供 `case_macro`（先源案例内平均，再跨案例平均，主口径）和 `probe_macro`（逐题平均，对应原 UltraEdit 的汇总口径）。分组包括 all、accepted、rejected；缺少 persona/mhop 等题目时标为 not_applicable，分数为 null。独立拒绝案例的最终状态为原始模型，计入全部案例并复用基线预测；连续编辑统一使用 final_model 回测所有已尝试事实，包括当轮拒绝的事实。当前没有逐轮快照，因此不提供连续编辑逐轮曲线。
+
+评估参数与编辑参数完全独立：
+
+| 参数 | 含义 |
+| --- | --- |
+| `framework` / `protocol` | 当前分别为 ultraedit / diffusion_short_v1 |
+| `run_dir` | 已完成编辑目录，可由 --run-dir 覆盖；命令行路径相对当前目录，配置资源路径相对项目根 |
+| `groups` | 选择要评估的问题组，默认全部五组 |
+| `device` | cpu、cuda 或 cuda:N，可由 --device 覆盖 |
+| `seed`（可选） | 默认继承编辑报告的种子，可显式覆盖评估生成种子；源数据改写选择始终使用原读取种子 |
+| `generation.steps` / `generation.temperature` | 评估专用去噪步数和温度 |
+| `output_root` / `eval_id` | 独立输出位置；--eval-id 可指定尚未存在的目录名 |
+
+数据读取器、目标答案字段、读取范围和原读取种子从 run_report 恢复；只评估报告 rounds 中实际尝试的事实。源数据主体标注不参与预测，因此评估不要求提供 FEVER 的主体文件。--dataset 仅用于同一文件迁移后的路径覆盖，不改变读取器或文件名构成的案例 ID；--model-path 用于原模型路径迁移。保存目录可以整体移动，评估从当前 run-dir 下的 case_N/final_model 读取产物。
+
+若独立运行全部被拒绝，原流程不保存 model.json；此时需要在评估配置中显式提供本次编辑原有的 target_layers 和 torch_dtype。也可通过 model_config 引用原模型配置（相对评估配置目录），并补充 torch_dtype。例如原编辑确实采用第 0 层和自动加载精度时，填写 `"target_layers": [0], "torch_dtype": "auto"`。存在已保存模型时，以产物 metadata 的层与精度为准。
+
+每次运行生成 manifest.json、predictions.jsonl、summary.json。manifest 记录源数据/目标权重/评估代码摘要、任务摘要、配置及环境；predictions 保存逐题基线和配对预测、参考标签与分数；summary 保存覆盖率及错误信息。失败即停止并标为 failed，部分指标不可当作完整结果；不静默略过运行错误，不覆盖已有评估目录。无效产物在加载模型前报错。
+
+现有编辑产物没有源数据和原模型权重的编辑时摘要，因此 manifest 会明确注明这两项历史身份未验证，当前摘要只证明评估时版本。当前 LS 属于 benchmark preservation，未验证与编辑保持池独立，不应称为独立保持测试集。原始模型路径迁移必须指向同一份基础权重。
+
+以后可继承 `evaluation.types.EvaluationFramework`，实现 build_tasks、score，按需覆盖 aggregate，并在 `evaluation.registry.FRAMEWORKS` 登记。当前已实现的推理协议仅服务短答案；长答案任务和新的推理后端需要另行接入，不能通过修改协议名称就启用。
+
 ## 增加其他编辑算法
 
 在新模块中实现 `run_dataset(config_file, **options)`，并在 `main.py` 的
@@ -129,15 +167,6 @@ adapter, model = load_final_model("runs/<run_id>/final_model", device_map="cuda:
 
 ```bash
 python main.py --editor 算法名 --config configs/对应主配置.json
-```
-
-## 本地验证
-
-`tests/` 仅在本地保留。新的回归测试用重构前保存的小模型基准，逐元素比较
-K、C、Q、R、最终权重、优化损失和验收决策，并检查连续编辑、失败回退、CUDA 与最终结果重载：
-
-```bash
-python -m unittest tests.test_dataset_readers tests.test_relocation tests.test_module_merge tests.test_split_config tests.test_main_cli tests.test_memory_pipeline tests.test_memory_runner tests.test_memory_preparation tests.test_memory_gpu -b -q
 ```
 
 原始算法推导和历史联调记录保留在 `docs/`；其中的阶段文件和旧命令描述对应当时版本。
