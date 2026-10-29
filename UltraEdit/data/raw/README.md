@@ -1,1 +1,0 @@
-This folder is used to store all datasets required for running UltraEdit.

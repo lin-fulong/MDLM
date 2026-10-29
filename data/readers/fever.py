@@ -1,4 +1,4 @@
-"""适配 UltraEdit/data/fever.py；主体标注和改写选择显式、可复现。"""
+"""读取 FEVER 字段；主体标注和改写选择显式、可复现。"""
 
 import hashlib
 import json
@@ -45,6 +45,7 @@ class FEVERReader(BaseReader):
             raise ValueError("equiv_prompt 必须是非空字符串列表")
         indices = range(len(variants))
         if self.policy == "single_fixed":
+            # 案例独立选题；读取顺序和全局随机状态不影响选中的改写。
             digest = hashlib.sha256(f"{self.seed}:{case_id}:rephrase".encode("utf-8")).digest()
             indices = [int.from_bytes(digest[:8], "big") % len(variants)]
         case["prompts"]["generalization"] = [

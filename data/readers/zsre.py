@@ -1,11 +1,12 @@
-"""适配 UltraEdit/data/zsre.py 的字段映射，返回文本案例。"""
+"""读取 ZSRE 字段并转换为统一文本案例。"""
 
-from .base import BaseReader, probe, required_text
+from .base import BaseReader, required_text
 
 
 class ZSREReader(BaseReader):
     name = "zsre"
     allowed_options = frozenset({"target_field"})
+    question_fields = {"generalization": "rephrase"}
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -21,8 +22,6 @@ class ZSREReader(BaseReader):
         answer = required_text(row, self.target_field)
         case = self.make_case(path, index, row, required_text(row, "src"), answer,
                               subject=required_text(row, "subject"))
-        case["prompts"]["generalization"] = [probe(
-            case["case_id"], "generalization", required_text(row, "rephrase"), answer)]
         case["metadata"].update(target_field=self.target_field, original_ans=row.get("ans"),
                                 original_alt=row.get("alt"))
         return case

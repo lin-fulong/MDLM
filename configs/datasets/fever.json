@@ -1,7 +1,7 @@
 {
   "dataset_reader": "fever",
-  "dataset_path": "UltraEdit/data/raw/fever/fever_eval_20k.json",
-  "keep_path": "UltraEdit/data/raw/fever/fever_train.json",
+  "dataset_path": "data/datasets/ultraedit/fever/fever_eval_20k.json",
+  "keep_path": "data/datasets/ultraedit/fever/fever_train.json",
   "source_limit": 20000,
   "keep_limit": 512,
   "reader_options": {"rephrase_policy": "single_fixed", "subject_path": null},

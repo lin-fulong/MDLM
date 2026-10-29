@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from itertools import islice
 import json
 from pathlib import Path
@@ -72,6 +73,8 @@ class BaseReader:
     name = ""
     allowed_options = frozenset()
     keep_fields = ("loc", "loc_ans")
+    # 各数据集只声明固定字段映射；这些附加问题不进入 edit 监督。
+    question_fields = {}
 
     def __init__(self, *, options=None, seed=2026):
         if options is not None and not isinstance(options, dict):
@@ -99,6 +102,8 @@ class BaseReader:
             "edit", "generalization", "preservation", "persona", "portability", "free_form_qa")}
         prompts["edit"] = [probe(case_id, "edit", prompt, answer)]
         prompts["preservation"] = [probe(case_id, "preservation", *self.keep_pair(row))]
+        for role, field in self.question_fields.items():
+            prompts[role] = [probe(case_id, role, required_text(row, field), answer)]
         return {"case_id": case_id, "source_case_id": case_id, "dataset_group": self.name,
                 "fact_core": {"subject": subject, "relation": row.get("relation"),
                               "old_object": old_object, "new_object": answer},
@@ -112,8 +117,8 @@ class BaseReader:
 
     def iter_cases(self, path, *, limit=None):
         seen = set()
-        records = iter_records(path, limit=limit)
-        try:
+        # 读取结束或生成器关闭时释放源文件，包括异常路径。
+        with closing(iter_records(path, limit=limit)) as records:
             for index, row in records:
                 try:
                     case = self.convert(path, index, row)
@@ -124,20 +129,15 @@ class BaseReader:
                 except (ValueError, KeyError, TypeError) as exc:
                     raise ValueError(f"{self.name}: {path}, source_index={index}: {exc}") from exc
                 yield case
-        finally:
-            records.close()
 
     def iter_keep_probes(self, path, *, limit=None):
         """只读取无关问题，不要求编辑主体、改写或多跳字段存在。"""
-        records = iter_records(path, limit=limit)
-        try:
+        with closing(iter_records(path, limit=limit)) as records:
             for index, row in records:
                 try:
                     yield probe(self.identity(path, index, row), "preservation", *self.keep_pair(row))
                 except (ValueError, KeyError, TypeError) as exc:
                     raise ValueError(f"{self.name}: {path}, source_index={index}: {exc}") from exc
-        finally:
-            records.close()
 
 
 def validate_edit_subjects(cases):

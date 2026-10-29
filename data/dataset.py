@@ -23,6 +23,8 @@ READERS = {"native": None, "zsre": ZSREReader, "fever": FEVERReader,
 
 @dataclass
 class DatasetBundle:
+    """文本案例与可选保持池；keep_pool=None 时沿用原 MDLM 的案例内保持题。"""
+
     cases: list[dict]
     keep_pool: list[dict] | None
     metadata: dict
@@ -53,10 +55,10 @@ def load_dataset(config: dict, *, dataset_path_override=None) -> DatasetBundle:
     keep_path = project_path(config["keep_path"]) if config.get("keep_path") is not None else None
     if keep_limit is not None and keep_path is None:
         raise ValueError("keep_limit 需要同时指定 keep_path")
-    raw_options = config.get("reader_options", {})
-    if not isinstance(raw_options, dict):
+    options = config.get("reader_options", {})
+    if not isinstance(options, dict):
         raise ValueError("reader_options 必须是对象")
-    options = dict(raw_options)
+    options = dict(options)  # 路径展开不回写调用方的配置。
     if options.get("subject_path") is not None:
         options["subject_path"] = str(project_path(options["subject_path"]))
     seed = config.get("seed", 2026)
