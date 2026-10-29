@@ -1,8 +1,4 @@
-"""Adapt the reviewed cases.jsonl layout to the existing editing runtime interface.
-
-This is a field adapter, not a data-quality validator. The source's gold_ready
-flag selects rows for editing; all other review decisions remain with the source.
-"""
+"""将 gold_ready 源案例按请求展开为算法事实；沿用源数据的审核结果。"""
 
 from __future__ import annotations
 
@@ -12,49 +8,40 @@ from pathlib import Path
 
 
 def _probe(source: dict, *, answer_field: str, used_for_edit: bool, role: str) -> dict:
-    return {
-        "probe_id": source["probe_id"],
-        "prompt": source["question"],
-        "answer": source[answer_field],
-        "used_for_edit": used_for_edit,
-        "role": role,
-    }
+    """把一道题映射为探针，保留原题、指定答案及用途，不重新分词。"""
+    return {"probe_id": source["probe_id"], "prompt": source["question"],
+            "answer": source[answer_field], "used_for_edit": used_for_edit, "role": role}
 
 
 def adapt_reviewed_cases(rows: list[dict]) -> list[dict]:
-    """Return one runtime case per approved edit request, in source order."""
+    """按源案例/请求顺序构造 D_edit；同源事实由 runner 分组联合编辑。"""
     adapted = []
     for row in rows:
         if not row["gold_ready"]:
             continue
         requests, questions = row["edit_requests"], row["edit_questions"]
-        if len(requests) != len(questions):
+        count = len(requests)
+        if count != len(questions):
             raise ValueError(f"{row['case_id']}: edit_requests and edit_questions cannot be paired by index")
         for index, (request, question) in enumerate(zip(requests, questions)):
-            # The source has no request_id on edit_questions; their shared index
-            # is the only explicit pairing available. Keep the original IDs.
-            case_id = row["case_id"] if len(requests) == 1 else request["request_id"]
+            # 编辑题没有 request_id，沿用同下标配对；公式（2）（3）（4）沿用此事实顺序。
+            case_id = row["case_id"] if count == 1 else request["request_id"]
+            # 保持题只挂在首个请求下，供后续公式（5）（10）（16）的固定输入划分使用。
             prompts = {"edit": [_probe(question, answer_field="expected_new_answer",
                                         used_for_edit=True, role="edit")],
-                       "free_form_qa": [], "portability": [], "preservation": []}
-            if index == 0:
-                # Shared preservation probes are attached once across a multi-request case.
-                prompts["preservation"] = [
-                    _probe(source, answer_field="expected_unchanged_answer",
-                           used_for_edit=False, role="preservation")
-                    for source in row["preservation_questions"]
-                ]
+                       "free_form_qa": [], "portability": [],
+                       "preservation": [_probe(source, answer_field="expected_unchanged_answer",
+                                               used_for_edit=False, role="preservation")
+                                        for source in row["preservation_questions"]] if index == 0 else []}
+            # fact_core 保存请求事实；真正的逐 token 监督取上面编辑题的 answer。
             adapted.append({
                 "case_id": case_id,
                 "source_case_id": row["case_id"],
                 "source_request_id": request["request_id"],
                 "dataset_group": row["dataset_group"],
-                "fact_core": {
-                    "subject": request["subject"],
-                    "relation": request["relation"],
-                    "old_object": request["old_answer"],
-                    "new_object": request["experimental_new_answer"],
-                },
+                "fact_core": {"subject": request["subject"], "relation": request["relation"],
+                              "old_object": request["old_answer"],
+                              "new_object": request["experimental_new_answer"]},
                 "prompts": prompts,
                 "quality_control": {"status": row["review_status"]},
             })
@@ -62,6 +49,7 @@ def adapt_reviewed_cases(rows: list[dict]) -> list[dict]:
 
 
 def main() -> None:
+    """可选转换入口：读取 JSONL，按源/事实编号选例，写出 JSON 或 JSONL。"""
     parser = argparse.ArgumentParser(description="Materialize gold_ready editing cases for P0-P5.")
     parser.add_argument("source", type=Path, help="reviewed cases.jsonl")
     parser.add_argument("output", type=Path, help="output .json or .jsonl; source is never modified")
