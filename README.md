@@ -57,6 +57,7 @@ python -u main.py --editor mdlm --sequential
 ## 算法代码
 
 - `model/base.py`：模型输入、监督答案、前向捕获、去噪轨迹与本轮权重快照，以及适配器接口；其中的公式编号说明数据和接口用途。
+- `model/adapters/llada_8b_instruct.py`：LLaDA 本地加载、模板对齐、单条/批量实际 FFN 输入捕获、可微完整词表读出、自主去噪与本轮权重恢复。
 - `MDLM/runner.py`：按源案例分组、加载一次模型，固定最初 θ₀/W₀ 参照，控制独立/连续编辑与本轮恢复，保存最终结果。
 - `MDLM/states.py`：去噪状态的兼容性筛选与三级监督权重，公式（1）～（3）。
 - `util/extract_reference_keys.py`：从本轮全 mask 初态提取 K，公式（4）。
