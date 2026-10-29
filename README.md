@@ -60,6 +60,7 @@ python -u main.py --editor mdlm --sequential
 - `model/adapters/llada_8b_instruct.py`：LLaDA 本地加载、模板对齐、单条/批量实际 FFN 输入捕获、可微完整词表读出、自主去噪与本轮权重恢复。
 - `MDLM/runner.py`：按源案例分组、加载一次模型，固定最初 θ₀/W₀ 参照，控制独立/连续编辑与本轮恢复，保存最终结果。
 - `MDLM/states.py`：去噪状态的兼容性筛选与三级监督权重，公式（1）～（3）。
+- `util/prepare_dataset_inputs.py`：固定保持题划分、全 mask 上下文及题/位置权重，为公式（5）（10）（16）和开发编辑准备输入；统计与训练共用训练分区，开发保持单独划分。
 - `util/extract_reference_keys.py`：从本轮全 mask 初态提取 K，公式（4）。
 - `MDLM/keep_statistics.py` 与 `util/extract_keep_statistics.py`：每批保持输入前向一次，按公式（5）逐层累计 C；直接返回矩阵。
 - `MDLM/writeback.py`：以原有 λ 和 Cholesky 方法求解并直接返回固定 Q，公式（6）～（9）。
