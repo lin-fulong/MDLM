@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
@@ -34,27 +33,6 @@ def choose_run_id(configured: str | None, override: str | None) -> str:
     if not isinstance(run_id, str) or run_id in ("", ".", "..") or "/" in run_id or "\\" in run_id:
         raise ValueError("run_id must be one directory name")
     return run_id
-
-
-def stage_settings(kind, values):
-    """读取数学参数；旧磁盘流程的路径和版本绑定字段已不再参与计算。"""
-    values = dict(values)
-    legacy = {"dev_edit_file", "dev_edit_probes", "dev_keep_file", "keep_train_file",
-              "reference_model_path", "reference_model_revision", "reference_tokenizer_revision"}
-    if values.pop("allow_example_only", False):
-        raise ValueError("正式入口不允许 example-only 输入")
-    for name in legacy:
-        values.pop(name, None)
-    if "checkpoints" in values:
-        values["checkpoints"] = tuple(values["checkpoints"])
-    if "alphas" in values:
-        values["alphas"] = tuple(values["alphas"])
-    unknown = set(values) - {item.name for item in fields(kind)}
-    if unknown:
-        raise ValueError(f"{kind.__name__} 中存在不支持的参数：{sorted(unknown)}")
-    settings = kind(**values)
-    settings.check()
-    return settings
 
 
 def select_cases(cases, case_ids):
@@ -104,7 +82,7 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
     keep_values["batch_keep"] = execution.get("backend") == "resident" and keep_values.get("device", "cpu").startswith("cuda")
     q = WritebackConfig(**q_values)
     optimization = ResidualOptimizationConfig(**choices["p4"])
-    acceptance = stage_settings(AcceptanceConfig, choices["p5"])
+    acceptance = AcceptanceConfig(**choices["p5"])
 
     run_id = choose_run_id(choices.get("run_id"), run_id_override)
     output = project_path(choices.get("output_root", "runs")) / run_id

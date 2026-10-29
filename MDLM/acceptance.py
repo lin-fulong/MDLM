@@ -1,4 +1,4 @@
-"""Formulas (16)–(18): independent development gates and ordered common trials."""
+"""公式（16）～（18）：按预定公共 α 试步，以三个独立开发条件决定接受或回退。"""
 
 from __future__ import annotations
 
@@ -27,39 +27,17 @@ class AcceptanceConfig:
     equivalence_atol: float = 0.125
     equivalence_rtol: float = 0.02
     chunk_size: int = 256
-    edit_protocol: str = "full_mask_mean_fact_probe_token_v1"
-
-    def check(self) -> None:
-        if not self.alphas or any(isinstance(a, bool) or not isinstance(a, (int, float))
-                                 or not math.isfinite(a) or a <= 0 for a in self.alphas):
-            raise ValueError("P5 requires a finite ordered sequence of positive common alphas")
-        for name in ("delta", "tau_g", "tau_u", "epsilon", "equivalence_atol", "equivalence_rtol"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-                raise ValueError(f"P5 {name} must be finite and nonnegative")
-        if self.delta == 0 or self.epsilon == 0:
-            raise ValueError("P5 delta and epsilon must be positive")
-        if self.compute_dtype not in ("float32", "float64") or type(self.chunk_size) is not int or self.chunk_size < 1:
-            raise ValueError("P5 requires float32/float64 merge arithmetic and positive chunk_size")
-        if self.edit_protocol != "full_mask_mean_fact_probe_token_v1":
-            raise ValueError("unsupported P5 development protocol")
-
-
-class AcceptanceError(RuntimeError):
-    def __init__(self, message: str, report: dict):
-        super().__init__(message)
-        self.report = report
 
 
 def development_edits(cases: list[dict], selections: tuple, adapter) -> list[EditTrainingExample]:
-    """Trusted original case schema; one full-mask readout per explicitly selected probe."""
+    """构造固定开发编辑输入，沿用事实 → 探针 → 答案 token 的均分协议。"""
     by_id = {case["case_id"]: case for case in cases}
     counts = Counter(item.case_id for item in selections)
     examples = []
     for item in selections:
         model_input, target = adapter.prepare_development_input(by_id[item.case_id], item.probe_id)
         positions = model_input.mask_positions
-        # 冻结开发协议：事实均分、同事实探针均分、答案 token 均分。
+        # F_dev 沿用公式（2）（3）的分级均值形式，此处用开发探针替代训练状态。
         weight = 1 / (len(counts) * counts[item.case_id] * len(positions))
         examples.append(EditTrainingExample(item.case_id, model_input, positions, target.token_ids,
                                             (weight,) * len(positions)))
@@ -68,16 +46,10 @@ def development_edits(cases: list[dict], selections: tuple, adapter) -> list[Edi
 
 @torch.no_grad()
 def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float) -> float:
-    """Formula (17): actual current minus original weights, never a sum of step norms."""
-    if set(originals) != set(merger.parameters):
-        raise ValueError("original W_0 layer selection differs from actual merged model")
+    """公式（17）：当前实际存储权重相对最初 W_0 的整体净变化比例。"""
     scale = epsilon
     for name, weight in merger.parameters.items():
         original = originals[name]
-        if original.shape != weight.shape or not torch.isfinite(original).all():
-            raise ValueError(f"original W_0 shape/finiteness differs at {name}")
-        if not torch.isfinite(weight).all():
-            raise FloatingPointError("nonfinite actual weights in cumulative change")
         scale = max(scale, float(original.abs().max()), float(weight.detach().abs().max()))
     numerator, denominator = 0.0, 0.0
     for name, weight in merger.parameters.items():
@@ -98,10 +70,9 @@ def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float) -> f
 
 @torch.no_grad()
 def development_metrics(merger, adapter, edits, keeps, originals, epsilon, logits=None) -> dict:
+    """计算 F_dev、完整词表 G_dev 和累计 U，可复用合并一致性前向的 logits。"""
     if not edits or not keeps:
         raise ValueError("P5 requires both development edit and preservation readouts even when training beta=0")
-    if logits is not None and len(logits) != len(edits) + len(keeps):
-        raise ValueError("P5 cached logits do not cover all development readouts")
     edit = math.fsum(float(edit_loss(adapter, merger.model, item) if logits is None
                           else edit_loss_from_logits(logits[index], item)) for index, item in enumerate(edits))
     # 公式（16）：复用完整词表 KL(theta_0 || theta_alpha)，开发保持始终执行。
@@ -115,6 +86,7 @@ def development_metrics(merger, adapter, edits, keeps, originals, epsilon, logit
 
 
 def gate_decision(metrics: dict, baseline_edit: float, settings: AcceptanceConfig) -> dict:
+    """公式（18）：F_dev ≤ F_dev(W_b)−δ、G_dev ≤ τ_G、U ≤ τ_U 同时成立。"""
     limits = {"f_dev": baseline_edit - settings.delta, "g_dev": settings.tau_g, "u": settings.tau_u}
     checks = {name: math.isfinite(metrics[name]) and metrics[name] <= limit for name, limit in limits.items()}
     return {"passed": all(checks.values()), "checks": checks, "limits": limits,
@@ -123,7 +95,7 @@ def gate_decision(metrics: dict, baseline_edit: float, settings: AcceptanceConfi
 
 def select_merged_candidate(merger: WeightMerge, adapter, factors: dict, residuals: dict,
                             edits: list, keeps: list, originals: dict, settings: AcceptanceConfig) -> dict:
-    settings.check()
+    """依序接受首个通过等价性与三个门槛的 α；全部拒绝或异常时恢复 W_b。"""
     report = {"status": "running", "selected_alpha": None, "trials": [], "baseline_restored": False}
     try:
         merger.restore()
@@ -139,8 +111,6 @@ def select_merged_candidate(merger: WeightMerge, adapter, factors: dict, residua
                     atol=settings.equivalence_atol, rtol=settings.equivalence_rtol, merged_logits=merged_logits)
                 row["metrics"] = development_metrics(merger, adapter, edits, keeps, originals, settings.epsilon,
                                                      merged_logits)
-                # check_integrity 已将当前目标层摘要与 apply() 后的冻结摘要逐项比较。
-                merger.check_integrity()
                 row["gate"] = gate_decision(row["metrics"], report["baseline"]["f_dev"], settings)
                 row["accepted"] = row["gate"]["passed"]
             except (EquivalenceError, FloatingPointError) as error:
@@ -152,11 +122,6 @@ def select_merged_candidate(merger: WeightMerge, adapter, factors: dict, residua
             row["baseline_restored"] = True
         report.update(status="rejected", baseline_restored=True, failure=None)
         return report
-    except Exception as error:
-        report.update(status="failed", baseline_restored=False, failure=str(error))
-        try:
-            merger.restore()
-            report["baseline_restored"] = True
-        except Exception as recovery_error:
-            report["recovery_failure"] = str(recovery_error)
-        raise AcceptanceError(str(error), report) from error
+    except Exception:
+        merger.restore()
+        raise

@@ -69,13 +69,8 @@ def edit_round(model, adapter, trajectories, statistics, dev_edits, dev_keeps, o
     # P5：沿用 W_b + αRQ、因子/合并前向等价检查、三个开发门槛和精确回退。
     merger = WeightMerge(model, factors, optimized.residuals,
                          compute_dtype=acceptance.compute_dtype, chunk_size=acceptance.chunk_size)
-    try:
-        merger.diagnostics(factors, optimized.residuals, keys)
-        selection = select_merged_candidate(merger, adapter, factors, optimized.residuals,
-                                            dev_edits, dev_keeps, originals, acceptance)
-    except Exception:
-        merger.restore()
-        raise
+    selection = select_merged_candidate(merger, adapter, factors, optimized.residuals,
+                                        dev_edits, dev_keeps, originals, acceptance)
     return {**result, "decision": selection["status"], "selected_alpha": selection["selected_alpha"],
             "baseline_restored": selection["baseline_restored"], "selection": selection}
 
