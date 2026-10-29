@@ -61,7 +61,7 @@ python -u main.py --editor mdlm --sequential
 - `MDLM/writeback.py`：以原有 λ 和 Cholesky 方法求解并直接返回固定 Q，公式（6）～（9）。
 - `MDLM/candidate.py` 与 `MDLM/optimize.py`：安装全位置 R(Qk) 分支，固定 Q、联合优化多层 R，按预定检查点选择优于 J(0) 的候选，公式（10）～（12）。
 - `MDLM/merge.py` 与 `MDLM/acceptance.py`：按公共 α 从基准重建实际权重，核对因子/合并前向，按三个独立开发门槛接受或精确回退，公式（13）～（18）。
-- `MDLM/workflow.py`：直接衔接上述计算，并提供最终结果保存和加载。
+- `MDLM/workflow.py`：准备最初 θ₀ 的保持参考，串联单轮监督 → K/C → Q → R → 开发接受，并保存、重载最终目标权重。
 
 `contracts.py` 已删除。数学参数放在对应算法模块的参数类中；
 不再需要阶段 manifest、文件摘要、版本合同或临时 JSON 配置来衔接计算。
