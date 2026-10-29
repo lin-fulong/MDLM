@@ -92,7 +92,7 @@ def run_dataset(config_file: Path, *, sequential=False, run_id_override=None, da
               "source_dataset": str(dataset), "original_model": str(model_path),
               "selected_case_ids": case_ids, "rounds": [], "current_case_id": None}
     try:
-        with execution_context(execution, layers):
+        with execution_context(execution):
             adapter = LLaDA8BInstructAdapter.from_local_tokenizer(model_path=model_path, target_layers=layers)
             # 用完整 cases 划分保持输入，不让 --case-id 改变训练/开发集合。
             prepared = prepare_inputs(cases, adapter, settings=choices.get("input_preparation", {}).get("settings"))

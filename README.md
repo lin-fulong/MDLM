@@ -70,6 +70,8 @@ python -u main.py --editor mdlm --sequential
 - `MDLM/candidate.py` 与 `MDLM/optimize.py`：安装全位置 R(Qk) 分支，固定 Q、联合优化多层 R，按预定检查点选择优于 J(0) 的候选，公式（10）～（12）。
 - `MDLM/merge.py` 与 `MDLM/acceptance.py`：按公共 α 从基准重建实际权重，核对因子/合并前向，按三个独立开发门槛接受或精确回退，公式（13）～（18）。
 - `MDLM/workflow.py`：准备最初 θ₀ 的保持参考，串联单轮监督 → K/C → Q → R → 开发接受，并保存、重载最终目标权重。
+- `util/gpu_runtime.py`：选择运行设备；resident 模式关闭 TF32，退出时恢复原设置。它不实现编号公式，只固定公式（1）～（18）的共同运行环境。
+- `util/io.py`：读取配置、保存运行摘要和最终模型元数据，并为保持输入生成确定性划分摘要；摘要服务公式（5）（10）（16）的输入准备，本身不计算公式。
 
 `contracts.py` 已删除。数学参数放在对应算法模块的参数类中；
 不再需要阶段 manifest、文件摘要、版本合同或临时 JSON 配置来衔接计算。

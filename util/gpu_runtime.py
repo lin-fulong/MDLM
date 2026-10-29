@@ -1,11 +1,15 @@
-"""进程内计算设备与精度设置；模型由 runner 一次加载。"""
+"""设置单进程算法运行所用的设备与 TF32 精度。"""
 
 from contextlib import contextmanager
 import torch
 
 
 @contextmanager
-def execution_context(settings, layers=None):
+def execution_context(settings):
+    """选择计算设备；resident 模式关闭 TF32，并在退出时恢复原设置。
+
+    本函数不实现公式（1）～（18），只固定这些计算共同使用的运行环境。
+    """
     backend = settings.get("backend", "subprocess")
     if backend not in ("resident", "subprocess"):
         raise ValueError("execution.backend must be resident or subprocess")
