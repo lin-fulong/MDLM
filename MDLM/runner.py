@@ -19,6 +19,7 @@ from MDLM.writeback import WritebackConfig, extract_keys, keep_matrices, solve_w
 from data.dataset import load_dataset
 from model.registry import get_adapter
 from util.gpu_runtime import execution_context
+from util.experiment_log import ExperimentLog
 from util.io import choose_run_id, project_path, read_config, read_json, write_json
 
 
@@ -53,12 +54,26 @@ def run_dataset(config_file: Path, **options) -> dict:
     output.mkdir(parents=True, exist_ok=False)
     report = {"editor": "mdlm", "status": "running", "run_id": run_id,
               "rounds": [], "current_case_id": None}
-    try:
-        return _run_dataset(choices, output, report, **options)
-    finally:
-        if report["status"] != "complete":
-            report.update(status="failed", failure=str(sys.exc_info()[1]))
-        write_json(output / "run_report.json", report)
+    mode = choices.get("mode", "independent") if options.get("sequential") is None else (
+        "sequential" if options["sequential"] else "independent")
+    dataset = options.get("dataset_override") or choices.get("dataset_path")
+    model = options.get("model_override") or choices.get("model_path")
+    log = ExperimentLog(
+        output, algorithm=choices.get("editor", "mdlm"), model=model, dataset=dataset, kind="edit",
+        parameters={"mode": mode, "layers": "-".join(map(str, choices.get("target_layers", []))),
+                    "steps": choices.get("optimization_steps", 20),
+                    "ridge": choices.get("ridge", 0.01), "rho": choices.get("rho", 0.001),
+                    "seed": choices.get("seed", 2026),
+                    "cases": options.get("max_cases_override") or choices.get("max_cases") or "all"})
+    with log.capture():
+        try:
+            return _run_dataset(choices, output, report, **options)
+        finally:
+            if report["status"] != "complete":
+                report.update(status="failed", failure=str(sys.exc_info()[1]))
+            report["log_file"] = str(log.path)
+            log.finish(report)
+            write_json(output / "run_report.json", report)
 
 
 def _run_dataset(choices, output, report, *, sequential=None, dataset_override=None,

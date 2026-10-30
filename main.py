@@ -8,6 +8,7 @@ from importlib import import_module
 from pathlib import Path
 
 from util.io import read_json
+from util.experiment_log import append_command_output
 
 
 ROOT = Path(__file__).resolve().parent
@@ -61,7 +62,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     summary = {key: result.get(key) for key in (
         "status", "mode", "fact_count", "accepted_count", "rejected_count", "final_checkpoint_dir")}
-    print(json.dumps({"editor": editor, **summary}, ensure_ascii=False, indent=2))
+    output = json.dumps({"editor": editor, **summary}, ensure_ascii=False, indent=2)
+    print(output)
+    append_command_output(result["log_file"], output)
 
 
 if __name__ == "__main__":

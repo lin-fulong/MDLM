@@ -11,6 +11,7 @@ import sys
 from tqdm.auto import tqdm
 
 from util.io import choose_run_id, config_digest, project_path, read_config, write_json
+from util.experiment_log import ExperimentLog
 from .artifacts import file_digest, model_settings, read_evaluation_data, read_run
 from .framework import get_framework
 from .reporting import write_record
@@ -22,15 +23,44 @@ def run_evaluation(config_file, **options):
     identifier = choose_run_id(config.get("eval_id"), options.pop("eval_id", None))
     output = project_path(config.get("output_root", "evaluations")) / identifier
     output.mkdir(parents=True, exist_ok=False)
-    try:
-        return _evaluate(config, output, identifier, **options)
-    finally:
-        error = sys.exc_info()[1]
-        if error is not None and not (output / "summary.json").exists():
-            write_json(output / "summary.json", {
-                "eval_id": identifier, "status": "failed", "failure": str(error),
-                "output_dir": str(output), "expected_tasks": None, "completed_tasks": 0,
-                "coverage": None, "error_count": 1, "metrics": {}, "config": config})
+    run_dir = options.get("run_dir") or config.get("run_dir")
+    report = {}
+    if run_dir is not None:
+        report_path = (Path(run_dir).resolve() if options.get("run_dir") is not None
+                       else project_path(run_dir)) / "run_report.json"
+        if report_path.is_file():
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # 这里只为日志目录提取名称；真正的输入错误仍在捕获开启后由评价器报告。
+                report = {}
+    generation = config.get("generation") or {}
+    log = ExperimentLog(
+        output, algorithm="mdlm", model=options.get("model_path") or report.get("original_model"),
+        dataset=options.get("dataset_path") or report.get("source_dataset"), kind="evaluation",
+        parameters={"protocol": config.get("protocol", "diffusion_short_v1"),
+                    "steps": generation.get("steps") or "auto",
+                    "temperature": generation.get("temperature", 0.0),
+                    "seed": config.get("seed", report.get("seed", "inherited"))})
+    with log.capture():
+        try:
+            result = _evaluate(config, output, identifier, **options)
+        finally:
+            error = sys.exc_info()[1]
+            if error is not None and not (output / "summary.json").exists():
+                write_json(output / "summary.json", {
+                    "eval_id": identifier, "status": "failed", "failure": str(error),
+                    "output_dir": str(output), "expected_tasks": None, "completed_tasks": 0,
+                    "coverage": None, "error_count": 1, "metrics": {}, "config": config})
+            summary_path = output / "summary.json"
+            if summary_path.exists():
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                summary["log_file"] = str(log.path)
+                write_json(summary_path, summary)
+                log.finish(summary)
+                if error is None:
+                    result["log_file"] = str(log.path)
+    return result
 
 
 def _evaluate(config, output, identifier, *, run_dir=None, device=None, model_path=None, dataset_path=None):

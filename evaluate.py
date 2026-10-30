@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+from util.experiment_log import append_command_output
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -18,8 +20,11 @@ def main(argv=None):
     from evaluation.runner import run_evaluation
     result = run_evaluation(args.config, run_dir=args.run_dir, device=args.device,
                             model_path=args.model_path, dataset_path=args.dataset, eval_id=args.eval_id)
-    print(json.dumps({key: result[key] for key in ("status", "output_dir", "expected_tasks", "completed_tasks", "coverage")},
-                     ensure_ascii=False, indent=2))
+    output = json.dumps({key: result[key] for key in (
+        "status", "output_dir", "expected_tasks", "completed_tasks", "coverage")},
+        ensure_ascii=False, indent=2)
+    print(output)
+    append_command_output(result["log_file"], output)
 
 
 if __name__ == "__main__":

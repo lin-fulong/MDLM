@@ -1,7 +1,7 @@
 """清理异常语句后的算法回归：微型模型、已提交基线和失败恢复。"""
 
 import ast
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 import importlib
 import io
@@ -21,6 +21,7 @@ from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 from model.base import KeepModelInput, ModelAdapter
 from util.nethook import register_output_hooks
 from util.io import read_json, write_json
+from util.experiment_log import ExperimentLog
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +71,33 @@ class AlgorithmRegressionTests(unittest.TestCase):
             if name == "MDLM" or name.startswith(("MDLM.", "_cleanup_before_")):
                 del sys.modules[name]
         sys.modules.update(self.modules)
+
+    def test_experiment_log_tees_terminal_streams_and_summary(self):
+        with tempfile.TemporaryDirectory(prefix="mdlm_log_") as temporary:
+            root = Path(temporary)
+            log = ExperimentLog(root / "runs/edit", algorithm="mdlm", model="base",
+                                dataset="cases.jsonl", kind="edit", parameters={"mode": "independent"})
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr), log.capture():
+                print("stdout marker")
+                print("stderr marker", file=sys.stderr)
+                log.finish({"status": "complete", "case_count": 1})
+            content = log.path.read_text(encoding="utf-8")
+            self.assertIn("stdout marker", stdout.getvalue())
+            self.assertIn("stderr marker", stderr.getvalue())
+            self.assertIn("stdout marker", content)
+            self.assertIn("stderr marker", content)
+            self.assertIn("status: complete", content)
+
+            failed = ExperimentLog(root / "runs/failed", algorithm="mdlm", model="base",
+                                   dataset="cases.jsonl", kind="edit", parameters={"mode": "independent"})
+            with self.assertRaises(ValueError):
+                with failed.capture():
+                    int("not an integer")
+            failure_content = failed.path.read_text(encoding="utf-8")
+            self.assertIn("[uncaught_exception]", failure_content)
+            self.assertIn("ValueError", failure_content)
+            self.assertIn("status: failed", failure_content)
 
     def test_no_explicit_exception_statements(self):
         paths = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.py"],
@@ -220,6 +248,10 @@ class AlgorithmRegressionTests(unittest.TestCase):
                 self.assertEqual(report["case_count"], 2)
                 self.assertEqual(report["accepted_count"], 2)
                 self.assertEqual(read_json(root / "runs/edit/run_report.json"), report)
+                edit_log = Path(report["log_file"])
+                self.assertEqual(edit_log.parent, root / "logs/mdlm/base/cases")
+                self.assertIn(f"mode-{mode}", edit_log.name)
+                self.assertIn("round:", edit_log.read_text(encoding="utf-8"))
                 if mode == "independent":
                     self.assertTrue(torch.equal(model.get_submodule(name).weight, torch.zeros(2, 2)))
                 else:
@@ -235,6 +267,10 @@ class AlgorithmRegressionTests(unittest.TestCase):
                     self.assertEqual(result["status"], "complete")
                     self.assertEqual(result["coverage"], 1)
                     self.assertEqual(result["completed_tasks"], 10)
+                    evaluation_log = Path(result["log_file"])
+                    self.assertEqual(evaluation_log.parent, root / "logs/mdlm/base/cases")
+                    self.assertIn(f"protocol-{protocol}", evaluation_log.name)
+                    self.assertIn("completed_tasks: 10", evaluation_log.read_text(encoding="utf-8"))
                     self.assertTrue(torch.equal(runtime.get_submodule(name).weight, torch.zeros(2, 2)))
 
     def test_edit_runner_failure_report_and_round_rollback(self):
@@ -273,6 +309,7 @@ class AlgorithmRegressionTests(unittest.TestCase):
                     report = read_json(root / "runs/failure/run_report.json")
                     self.assertEqual(report["status"], "failed")
                     self.assertIn("失败", report["failure"])
+                    self.assertIn("status: failed", Path(report["log_file"]).read_text(encoding="utf-8"))
                     if phase == "round":
                         self.assertEqual(report["current_case_id"], "f0")
                         self.assertTrue(torch.equal(model.get_submodule(name).weight, torch.zeros(2, 2)))

@@ -527,6 +527,7 @@ class RunnerTests(unittest.TestCase):
                 summary = read_json(root / "out/failed/summary.json")
                 self.assertEqual(summary["status"], "failed")
                 self.assertTrue(summary["failure"])
+                self.assertIn("status: failed", Path(summary["log_file"]).read_text(encoding="utf-8"))
                 self.assertEqual(summary["completed_tasks"], 0)
                 self.assertIsNone(summary["coverage"])
                 if failure == "failed_report":
