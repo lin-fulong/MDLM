@@ -4,6 +4,7 @@ from dataclasses import asdict
 from contextlib import ExitStack
 import hashlib
 import json
+import math
 from pathlib import Path
 import platform
 import sys
@@ -14,7 +15,24 @@ from .framework import get_framework
 from .reporting import write_record
 
 
-def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, dataset_path=None, eval_id=None):
+def run_evaluation(config_file, **options):
+    """在读取产物前建立输出，输入校验失败也保存明确的失败摘要。"""
+    config = read_config(Path(config_file))
+    identifier = choose_run_id(config.get("eval_id"), options.pop("eval_id", None))
+    output = project_path(config.get("output_root", "evaluations")) / identifier
+    output.mkdir(parents=True, exist_ok=False)
+    try:
+        return _evaluate(config, output, identifier, **options)
+    finally:
+        error = sys.exc_info()[1]
+        if error is not None and not (output / "summary.json").exists():
+            write_json(output / "summary.json", {
+                "eval_id": identifier, "status": "failed", "failure": str(error),
+                "output_dir": str(output), "expected_tasks": None, "completed_tasks": 0,
+                "coverage": None, "error_count": 1, "metrics": {}, "config": config})
+
+
+def _evaluate(config, output, identifier, *, run_dir=None, device=None, model_path=None, dataset_path=None):
     """读取产物 → 全部 before → 按权重分组 after → 评分和保存。"""
     # 模型依赖只在执行评估时导入；--help 不加载模型或导入 MDLM。
     import torch
@@ -22,11 +40,17 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
     from .inference import (GOLD_PROTOCOL, PROTOCOL, PROTOCOLS, LLaDABackend,
                             generate, prepare_request)
 
-    config = read_config(Path(config_file))
     framework = get_framework(config.get("framework", "ultraedit"))
     protocol = config.get("protocol", PROTOCOL)
     description = PROTOCOLS[protocol]
     generation = {"steps": None, "temperature": 0.0, **config.get("generation", {})}
+    # 配置错误先于模型加载；逐题长度上限仍由 generate 检查。
+    if generation.keys() - {"steps", "temperature"}:
+        sys.exit("未知评价生成参数")
+    steps, temperature = generation["steps"], generation["temperature"]
+    if (steps is not None and (type(steps) is not int or steps < 1)
+            or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature < 0):
+        sys.exit("评价轮数必须为正整数/null，温度必须为有限非负数")
     run_dir = Path(run_dir).resolve() if run_dir is not None else project_path(config["run_dir"])
     report_hash = file_digest(run_dir / "run_report.json")
     report, rounds, artifacts = read_run(run_dir)
@@ -37,9 +61,6 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
     tasks = framework.build_tasks(bundle.cases, rounds, groups)
     settings = model_settings(report, artifacts, config, override=model_path)
     device = device or config.get("device", "cuda:0")
-    identifier = choose_run_id(config.get("eval_id"), eval_id)
-    output = project_path(config.get("output_root", "evaluations")) / identifier
-    output.mkdir(parents=True, exist_ok=False)
     summary = framework.aggregate(tasks, groups)
     accepted = sum(row["decision"] == "accepted" for row in rounds)
     # 运行口径只定义一次，运行清单和最终汇总使用相同统计。
@@ -106,6 +127,11 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
                 by_checkpoint.setdefault(task.checkpoint, []).append(task)
             for checkpoint, selected in by_checkpoint.items():
                 if checkpoint is not None:
+                    item = artifacts[str(checkpoint)]
+                    if (file_digest(checkpoint / "target_weights.safetensors") != item["weights_sha256"]
+                            or file_digest(checkpoint / "model.json") != item["metadata_sha256"]):
+                        sys.exit("评价权重加载前产物已发生变化")
+                if checkpoint is not None:
                     backend.use_checkpoint(checkpoint)
                 print(f"[evaluate] {checkpoint or 'original (rejected)'}: {len(selected)} probes", flush=True)
                 for task in selected:
@@ -127,6 +153,13 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
                     # 只有逐题结果成功保存，才计入已完成数量。
                     summary.add(task, scores)
                     current = None
+        # 哈希只证明本次评价期间输入未变，不能证明与编辑当时版本相同。
+        if file_digest(run_dir / "run_report.json") != report_hash or file_digest(bundle.metadata["source_path"]) != source_hash:
+            sys.exit("评价期间编辑报告或源数据发生变化")
+        for path, item in artifacts.items():
+            if (file_digest(Path(path) / "model.json") != item["metadata_sha256"]
+                    or file_digest(Path(path) / "target_weights.safetensors") != item["weights_sha256"]):
+                sys.exit("评价期间模型产物发生变化")
         status = "complete"
     finally:
         # 上下文退出和权重恢复成功后才算完成；异常在记录后自然传播。

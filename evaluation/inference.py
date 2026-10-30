@@ -1,6 +1,8 @@
 """评估专用的定长全 mask 推理；不使用编辑轨迹、取键或优化代码。"""
 
 import hashlib
+import math
+import sys
 from dataclasses import dataclass
 
 import torch
@@ -8,6 +10,7 @@ from safetensors.torch import load_file
 
 from model.base import KeepModelInput
 from model.registry import get_adapter
+from data.validation.alignment import encode_answer
 
 
 PROTOCOL = "diffusion_short_v1"
@@ -42,9 +45,7 @@ def prepare_request(adapter, task, seed, protocol=PROTOCOL):
     """p = Tok(Render(q))，y = Tok(Render(q) + answer)[len(p):]。"""
     # 联合分词后按提示长度取答案；数据与 tokenizer 需满足稳定的答案边界。
     rendered = adapter.render_prompt(task.prompt)
-    prompt = tuple(adapter.tokenizer.encode(rendered, add_special_tokens=False))
-    full = tuple(adapter.tokenizer.encode(rendered + task.answer, add_special_tokens=False))
-    target = full[len(prompt):]
+    prompt, target = encode_answer(adapter.tokenizer, rendered, task.answer, adapter.mask_token_id)
     derived = int.from_bytes(hashlib.sha256(f"{seed}:{protocol}:{task.task_id}".encode()).digest()[:8], "big") % (2**63)
     # 请求只含提示、长度和种子；标准答案由运行器按协议单独传递。
     return GenerationRequest(prompt, len(target), derived), target
@@ -55,9 +56,24 @@ def generate(model, adapter, request, *, steps=None, temperature=0.0, protocol=P
     """从全 mask 窗口去噪；按协议写预测或先评分后回填，返回评分预测。"""
     gold = protocol == GOLD_PROTOCOL
     length = request.answer_length
+    if protocol not in PROTOCOLS:
+        sys.exit(f"未知评价协议：{protocol}")
+    if type(length) is not int or length < 1:
+        sys.exit("评价答案 token 数必须为正整数")
+    if steps is not None and (type(steps) is not int or steps < 1):
+        sys.exit("评价 steps 必须为正整数或 null")
+    if not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature < 0:
+        sys.exit("评价 temperature 必须为有限非负数")
+    limit = getattr(model.config, "max_sequence_length", getattr(model.config, "max_position_embeddings", None))
+    if limit is not None and len(request.prompt_ids) + length > limit:
+        sys.exit("评价输入超过模型上下文长度，不自动截断")
     blocked = set(adapter.tokenizer.all_special_ids) | {adapter.mask_token_id}
     if gold:
         target = tuple(target) if target is not None else ()
+        if len(target) != length or set(target) & blocked:
+            sys.exit("回填协议要求等长且不含特殊 token 的标准答案")
+    elif target is not None:
+        sys.exit("自主去噪协议不能接收标准答案 token")
     begin = len(request.prompt_ids)
     # K = L（steps=null），否则 K = min(steps, L)；state 初态为 [p, MASK × L]。
     steps = min(steps, length) if steps is not None else length
@@ -72,6 +88,10 @@ def generate(model, adapter, request, *, steps=None, temperature=0.0, protocol=P
         logits[:, [i for i in blocked if 0 <= i < logits.shape[-1]]] = -torch.inf
         # P = softmax(logits / T)；T=0 时用 softmax(logits) 计算置信度，预测取 argmax。
         probabilities = torch.softmax(logits / temperature if temperature else logits, dim=-1)
+        if not torch.isfinite(probabilities).all():
+            sys.exit("评价概率无效，不能将 NaN/Inf 或无可用 token 当作正常预测")
+        if gold and any(token < 0 or token >= logits.shape[-1] for token in target):
+            sys.exit("标准答案 token 超出模型词表")
         if temperature:
             if generator is None:
                 # 每道题独立随机流，不推进全局 RNG。
@@ -128,6 +148,11 @@ class LLaDABackend:
         names = self.adapter.target_module_names()
         parameters = {name: self.model.get_submodule(name).weight for name in names}
         values = {name: weights[name].to(parameter.device) for name, parameter in parameters.items()}
+        if set(weights) != set(names) or any(
+            values[name].shape != parameter.shape or values[name].dtype != parameter.dtype
+            or not torch.isfinite(values[name]).all() for name, parameter in parameters.items()
+        ):
+            sys.exit("评价权重的层名、形状、精度或有限性不符合原模型")
         loaded = False
         try:
             with torch.no_grad():
