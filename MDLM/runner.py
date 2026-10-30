@@ -8,6 +8,7 @@ import sys
 
 import torch
 from safetensors.torch import load_file, save_file
+from tqdm.auto import tqdm
 
 from MDLM.merge import AcceptanceConfig, WeightMerge, development_edits, select_merged_candidate
 from MDLM.optimize import (CandidateModel, KeepTrainingExample, ResidualOptimizationConfig,
@@ -146,9 +147,10 @@ def _run_dataset(choices, output, report, *, sequential=None, dataset_override=N
                      for name in adapter.target_module_names()}
         dev_keeps = reference_examples(model, adapter, prepared["development"])
         train_keeps = reference_examples(model, adapter, prepared["training"]) if optimization.beta > 0 else []
-        for index, (case_id, group) in enumerate(groups.items()):
+        for index, (case_id, group) in enumerate(tqdm(
+                groups.items(), total=len(groups), desc="Editing", unit="case",
+                disable=not sys.stderr.isatty())):
             report["current_case_id"] = case_id
-            print(f"[round {index + 1}/{len(groups)}] {case_id}", flush=True)
             # 文档 3.1（未编号）：theta_b 为当前模型；快照用于本轮恢复。
             baseline = adapter.snapshot_target_weights(model)
             round_complete = False

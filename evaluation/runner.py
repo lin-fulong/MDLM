@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import platform
 import sys
+from tqdm.auto import tqdm
 
 from util.io import choose_run_id, config_digest, project_path, read_config, write_json
 from .artifacts import file_digest, model_settings, read_evaluation_data, read_run
@@ -106,7 +107,7 @@ def _evaluate(config, output, identifier, *, run_dir=None, device=None, model_pa
                 str(path.relative_to(Path(__file__).parent)): file_digest(path)
                 for path in sorted(Path(__file__).parent.rglob("*.py"))}
             write_json(output / "manifest.json", manifest)
-            for index, task in enumerate(tasks):
+            for task in tqdm(tasks, desc="Baseline evaluation", unit="task", disable=not sys.stderr.isatty()):
                 current = task.task_id
                 request, target = prepare_request(backend.adapter, task, seed, protocol)
                 prediction = generate(backend.model, backend.adapter, request, **generation,
@@ -119,12 +120,12 @@ def _evaluate(config, output, identifier, *, run_dir=None, device=None, model_pa
                                       "prediction": asdict(prediction), "target_ids": target,
                                       "request": request_data, "request_sha256": config_digest(request_data),
                                       "seed": request.seed})
-                if index % 100 == 0:
-                    print(f"[baseline {index + 1}/{len(tasks)}]", flush=True)
             current = None
             by_checkpoint = {}
             for task in tasks:
                 by_checkpoint.setdefault(task.checkpoint, []).append(task)
+            progress = tqdm(total=len(tasks), desc="Post-edit evaluation", unit="task", disable=not sys.stderr.isatty())
+            resources.callback(progress.close)
             for checkpoint, selected in by_checkpoint.items():
                 if checkpoint is not None:
                     item = artifacts[str(checkpoint)]
@@ -133,7 +134,6 @@ def _evaluate(config, output, identifier, *, run_dir=None, device=None, model_pa
                         sys.exit("评价权重加载前产物已发生变化")
                 if checkpoint is not None:
                     backend.use_checkpoint(checkpoint)
-                print(f"[evaluate] {checkpoint or 'original (rejected)'}: {len(selected)} probes", flush=True)
                 for task in selected:
                     current = task.task_id
                     before, target, request = baseline.pop(task.task_id)
@@ -152,6 +152,7 @@ def _evaluate(config, output, identifier, *, run_dir=None, device=None, model_pa
                         "before": asdict(before), "after": asdict(after), "scores": scores})
                     # 只有逐题结果成功保存，才计入已完成数量。
                     summary.add(task, scores)
+                    progress.update(1)
                     current = None
         # 哈希只证明本次评价期间输入未变，不能证明与编辑当时版本相同。
         if file_digest(run_dir / "run_report.json") != report_hash or file_digest(bundle.metadata["source_path"]) != source_hash:
