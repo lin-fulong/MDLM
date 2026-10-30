@@ -5,6 +5,7 @@ from .base import BaseReader
 
 class ZSREReader(BaseReader):
     name = "zsre"
+    allowed_options = frozenset({"target_field"})
     question_fields = {"generalization": "rephrase"}
 
     def __init__(self, **kwargs):

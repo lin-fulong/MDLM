@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 import hashlib
 import json
+import sys
 from pathlib import Path
 import uuid
 
@@ -46,4 +47,6 @@ def choose_run_id(configured: str | None, override: str | None) -> str:
     """按命令行、配置、自动生成的优先级选取单层输出目录名。"""
     run_id = override or configured or (
         "edit_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
+    if not isinstance(run_id, str) or run_id in (".", "..") or any(c in run_id for c in ("/", "\\", ":")):
+        sys.exit("运行编号必须为单层目录名")
     return run_id

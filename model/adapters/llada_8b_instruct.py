@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import Any
 
 from model.base import ForwardCapture, KeepModelInput, MaskedEditInput, ModelAdapter
@@ -18,6 +19,10 @@ class LLaDA8BInstructAdapter(ModelAdapter):
     def __init__(self, tokenizer: Any, *, mask_token_id: int, target_layers: tuple[int, ...]):
         """固定 tokenizer、mask 标记及可编辑层；目标为独立的 ff_out 线性层。"""
         self.tokenizer = tokenizer
+        if not target_layers or len(set(target_layers)) != len(target_layers) or any(
+            type(layer) is not int or layer < 0 for layer in target_layers
+        ):
+            sys.exit("目标层必须为非空、不重复的非负层号")
         self.mask_token_id = mask_token_id
         self.target_layers = target_layers
 
@@ -57,8 +62,13 @@ class LLaDA8BInstructAdapter(ModelAdapter):
     def inspect_target_modules(self, model: Any) -> dict[str, dict[str, int | bool]]:
         """读取目标 FFN 输出线性层的实际维度。"""
         result: dict[str, dict[str, int | bool]] = {}
+        pointers = set()
         for name in self.target_module_names():
             module = model.get_submodule(name)
+            pointer = (str(module.weight.device), module.weight.untyped_storage().data_ptr())
+            if pointer in pointers or module.weight.shape != (module.out_features, module.in_features):
+                sys.exit("目标层共享权重或权重方向不符合独立线性层约定")
+            pointers.add(pointer)
             result[name] = {
                 "in_features": module.in_features,
                 "out_features": module.out_features,
@@ -88,6 +98,15 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         import torch
 
         device = model.get_input_embeddings().weight.device
+        if model.training:
+            sys.exit("MDLM 前向必须使用 eval 模式")
+        if any(len(item.attention_mask) != len(item.input_ids) or item.mask_positions != tuple(
+            p for p, token in enumerate(item.input_ids) if token == self.mask_token_id
+        ) for item in model_inputs):
+            sys.exit("模型输入的注意力长度或 mask 位置不一致")
+        limit = getattr(model.config, "max_sequence_length", None)
+        if limit is not None and any(len(item.input_ids) > limit for item in model_inputs):
+            sys.exit("模型输入超过上下文长度，不自动截断")
         return model(
             input_ids=torch.tensor([item.input_ids for item in model_inputs], dtype=torch.long, device=device),
             attention_mask=torch.tensor([item.attention_mask for item in model_inputs], dtype=torch.long, device=device),
@@ -103,10 +122,12 @@ class LLaDA8BInstructAdapter(ModelAdapter):
 
         names = tuple(descriptions)
         positions_by_request = tuple(positions for _, positions in requests)
-        with capture_inputs(model, names, positions_by_request) as (captured, _):
+        with capture_inputs(model, names, positions_by_request) as (captured, counts):
             # 同一模型后续要优化 R；no_grad 生成的 RoPE 缓存可安全用于反向传播。
             with torch.no_grad():
                 logits = self._forward(model, tuple(item for item, _ in requests))
+            if any(counts[name] != 1 for name in names):
+                sys.exit("取键和保持统计要求目标模块每次前向恰好调用一次")
             results = []
             for index, (model_input, positions) in enumerate(requests):
                 mask_logits = logits[index, list(model_input.mask_positions)].detach().clone()

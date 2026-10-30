@@ -6,9 +6,10 @@ import argparse
 from dataclasses import dataclass
 from itertools import islice
 import json
+import sys
 from pathlib import Path
 
-from data.readers.base import iter_records
+from data.readers.base import iter_records, validate_limit
 from data.readers.fever import FEVERReader
 from data.readers.ultraeditbench import UltraEditBenchReader
 from data.readers.wikibigedit import WikiBigEditReader
@@ -47,11 +48,17 @@ def load_dataset(config: dict, *, dataset_path_override=None) -> DatasetBundle:
     """
     name = config.get("dataset_reader", "native")
     limit, keep_limit = config.get("source_limit"), config.get("keep_limit")
+    validate_limit(limit)
+    validate_limit(keep_limit)
+    if keep_limit is not None and config.get("keep_path") is None:
+        sys.exit("keep_limit 需要同时指定 keep_path")
     path = (Path(dataset_path_override).resolve() if dataset_path_override is not None
             else project_path(config["dataset_path"]))
     keep_path = project_path(config["keep_path"]) if config.get("keep_path") is not None else None
     options = config.get("reader_options", {})
     options = dict(options)  # 路径展开不回写调用方的配置。
+    if name == "native" and options:
+        sys.exit("native 读取器不接受 reader_options")
     if options.get("subject_path") is not None:
         options["subject_path"] = str(project_path(options["subject_path"]))
     seed = config.get("seed", 2026)

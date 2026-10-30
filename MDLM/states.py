@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import math
+import random
+import sys
 from dataclasses import dataclass
 
 import torch
 
-from data.validation.alignment import align_edit_prompt
+from data.validation.alignment import align_edit_prompt, encode_answer
 from model.base import ForwardCapture, KeepModelInput, MaskedEditInput
 from util.io import config_digest
 from util.nethook import tensor_sha256
@@ -117,6 +119,8 @@ def _prepare_short_answer(adapter, case: dict, probe: dict) -> tuple[MaskedEditI
     alignment = align_edit_prompt(
         adapter.tokenizer, rendered, case["fact_core"]["subject"], probe["answer"]
     )
+    if adapter.mask_token_id in alignment.prompt_ids:
+        sys.exit("编辑提示不能预置 mask token")
     begin = len(alignment.prompt_ids)
     positions = tuple(range(begin, begin + len(alignment.answer_ids)))
     token_ids = alignment.prompt_ids + (adapter.mask_token_id,) * len(positions)
@@ -138,10 +142,9 @@ DEFAULT_SETTINGS = {"seed": 2026, "dev_fraction": 0.25, "test_fraction": 0.25,
 def encode_keep(adapter, prompt: str, answer: str) -> tuple[dict, list[int], list[int]]:
     """编码全 mask 短答案上下文，返回输入、KL 读出位置和 C 的激活捕获位置。"""
     rendered = adapter.render_prompt(prompt)
-    prompt_ids = list(adapter.tokenizer.encode(rendered, add_special_tokens=False))
-    full_ids = list(adapter.tokenizer.encode(rendered + answer, add_special_tokens=False))
+    prompt, _answer = encode_answer(adapter.tokenizer, rendered, answer, adapter.mask_token_id)
+    prompt_ids, answer_ids = list(prompt), list(_answer)
     begin = len(prompt_ids)
-    answer_ids = full_ids[begin:]
     # 公式（10）（16）（17）：KL 只读答案 mask；答案内容不进入模型输入。
     positions = list(range(begin, begin + len(answer_ids)))
     tokens = prompt_ids + [adapter.mask_token_id] * len(answer_ids)
@@ -154,6 +157,13 @@ def prepare_inputs(cases: list[dict], adapter, *, settings: dict | None = None,
     """从显式保持池或完整案例集准备输入；沿用原去重、划分和位置权重。"""
     policy = {**DEFAULT_SETTINGS, **(settings or {})}
     scale = policy["statistics_scale"]
+    dev, test = policy["dev_fraction"], policy["test_fraction"]
+    if not math.isfinite(scale) or scale <= 0:
+        sys.exit("statistics_scale 必须为有限正数")
+    if not (0 < dev < 1 and 0 <= test < 1 and dev + test < 1):
+        sys.exit("保持划分必须满足 dev>0、test>=0、dev+test<1")
+    if not cases:
+        sys.exit("没有可编辑案例")
 
     # 按 strip 后的题目摘要去重，保留首次出现的原始 prompt 和 answer。
     pool = {}
@@ -164,6 +174,8 @@ def prepare_inputs(cases: list[dict], adapter, *, settings: dict | None = None,
         pool.setdefault(key, {"prompt": probe["prompt"], "answer": probe["answer"]})
     ordered = sorted(pool, key=lambda key: config_digest({"seed": policy["seed"], "prompt": key}))
     count = len(ordered)
+    if count < 2:
+        sys.exit("至少需要两道不同的保持题，保证训练与开发保持集均非空")
     # 摘要排序不使用全局随机状态；计数沿用截断、至少一条开发题及一条训练题的规则。
     dev_count = min(count - 1, max(1, int(count * policy["dev_fraction"])))
     test_count = min(count - dev_count - 1, max(1, int(count * policy["test_fraction"]))) \
@@ -213,6 +225,10 @@ def sample_denoise(
 ) -> DenoiseTrace:
     """公式（1）的状态来源：自主采样并按置信度揭示现有答案 mask，不接收目标答案。"""
     mask_count = len(model_input.mask_positions)
+    if type(steps) is not int or not 1 <= steps <= mask_count:
+        sys.exit("MDLM 去噪步数必须为 1 到答案 token 数之间的整数")
+    if not math.isfinite(temperature) or temperature < 0:
+        sys.exit("采样温度必须为有限非负数")
 
     generator = None
     current_ids = list(model_input.input_ids)
@@ -235,6 +251,8 @@ def sample_denoise(
         logits[:, [token for token in blocked_ids if 0 <= token < logits.shape[-1]]] = -torch.inf
         # 当前采样约定（无独立公式编号）：屏蔽特殊 token 后，T>0 按 softmax(logits/T) 抽样。
         probabilities = torch.softmax(logits / temperature if temperature else logits, dim=-1)
+        if not torch.isfinite(probabilities).all():
+            sys.exit("MDLM 采样概率无效，不能将数值故障当作预测结果")
         if temperature:
             if generator is None:
                 generator = torch.Generator(device=logits.device)
@@ -264,21 +282,37 @@ def sample_denoise(
 
 
 def collect_trajectories(model, adapter, cases: list[dict], *, seed=2026, steps=None,
-                         temperature=0.0) -> list[FactTrajectory]:
+                         temperature=0.0, replay_count=1) -> list[FactTrajectory]:
     """每事实采集一条全 mask 起始的轨迹；保持原逐事实随机流。"""
     trajectories = []
+    if type(replay_count) is not int or not 0 <= replay_count <= len(cases):
+        sys.exit("replay_count 必须在 0 与本轮事实数之间")
     for case in cases:
         probes = case["prompts"]["edit"]
+        if len(probes) != 1:
+            sys.exit(f"{case['case_id']}: 每个事实必须且只能有一个编辑探针")
         probe_id = probes[0]["probe_id"]
         initial, target = prepare_edit_input(adapter, case, probe_id)
         answer_positions = initial.mask_positions
+        # P0：相同基准输入应重放相同前向，避免不稳定轨迹进入监督和取键。
+        captured, repeated = capture_edit(model, adapter, initial), capture_edit(model, adapter, initial)
+        if not torch.allclose(captured.mask_logits, repeated.mask_logits, atol=1e-2, rtol=1e-3) or any(
+            not torch.allclose(value, repeated.module_inputs[name], atol=1e-2, rtol=1e-3)
+            for name, value in captured.module_inputs.items()
+        ):
+            sys.exit(f"{case['case_id']}: P0 前向无法重放")
 
         # 目标答案只附在监督侧；采样器仅接收 initial，不接收 target。
         selected_seed = fact_seed(seed, case["case_id"], probe_id)
-        trace = sample_denoise(model, adapter, initial, steps=steps or len(answer_positions),
+        trace = sample_denoise(model, adapter, initial, steps=len(answer_positions) if steps is None else steps,
                                        temperature=temperature, seed=selected_seed)
         trajectories.append(FactTrajectory.from_sample(target, selected_seed, trace))
-
+    for index in sorted(random.Random(seed).sample(range(len(trajectories)), replay_count)):
+        saved = trajectories[index]
+        replay = sample_denoise(model, adapter, saved.trace.pre_forward_inputs[0],
+                               steps=len(saved.trace.pre_forward_inputs), temperature=temperature, seed=saved.seed)
+        if replay != saved.trace:
+            sys.exit(f"{saved.case_id}: 去噪轨迹或 logits 无法重放")
     return trajectories
 
 
@@ -288,6 +322,35 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
     inputs = trace.pre_forward_inputs
     answer_positions = trajectory.answer_positions
     targets = trajectory.target_token_ids
+    if (not inputs or not answer_positions or len(answer_positions) != len(targets)
+            or answer_positions != tuple(sorted(set(answer_positions)))
+            or inputs[0].mask_positions != answer_positions
+            or len(trace.revealed_tokens) != len(inputs) or len(trace.mask_logit_sha256) != len(inputs)):
+        sys.exit(f"{trajectory.case_id}: 轨迹缺少完整答案窗口或前向记录")
+    initial = inputs[0]
+    if (not 0 <= initial.subject_last_position < min(answer_positions)
+            or len(initial.attention_mask) != len(initial.input_ids)
+            or any(value != 1 for value in initial.attention_mask)):
+        sys.exit(f"{trajectory.case_id}: 主体位置或注意力输入不符合轨迹约定")
+    # 保存的每次揭示必须确实产生下一状态；不允许重掩码或篡改提示。
+    for step, state in enumerate(inputs):
+        if state.mask_positions != tuple(p for p, token in enumerate(state.input_ids) if token == mask_token_id):
+            sys.exit(f"{trajectory.case_id}: mask 位置与输入不一致")
+        expected = list(state.input_ids)
+        revealed = trace.revealed_tokens[step]
+        positions = [p for p, _ in revealed]
+        if len(set(positions)) != len(positions) or any(
+            p not in state.mask_positions or token == mask_token_id for p, token in revealed
+        ):
+            sys.exit(f"{trajectory.case_id}: 非法揭示记录")
+        for p, token in revealed:
+            expected[p] = token
+        following = inputs[step + 1] if step + 1 < len(inputs) else trace.final_input
+        remaining = tuple(p for p in state.mask_positions if p not in positions)
+        if following != MaskedEditInput(tuple(expected), state.attention_mask, remaining, state.subject_last_position):
+            sys.exit(f"{trajectory.case_id}: 保存的状态转换与揭示记录不一致")
+    if trace.final_input.mask_positions or mask_token_id in trace.final_input.input_ids:
+        sys.exit(f"{trajectory.case_id}: 轨迹未完成去噪")
 
     compatible: list[dict] = []
     discarded: list[dict] = []
@@ -330,12 +393,16 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
 def build_supervision(trajectories: list[FactTrajectory], mask_token_id: int) -> tuple[list[dict], dict]:
     """公式（2）（3）：为事实、兼容状态、剩余 mask 三级平均准备位置权重。"""
     fact_count = len(trajectories)
+    if not fact_count:
+        sys.exit("监督事实集不能为空")
     fixed: list[dict] = []
     reports: list[dict] = []
     for trajectory in trajectories:
         states, report = classify_fact(trajectory, mask_token_id)
         answer_by_position = dict(zip(trajectory.answer_positions, trajectory.target_token_ids, strict=True))
         total_states = len(states)
+        if not total_states:
+            sys.exit(f"{trajectory.case_id}: 没有合法兼容状态")
         for state in states:
             positions = state["remaining_mask_positions"]
             # 公式（3）：w_i,t,j = 1 / (N·|T_i|·|M_i,t|)，不再对样本另取平均。

@@ -29,6 +29,13 @@ class AcceptanceConfig:
     equivalence_rtol: float = 0.02
     chunk_size: int = 256
 
+    def __post_init__(self):
+        if (not self.alphas or any(not math.isfinite(a) or a <= 0 for a in self.alphas)
+                or not math.isfinite(self.epsilon) or self.epsilon <= 0
+                or any(not math.isfinite(x) or x < 0 for x in (
+                    self.delta, self.tau_g, self.tau_u, self.equivalence_atol, self.equivalence_rtol))):
+            sys.exit("P5 的公共步长、门槛或等价容差无效")
+
 
 class WeightMerge:
     """保存本轮基准 W_b 和固定增量 ΔW，每次试步都从 W_b 重建。
@@ -41,9 +48,13 @@ class WeightMerge:
         """公式（13）：ΔW = R*Q；沿用分块乘法和原合并精度。"""
         self.model, self.chunk_size = model, chunk_size
         self.dtype = getattr(torch, compute_dtype)
+        if type(chunk_size) is not int or chunk_size < 1:
+            sys.exit("合并分块大小必须为正整数")
         self.baseline, self.increments, self.parameters = {}, {}, {}
         for name, q in factors.items():
             weight, r = model.get_submodule(name).weight, residuals[name]
+            if q.ndim != 2 or q.shape[1] != weight.shape[1] or r.shape != (weight.shape[0], q.shape[0]):
+                sys.exit("RQ 的形状必须与目标权重完全一致")
             self.parameters[name] = weight
             self.baseline[name] = weight.detach().clone()
             device = weight.device
@@ -81,6 +92,8 @@ def capture_outputs(adapter, model, model_input, positions, names):
         logits = adapter.forward_logits(model, model_input, positions).detach().clone()
         if not torch.isfinite(logits).all():
             return None
+        if any(not values for values in outputs.values()):
+            sys.exit("P5 的目标模块没有实际参与前向")
         return logits, outputs
 
 
@@ -168,6 +181,8 @@ def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float) -> f
 @torch.no_grad()
 def development_metrics(merger, adapter, edits, keeps, originals, epsilon, logits=None) -> dict:
     """计算 F_dev、完整词表 G_dev 和累计 U，可复用合并一致性前向的 logits。"""
+    if not edits or not keeps:
+        sys.exit("P5 必须同时提供非空开发编辑集和开发保持集，beta=0 也不能跳过保持验收")
     edit = math.fsum(float(edit_loss(adapter, merger.model, item) if logits is None
                           else edit_loss_from_logits(logits[index], item)) for index, item in enumerate(edits))
     # 公式（16）：复用完整词表 KL(theta_0 || theta_alpha)，开发保持始终执行。
@@ -193,6 +208,8 @@ def select_merged_candidate(merger: WeightMerge, adapter, factors: dict, residua
     try:
         merger.restore()
         report["baseline"] = development_metrics(merger, adapter, edits, keeps, originals, settings.epsilon)
+        if not all(math.isfinite(value) for value in report["baseline"].values()):
+            sys.exit("P5 基准指标非有限，无法进行有效验收")
         inputs = [(item.model_input, item.positions) for item in (*edits, *keeps)]
         for alpha in settings.alphas:
             row = {"alpha": alpha, "accepted": False}
@@ -227,5 +244,5 @@ def select_merged_candidate(merger: WeightMerge, adapter, factors: dict, residua
         report.update(status="rejected", baseline_restored=True, failure=None)
         return report
     finally:
-        if report["status"] == "running" and isinstance(sys.exc_info()[1], Exception):
+        if report["status"] == "running":
             merger.restore()

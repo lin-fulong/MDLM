@@ -33,7 +33,7 @@ def register_output_hooks(model: nn.Module, callbacks: dict) -> list:
         installed = True
         return handles
     finally:
-        if not installed and isinstance(sys.exc_info()[1], Exception):
+        if not installed:
             remove_hooks(handles)
 
 
@@ -93,7 +93,13 @@ def snapshot_weights(model: nn.Module, names) -> TargetWeightSnapshot:
 
 def restore_weights(model: nn.Module, snapshot: TargetWeightSnapshot, names) -> None:
     """将同一模型的目标层快照原位复制回参数，保留参数身份和设备。"""
+    parameters = {name: model.get_submodule(name).weight for name in names}
+    if set(snapshot) != set(parameters) or any(
+        snapshot[name].shape != weight.shape or snapshot[name].dtype != weight.dtype
+        or not torch.isfinite(snapshot[name]).all() for name, weight in parameters.items()
+    ):
+        sys.exit("恢复权重的层名、形状、精度或有限性不匹配")
+    values = {name: snapshot[name].to(weight.device) for name, weight in parameters.items()}
     with torch.no_grad():
-        for name in names:
-            weight = model.get_submodule(name).weight
-            weight.copy_(snapshot[name].to(weight.device))
+        for name, weight in parameters.items():
+            weight.copy_(values[name])

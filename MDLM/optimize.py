@@ -53,7 +53,7 @@ class CandidateModel:
             })
             installed = True
         finally:
-            if not installed and isinstance(sys.exc_info()[1], Exception):
+            if not installed:
                 self.close()
 
     def parameters(self) -> list[nn.Parameter]:
@@ -68,6 +68,8 @@ class CandidateModel:
     def set_residuals(self, residuals: dict[str, torch.Tensor]) -> None:
         """装入指定 R，供恢复最佳候选或合并前向使用。"""
         for name, branch in self.branches.items():
+            if residuals[name].shape != branch.r.shape:
+                sys.exit("残差形状与固定 Q 的事实维数不一致")
             branch.r.copy_(residuals[name].to(branch.r.device))
 
     def close(self) -> None:
@@ -193,14 +195,21 @@ def optimize_residuals(candidate: CandidateModel, adapter: ModelAdapter, edits: 
                        keeps: list[KeepTrainingExample], settings: ResidualOptimizationConfig) -> OptimizationResult:
     """从 R=0 开始联合优化，在预定检查点中选择有限、非零且优于 J(0) 的最佳 R。"""
     torch.manual_seed(settings.seed)
+    if not edits or (settings.beta > 0 and not keeps):
+        sys.exit("残差优化需要非空编辑监督；beta>0 时还需要保持训练集")
     optimizer = torch.optim.Adam(candidate.parameters(), lr=settings.learning_rate,
                                  betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
     baseline = evaluate_objective(candidate, adapter, edits, keeps, settings)
+    if not all(math.isfinite(value) for value in baseline.values()):
+        sys.exit("残差优化基准目标非有限")
     report = {"baseline": baseline, "history": [{"step": 0, "loss": baseline}], "selected_step": None}
     best_residuals, best_total = None, math.inf
     for step in range(1, settings.max_steps + 1):
         optimizer.zero_grad(set_to_none=True)
         accumulate_data_gradients(candidate, adapter, edits, keeps, settings)
+        if any(parameter.grad is None or not torch.isfinite(parameter.grad).all()
+               for parameter in candidate.parameters()):
+            sys.exit("残差梯度缺失或非有限，终止本轮优化")
         optimizer.step()
         if step in settings.checkpoints:
             loss = evaluate_objective(candidate, adapter, edits, keeps, settings)
