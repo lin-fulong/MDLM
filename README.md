@@ -94,7 +94,7 @@ python -m data.dataset data/datasets/cases.jsonl /tmp/edit_cases.jsonl --case-id
 
 通常直接启动 `main.py` 即可自动读取和转换，无需先生成转换文件。
 
-接入外部数据时，在主配置中选择对应的 `datasets/*.json`；具体字段、限量、独立保持来源和 FEVER 主体标注见[可选数据读取器](docs/配置参数说明.md#可选数据读取器)。默认原生配置保持不变；数据集 JSON/JSONL 原文件只读。外部示例配置有显式读取上限，`max_cases` 只限制编辑数量。改写、persona 和多跳问题仅保留，不提前实现评估。
+接入外部数据时，在主配置中选择对应的 `datasets/*.json`；具体字段、限量、独立保持来源和 FEVER 主体标注见[可选数据读取器](docs/配置参数说明.md#可选数据读取器)。默认原生配置保持不变；数据集 JSON/JSONL 原文件只读。外部示例配置有显式读取上限，`max_cases` 只限制编辑数量。改写、persona 和多跳问题由独立评估入口使用。
 
 `MDLM/` 保留五个核心文件。算法决定捕获哪些层和位置，model 提供模型操作，util 只提供通用机制；model/data/util 均不反向依赖 MDLM。
 
@@ -123,6 +123,8 @@ adapter, model = load_final_model("runs/<run_id>/final_model", device_map="cuda:
 ```
 
 ## 独立 UltraEdit 评估
+
+UltraEdit 评价资料集中在 [docs/UltraEdit评价](docs/UltraEdit评价/)：[原版指标计算逻辑](docs/UltraEdit评价/原版UltraEdit评估指标计算逻辑.md) 解释正确答案前缀与逐题评分；[当前 MDLM 评价实现](docs/UltraEdit评价/MDLM接入后UltraEdit评估指标计算逻辑.md) 说明自主去噪评分；[标准答案回填评价方案](docs/UltraEdit评价/MDLM置信度顺序标准答案回填评价方案.md) 是尚未实现的新协议设计；[evaluation 文件职责](docs/UltraEdit评价/evaluation文件功能说明.md) 说明评价模块各文件的功能边界。
 
 完成编辑后，在 WSL 的 `mdlm` 环境中执行（将目录名替换为实际运行目录）：
 
