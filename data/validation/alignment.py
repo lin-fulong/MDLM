@@ -40,7 +40,7 @@ def encode_answer(tokenizer, rendered_prompt, answer, mask_token_id=None):
 def align_edit_prompt(tokenizer: Any, rendered_prompt: str, subject: str, answer: str) -> TokenAlignment:
     """按源数据给定的主体和稳定答案边界，构造监督 token 的位置。"""
     if not isinstance(subject, str) or not subject.strip():
-        sys.exit("缺少有效编辑主体；FEVER 可通过 subject_path 提供标注")
+        sys.exit("缺少有效编辑主体，请在案例 fact_core.subject 中提供")
     start = rendered_prompt.find(subject)
     if start < 0 or rendered_prompt.find(subject, start + 1) >= 0:
         sys.exit("编辑主体必须在模板化问题中唯一出现，不能猜测主体位置")

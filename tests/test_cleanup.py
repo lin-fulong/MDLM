@@ -41,7 +41,7 @@ def committed_module(path):
 
 class OffsetTokenizer(ByteTokenizer):
     def __call__(self, text, *, return_offsets_mapping=False, **kwargs):
-        # 本测试只使用 ASCII；实际分词边界由现有真实数据入口测试单独检查。
+        # ASCII 偏移用于轻量回归，真实 tokenizer 的边界需在实际模型环境核验。
         result = {"input_ids": self.encode(text)}
         if return_offsets_mapping:
             result["offset_mapping"] = [(i, i + 1) for i in range(len(text))]
@@ -191,7 +191,7 @@ class AlgorithmRegressionTests(unittest.TestCase):
         self.assertFalse(layer._forward_hooks)
 
     def test_edit_runner_and_evaluation_end_to_end(self):
-        from MDLM import runner
+        import main
         from evaluation import inference
         from evaluation.runner import run_evaluation
 
@@ -204,14 +204,18 @@ class AlgorithmRegressionTests(unittest.TestCase):
                 source = root / "cases.json"
                 write_json(source, cases)
                 config = root / "config.json"
-                write_json(config, {"dataset_path": str(source), "model_path": str(root / "base"),
+                write_json(config, {"dataset_config": str(ROOT / "configs/datasets/cases.json"),
+                    "editor_config": str(ROOT / "configs/editors/mdlm.json"),
+                    "model_config": str(ROOT / "configs/models/llada_8b_instruct.json"),
+                    "dataset_path": str(source), "model_path": str(root / "base"),
                     "target_layers": [0], "torch_dtype": "float32", "mode": mode,
                     "execution": {"backend": "resident", "device": "cpu"}, "output_root": str(root / "runs"),
                     "ridge": 0.01, "rho": 0.001, "optimization_steps": 4, "selection_steps": [1, 4],
                     "learning_rate": 0.1, "tau_u": 1e14, "tau_g": 10})
                 adapter.load_model = Mock(return_value=model)
                 with patch("MDLM.runner.get_adapter", return_value=adapter), redirect_stdout(io.StringIO()):
-                    report = runner.run_dataset(config, run_id_override="edit")
+                    main.main(["--config", str(config), "--run-id", "edit"])
+                report = read_json(root / "runs/edit/run_report.json")
                 self.assertEqual(report["status"], "complete")
                 self.assertEqual(report["case_count"], 2)
                 self.assertEqual(report["accepted_count"], 2)

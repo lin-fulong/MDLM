@@ -16,18 +16,14 @@ from unittest.mock import Mock, patch
 import torch
 from safetensors.torch import save_file
 
-from evaluation.artifacts import file_digest, read_evaluation_data, read_run
+from evaluation.artifacts import file_digest, read_run
 from evaluation.framework import EvalTask, UltraEditFramework, get_framework
 from evaluation.inference import (GOLD_PROTOCOL, PROTOCOL, GenerationRequest, LLaDABackend,
                                   Prediction, generate, prepare_request)
 from evaluation.reporting import ScoreSummary, paired_scores, token_accuracy, write_record
 from evaluation.runner import run_evaluation
 from util.io import read_json, write_json
-from data.readers.base import iter_records
-from data.readers.fever import FEVERReader
-from data.readers.ultraeditbench import UltraEditBenchReader
-from data.readers.wikibigedit import WikiBigEditReader
-from data.readers.zsre import ZSREReader
+from data.dataset import load_cases, load_dataset
 
 
 TARGET = (65, 66, 67)  # A、B、C
@@ -542,55 +538,39 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(cli_summary["status"], "failed")
 
 
-class ReaderTests(unittest.TestCase):
-    def test_reader_semantic_errors_stop(self):
-        with self.assertRaises(SystemExit):
-            FEVERReader(options={"rephrase_policy": "single_fixd"})
-        with self.assertRaises(SystemExit):
-            ZSREReader(options={"target_filed": "alt"})
-        with tempfile.TemporaryDirectory(prefix="mdlm_duplicate_") as temporary:
-            path = Path(temporary) / "data.json"
-            row = {"case_id": 1, "subject": "Alice", "src": "Alice?", "ans": "A",
-                   "rephrase": "Alice again?", "loc": "Bob", "loc_ans": "B"}
-            write_json(path, [row, row])
-            with self.assertRaisesRegex(SystemExit, "重复案例"):
-                list(ZSREReader().iter_cases(path))
-
+class NativeDatasetTests(unittest.TestCase):
     def test_json_jsonl_bom_limits_and_text_preservation(self):
-        rows = [{"case_id": 1, "text": " 中文🙂 "}, {"case_id": 2, "text": "é"}]
-        with tempfile.TemporaryDirectory(prefix="mdlm_reader_") as temporary:
-            root = Path(temporary)
-            formats = [
+        rows = [{"case_id": "one", "text": " 中文🙂 "}, {"case_id": "two", "text": "é"}]
+        with tempfile.TemporaryDirectory(prefix="mdlm_cases_") as temporary:
+            for name, text, expected in (
                 ("array.json", json.dumps(rows, ensure_ascii=False), rows),
                 ("object.json", json.dumps(rows[0], ensure_ascii=False), rows[:1]),
-                ("lines.JSONL", "\r\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\r\n\r\n", rows),
-            ]
-            for name, text, expected in formats:
+                ("lines.JSONL", "\n\n".join(json.dumps(r, ensure_ascii=False) for r in rows), rows),
+            ):
                 for bom in ("", "\ufeff"):
                     with self.subTest(name=name, bom=bool(bom)):
-                        path = root / name
+                        path = Path(temporary) / name
                         path.write_text(bom + text, encoding="utf-8")
-                        self.assertEqual(list(iter_records(path)), list(enumerate(expected)))
-                        self.assertEqual(list(iter_records(path, limit=1)), [(0, expected[0])])
+                        before = path.read_bytes()
+                        self.assertEqual(load_cases(path), expected)
+                        self.assertEqual(load_cases(path, limit=1), expected[:1])
+                        self.assertEqual(path.read_bytes(), before)
 
-    def test_native_parsing_field_errors_and_generator_cleanup(self):
-        import ijson
-
-        with tempfile.TemporaryDirectory(prefix="mdlm_reader_") as temporary:
-            path = Path(temporary) / "data.json"
+    def test_native_parse_failures_and_limits(self):
+        with tempfile.TemporaryDirectory(prefix="mdlm_cases_") as temporary:
+            path = Path(temporary) / "cases.json"
             for text in ("{", ""):
                 path.write_text(text, encoding="utf-8")
-                with self.subTest(text=text), self.assertRaises(ijson.JSONError):
-                    list(iter_records(path))
+                with self.assertRaises(json.JSONDecodeError):
+                    load_cases(path)
             path = path.with_suffix(".jsonl")
-            path.write_text('{"id": 1}\nnot-json\n', encoding="utf-8")
-            self.assertEqual(list(iter_records(path, limit=1)), [(0, {"id": 1})])
-            with self.assertRaises(ValueError):
-                list(iter_records(path))
-            for limit in (-1, "one"):
+            path.write_text('{"case_id": "one"}\nnot-json\n', encoding="utf-8")
+            self.assertEqual(load_cases(path, limit=1), [{"case_id": "one"}])
+            with self.assertRaises(json.JSONDecodeError):
+                load_cases(path)
+            for limit in (-1, 0, True, "one"):
                 with self.assertRaises(SystemExit):
-                    list(iter_records(path, limit=limit))
-            path.write_text('{"id": 1}\n{"id": 2}\n', encoding="utf-8")
+                    load_cases(path, limit=limit)
             opened, original_open = [], Path.open
 
             def tracked_open(*args, **kwargs):
@@ -599,62 +579,60 @@ class ReaderTests(unittest.TestCase):
                 return stream
 
             with patch.object(Path, "open", tracked_open):
-                records = iter_records(path)
-                next(records)
-                records.close()
+                load_cases(path, limit=1)
+                with self.assertRaises(json.JSONDecodeError):
+                    load_cases(path)
             self.assertTrue(opened and all(stream.closed for stream in opened))
-            row = {"case_id": 1, "subject": "Alice", "src": "Alice?", "ans": " A ",
-                   "rephrase": "Where is Alice?", "loc": "Bob", "loc_ans": " B "}
-            del row["src"]
-            write_json(path.with_suffix(".json"), [row])
-            with self.assertRaises(KeyError):
-                list(ZSREReader().iter_cases(path.with_suffix(".json")))
 
-    def test_reader_fields_keep_probes_and_zsre_target_choice(self):
-        with tempfile.TemporaryDirectory(prefix="mdlm_reader_") as temporary:
-            root = Path(temporary)
-            row = {"case_id": "one", "subject": "Alice", "ans": " A ", "alt": " C ",
-                   "src": "Alice?", "prompt": "Alice?", "update": "Alice?",
-                   "rephrase": "Where is Alice?", "rephrase_prompt": "Where is Alice?",
-                   "loc": "Bob", "loc_ans": " B ", "personas": "As a historian, Alice?",
-                   "mhop": "Next?", "mhop_ans": " D "}
-            for reader in (ZSREReader(), UltraEditBenchReader(), WikiBigEditReader()):
-                path = root / f"{reader.name}.json"
-                write_json(path, [row])
-                case = list(reader.iter_cases(path))[0]
-                self.assertEqual(case["prompts"]["edit"][0]["answer"], " A ")
-                self.assertEqual(case["prompts"]["generalization"][0]["answer"], " A ")
-                expected_keep = "Bob?" if reader.name == "zsre" else "Bob"
-                keep = list(reader.iter_keep_probes(path))[0]
-                self.assertEqual((keep["prompt"], keep["answer"]), (expected_keep, " B "))
-                if reader.name == "wikibigedit":
-                    self.assertEqual(case["prompts"]["portability"][0]["answer"], " D ")
-                    self.assertEqual(case["prompts"]["persona"][0]["answer"], " A ")
-            path = root / "zsre.json"
-            changed = list(ZSREReader(options={"target_field": "alt"}).iter_cases(path))[0]
-            self.assertEqual(changed["prompts"]["edit"][0]["answer"], " C ")
-            self.assertEqual(changed["prompts"]["generalization"][0]["answer"], " C ")
+    def test_reviewed_cases_expand_after_source_limit(self):
+        row = {
+            "case_id": "source", "gold_ready": True, "dataset_group": "cases",
+            "review_status": "ready",
+            "edit_requests": [
+                {"request_id": f"source:{i}", "subject": "Alice", "relation": "job",
+                 "old_answer": "A", "experimental_new_answer": answer}
+                for i, answer in enumerate(("B", "C"))],
+            "edit_questions": [
+                {"probe_id": f"edit:{i}", "question": f"Alice {i}?", "expected_new_answer": answer}
+                for i, answer in enumerate(("B", "C"))],
+            "preservation_questions": [
+                {"probe_id": "keep", "question": "Bob?", "expected_unchanged_answer": "D"}],
+        }
+        with tempfile.TemporaryDirectory(prefix="mdlm_cases_") as temporary:
+            path = Path(temporary) / "cases.json"
+            write_json(path, [row, {**row, "gold_ready": False}])
+            cases = load_cases(path, limit=1)
+            self.assertEqual(load_cases(path), cases)
+            self.assertEqual([c["case_id"] for c in cases], ["source:0", "source:1"])
+            self.assertEqual([c["source_case_id"] for c in cases], ["source", "source"])
+            self.assertEqual([c["prompts"]["edit"][0]["answer"] for c in cases], ["B", "C"])
+            self.assertEqual([len(c["prompts"]["preservation"]) for c in cases], [1, 0])
+            self.assertEqual(cases[0]["fact_core"]["new_object"], "B")
 
-    def test_fever_selection_and_optional_mhop(self):
-        with tempfile.TemporaryDirectory(prefix="mdlm_reader_") as temporary:
-            path = Path(temporary) / "fever.json"
-            row = {"case_id": 7, "prompt": "Alice?", "ans": "old", "alt": "new",
-                   "equiv_prompt": ["Alice one?", "Alice two?", "Alice three?"],
-                   "unrel_prompt": "Bob?", "unrel_ans": "unchanged"}
-            write_json(path, [row])
-            first = list(FEVERReader(seed=2026).iter_cases(path))[0]
-            second = list(FEVERReader(seed=2026).iter_cases(path))[0]
-            self.assertEqual(first, second)
-            self.assertEqual(len(first["prompts"]["generalization"]), 1)
-            all_variants = list(FEVERReader(options={"rephrase_policy": "all"}).iter_cases(path))[0]
-            self.assertEqual([p["prompt"] for p in all_variants["prompts"]["generalization"]], row["equiv_prompt"])
-            self.assertTrue(all(p["answer"] == "new" for p in all_variants["prompts"]["generalization"]))
-            self.assertEqual(first["prompts"]["preservation"][0]["answer"], "unchanged")
-            wiki = {"subject": "Alice", "update": "Alice?", "ans": "A", "rephrase": "Again?",
-                    "loc": "Bob?", "loc_ans": "B", "personas": "As a historian, Alice?"}
-            for missing in (None, "", "null", " null "):
-                case = WikiBigEditReader().convert(path, 0, {**wiki, "mhop": missing, "mhop_ans": missing})
-                self.assertEqual(case["prompts"]["portability"], [])
+    def test_bundle_config_override_and_native_keep_pool(self):
+        cases = [{"case_id": "one", "prompts": {"preservation": [
+            {"probe_id": "k0", "prompt": "Bob?", "answer": "A"},
+            {"probe_id": "k1", "prompt": "Carol?", "answer": "B"}]}}]
+        with tempfile.TemporaryDirectory(prefix="mdlm_cases_") as temporary:
+            path = Path(temporary) / "cases.json"
+            write_json(path, cases)
+            config = {"dataset_path": "missing.json", "seed": 7}
+            original = dict(config)
+            bundle = load_dataset(config, dataset_path_override=path)
+            self.assertEqual(config, original)
+            self.assertEqual(bundle.cases, cases)
+            self.assertIsNone(bundle.keep_pool)
+            self.assertEqual(bundle.metadata["reader"], "native")
+            self.assertEqual(bundle.metadata["case_count"], 1)
+            bundle = load_dataset({**config, "keep_path": str(path), "keep_limit": 1},
+                                  dataset_path_override=path)
+            self.assertEqual(bundle.keep_pool, cases[0]["prompts"]["preservation"][:1])
+
+    def test_removed_readers_and_invalid_keep_options_stop(self):
+        for options in ({"dataset_reader": "removed"}, {"reader_options": {"unknown": "x"}},
+                        {"keep_limit": 1}, {"keep_path": "unused", "keep_limit": -1}):
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                load_dataset({"dataset_path": "missing.json", **options})
 
 
 class ByteTokenizer:
@@ -796,83 +774,7 @@ class IntegrationTests(unittest.TestCase):
                         self.assertEqual(tokenizer.chat_call, ([{"role": "user", "content": "问题 Q"}], False, True))
                         self.assertEqual(protected, {p: file_digest(p) for p in protected})
 
-    def test_existing_dataset_samples_and_task_mapping(self):
-        from data.dataset import load_dataset
 
-        checked = 0
-        framework = get_framework("ultraedit")
-        for reader in ("zsre", "fever", "wikibigedit", "ultraeditbench"):
-            config = read_json(ROOT / f"configs/datasets/{reader}.json")
-            source = ROOT / config["dataset_path"]
-            if not source.is_file():
-                continue
-            with self.subTest(reader=reader):
-                before = (source.stat().st_size, source.stat().st_mtime_ns)
-                bundle = load_dataset({**config, "source_limit": 2, "keep_path": None, "keep_limit": None})
-                report = {"source_dataset": str(source), "seed": 2026, "dataset_reading": bundle.metadata}
-                if reader == "fever":
-                    report["dataset_reading"]["reader_options"]["subject_path"] = "不存在的主体标注"
-                reread = read_evaluation_data(report)
-                self.assertEqual(bundle.cases, reread.cases)
-                rounds = [{"case_id": c["source_case_id"], "fact_ids": [c["case_id"]],
-                           "decision": "rejected", "checkpoint": None} for c in reread.cases]
-                tasks = framework.build_tasks(reread.cases, rounds, list(framework.metrics))
-                expected_per_case = 5 if reader == "wikibigedit" else 3
-                self.assertEqual(len(tasks), expected_per_case * 2)
-                by_id = {c["case_id"]: c for c in reread.cases}
-                for t in tasks:
-                    probe = by_id[t.case_id]["prompts"][t.group][0]
-                    self.assertEqual((t.prompt, t.answer), (probe["prompt"], probe["answer"]))
-                # 真实样本 + 临时模拟编辑产物，经实际入口运行；不加载真实大模型。
-                import evaluate
-                from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
-
-                with tempfile.TemporaryDirectory(prefix="mdlm_samples_") as temporary, patch.dict(sys.modules):
-                    from MDLM.runner import save_final_model
-
-                    root = Path(temporary)
-                    run, base = root / "run", root / "base"
-                    run.mkdir()
-                    base.mkdir()
-                    adapter = LLaDA8BInstructAdapter(ByteTokenizer(), mask_token_id=0, target_layers=(0,))
-                    runtime, edited = AdapterModel(), AdapterModel()
-                    runtime.config.max_sequence_length = 8192
-                    with torch.no_grad():
-                        edited.get_submodule(adapter.target_module_names()[0]).weight[1, 0] = 3
-                    checkpoint = save_final_model(edited, adapter, run / "case_0", model_path=base,
-                                                  torch_dtype="float32", device_map="cpu")
-                    selected_rounds = [
-                        {**r, "round_id": i, "decision": "accepted" if i == 0 else "rejected",
-                         "final_model_dir": str(checkpoint) if i == 0 else None}
-                        for i, r in enumerate(rounds)]
-                    write_json(run / "run_report.json", {
-                        **report, "editor": "mdlm", "status": "complete", "mode": "independent",
-                        "case_count": 2, "fact_count": 2, "rounds": selected_rounds, "original_model": str(base)})
-                    config_path = root / "eval.json"
-                    write_json(config_path, {"protocol": GOLD_PROTOCOL, "device": "cpu",
-                                             "generation": {"steps": 2, "temperature": 0},
-                                             "output_root": str(root / "out")})
-                    with patch("evaluation.inference.get_adapter", return_value=adapter), \
-                            patch.object(adapter, "load_model", return_value=runtime), redirect_stdout(io.StringIO()):
-                        evaluate.main(["--config", str(config_path), "--run-dir", str(run), "--eval-id", "samples"])
-                    result = read_json(root / "out/samples/summary.json")
-                    self.assertEqual(result["status"], "complete")
-                    self.assertEqual(result["completed_tasks"], len(tasks))
-                    self.assertEqual(result["coverage"], 1)
-                    if reader != "wikibigedit":
-                        self.assertEqual(result["metrics"]["all"]["person_score"]["status"], "not_applicable")
-                    predictions = [json.loads(line) for line in
-                                   (root / "out/samples/predictions.jsonl").read_text(encoding="utf-8").splitlines()]
-                    before_rows = [r for r in predictions if r["phase"] == "before"]
-                    self.assertEqual({r["task_id"] for r in before_rows}, {t.task_id for t in tasks})
-                    for row in before_rows:
-                        saved = row["prediction"]
-                        self.assertEqual(saved["correct"], [int(a == b) for a, b in
-                                                           zip(saved["token_ids"], row["target_ids"])])
-                self.assertEqual(before, (source.stat().st_size, source.stat().st_mtime_ns))
-                checked += 1
-        if not checked:
-            self.skipTest("当前环境没有本地 UltraEdit 数据文件")
 
 
 if __name__ == "__main__":

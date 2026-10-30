@@ -1,4 +1,4 @@
-"""统一数据集入口；保留原生 JSON/JSONL 读取和审核源格式转换接口。"""
+"""原生 cases 的 JSON/JSONL 读取与审核源格式转换。"""
 
 from __future__ import annotations
 
@@ -9,17 +9,7 @@ import json
 import sys
 from pathlib import Path
 
-from data.readers.base import iter_records, validate_limit
-from data.readers.fever import FEVERReader
-from data.readers.ultraeditbench import UltraEditBenchReader
-from data.readers.wikibigedit import WikiBigEditReader
-from data.readers.zsre import ZSREReader
 from util.io import project_path
-
-
-# native 复用下面已有的读取函数，保留其格式识别、编号和展开规则。
-READERS = {"native": None, "zsre": ZSREReader, "fever": FEVERReader,
-           "wikibigedit": WikiBigEditReader, "ultraeditbench": UltraEditBenchReader}
 
 
 @dataclass
@@ -31,13 +21,9 @@ class DatasetBundle:
     metadata: dict
 
 
-def _native_cases(path, limit):
-    if limit is None:
-        return load_cases(path)
-    rows = [row for _, row in iter_records(path, limit=limit)]
-    if rows and "edit_requests" in rows[0] and "edit_questions" in rows[0]:
-        return adapt_reviewed_cases(rows)
-    return rows
+def _validate_limit(limit):
+    if limit is not None and (type(limit) is not int or limit < 1):
+        sys.exit("读取上限必须为正整数或 null")
 
 
 def load_dataset(config: dict, *, dataset_path_override=None) -> DatasetBundle:
@@ -46,51 +32,40 @@ def load_dataset(config: dict, *, dataset_path_override=None) -> DatasetBundle:
     source_limit 限定源记录范围，独立于 runner 的 case_ids/max_cases。
     未提供 keep_path 时返回 None，让原算法沿用案例内的保持题来源。
     """
-    name = config.get("dataset_reader", "native")
+    if config.get("dataset_reader", "native") != "native" or config.get("reader_options"):
+        sys.exit("当前仅支持原生 cases 数据，不接受外部读取器或 reader_options")
     limit, keep_limit = config.get("source_limit"), config.get("keep_limit")
-    validate_limit(limit)
-    validate_limit(keep_limit)
+    _validate_limit(keep_limit)
     if keep_limit is not None and config.get("keep_path") is None:
         sys.exit("keep_limit 需要同时指定 keep_path")
     path = (Path(dataset_path_override).resolve() if dataset_path_override is not None
             else project_path(config["dataset_path"]))
     keep_path = project_path(config["keep_path"]) if config.get("keep_path") is not None else None
-    options = config.get("reader_options", {})
-    options = dict(options)  # 路径展开不回写调用方的配置。
-    if name == "native" and options:
-        sys.exit("native 读取器不接受 reader_options")
-    if options.get("subject_path") is not None:
-        options["subject_path"] = str(project_path(options["subject_path"]))
     seed = config.get("seed", 2026)
+    cases = load_cases(path, limit=limit)
     keep_pool = None
-    if name == "native":
-        cases = _native_cases(path, limit)
-        if keep_path is not None:
-            keep_pool = list(islice((p for case in load_cases(keep_path)
-                                    for p in case["prompts"].get("preservation", [])), keep_limit))
-    else:
-        reader = READERS[name](options=options, seed=seed)
-        cases = list(reader.iter_cases(path, limit=limit))
-        if keep_path is not None:
-            keep_pool = list(reader.iter_keep_probes(keep_path, limit=keep_limit))
+    if keep_path is not None:
+        keep_pool = list(islice((p for case in load_cases(keep_path)
+                                for p in case["prompts"].get("preservation", [])), keep_limit))
     return DatasetBundle(cases, keep_pool, {
-        "reader": name, "source_path": str(path), "source_limit": limit,
-        "case_count": len(cases), "reader_options": options, "seed": seed,
+        "reader": "native", "source_path": str(path), "source_limit": limit,
+        "case_count": len(cases), "reader_options": {}, "seed": seed,
         "keep_path": str(keep_path) if keep_path is not None else None,
         "keep_limit": keep_limit,
         "keep_probe_count": len(keep_pool) if keep_pool is not None else None,
     })
 
 
-def load_cases(path: str | Path) -> list[dict]:
+def load_cases(path: str | Path, *, limit=None) -> list[dict]:
     """读取 JSON/JSONL，返回原顺序的案例列表；审核源格式调用 adapt_reviewed_cases。"""
+    _validate_limit(limit)
     path = Path(path)
-    with path.open(encoding="utf-8") as stream:
-        if path.suffix == ".jsonl":
-            payload = [json.loads(line) for line in stream if line.strip()]
+    with path.open(encoding="utf-8-sig") as stream:
+        if path.suffix.lower() == ".jsonl":
+            cases = list(islice((json.loads(line) for line in stream if line.strip()), limit))
         else:
             payload = json.load(stream)
-    cases = payload if isinstance(payload, list) else [payload]
+            cases = (payload if isinstance(payload, list) else [payload])[:limit]
     # 首条决定整份数据的格式；保留后续公式（2）（3）的事实及公式（4）的 K 列顺序。
     if cases and "edit_requests" in cases[0] and "edit_questions" in cases[0]:
         return adapt_reviewed_cases(cases)
