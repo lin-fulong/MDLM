@@ -15,43 +15,30 @@ def validate_limit(value, name="limit"):
 
 
 def iter_records(path, *, limit=None):
-    """按原顺序读取对象、数组或 JSONL；limit 按源记录计，不检查未读取尾部。"""
+    """按原顺序读取对象、数组或 JSONL；限量按源记录计，解析错误直接向上传递。"""
     path = Path(path)
     validate_limit(limit)
-    if path.suffix.lower() == ".jsonl":
-        with path.open(encoding="utf-8-sig") as stream:
+    jsonl = path.suffix.lower() == ".jsonl"
+    with path.open("r" if jsonl else "rb", encoding="utf-8-sig" if jsonl else None) as stream:
+        if jsonl:
             records = (json.loads(line) for line in stream if line.strip())
-            try:
-                for index, row in enumerate(islice(records, limit)):
-                    if not isinstance(row, dict):
-                        raise ValueError(f"源记录 {index} 必须是对象")
-                    yield index, row
-            except ValueError as exc:
-                raise ValueError(f"{path}: {exc}") from exc
-        return
+        else:
+            # 仅外部 JSON 数组/对象需要 ijson；不包装依赖库和解析器的原始异常。
+            import ijson
 
-    # 按需导入：原生读取和 JSONL 不要求安装流式解析库。
-    try:
-        import ijson
-    except ImportError as exc:
-        raise ImportError("读取外部 JSON 数据需要 ijson，请安装 requirement.txt 中的依赖") from exc
-    with path.open("rb") as stream:
-        start = 3 if stream.read(3) == b"\xef\xbb\xbf" else 0
-        stream.seek(start)
-        first = stream.read(1)
-        while first and first in b" \r\n\t":
+            start = 3 if stream.read(3) == b"\xef\xbb\xbf" else 0
+            stream.seek(start)
             first = stream.read(1)
-        if first not in (b"[", b"{"):
-            raise ValueError(f"{path}: 顶层必须是 JSON 数组或对象")
-        stream.seek(start)
-        try:
+            while first and first in b" \r\n\t":
+                first = stream.read(1)
+            if first not in (b"[", b"{"):
+                raise ValueError(f"{path}: 顶层必须是 JSON 数组或对象")
+            stream.seek(start)
             records = ijson.items(stream, "item" if first == b"[" else "", use_float=True)
-            for index, row in enumerate(islice(records, limit)):
-                if not isinstance(row, dict):
-                    raise ValueError(f"源记录 {index} 必须是对象")
-                yield index, row
-        except (ValueError, ijson.JSONError) as exc:
-            raise ValueError(f"{path}: {exc}") from exc
+        for index, row in enumerate(islice(records, limit)):
+            if not isinstance(row, dict):
+                raise ValueError(f"{path}: 源记录 {index} 必须是对象")
+            yield index, row
 
 
 def required_text(row, field):
@@ -63,8 +50,8 @@ def required_text(row, field):
 
 def probe(case_id, role, prompt, answer, index=0):
     # 不 strip、不添加空格；分词和模板由下游模型输入构造负责。
-    required_text({"prompt": prompt, "answer": answer}, "prompt")
-    required_text({"prompt": prompt, "answer": answer}, "answer")
+    if any(not isinstance(value, str) or not value.strip() for value in (prompt, answer)):
+        raise ValueError("prompt 和 answer 必须为非空字符串")
     return {"probe_id": f"{case_id}:{role}:{index}", "prompt": prompt, "answer": answer,
             "role": role, "used_for_edit": role == "edit"}
 
@@ -112,32 +99,23 @@ class BaseReader:
                              "original_case_id": row.get("case_id"),
                              "subject_missing": subject is None}}
 
-    def convert(self, path, index, row):
-        raise NotImplementedError
-
     def iter_cases(self, path, *, limit=None):
         seen = set()
-        # 读取结束或生成器关闭时释放源文件，包括异常路径。
+        # 转换错误直接抛出，closing 仍保证源文件及时释放。
         with closing(iter_records(path, limit=limit)) as records:
             for index, row in records:
-                try:
-                    case = self.convert(path, index, row)
-                    case_id = case["case_id"]
-                    if case_id in seen:
-                        raise ValueError(f"duplicate case_id: {case_id}")
-                    seen.add(case_id)
-                except (ValueError, KeyError, TypeError) as exc:
-                    raise ValueError(f"{self.name}: {path}, source_index={index}: {exc}") from exc
+                case = self.convert(path, index, row)
+                case_id = case["case_id"]
+                if case_id in seen:
+                    raise ValueError(f"duplicate case_id: {case_id}")
+                seen.add(case_id)
                 yield case
 
     def iter_keep_probes(self, path, *, limit=None):
         """只读取无关问题，不要求编辑主体、改写或多跳字段存在。"""
         with closing(iter_records(path, limit=limit)) as records:
             for index, row in records:
-                try:
-                    yield probe(self.identity(path, index, row), "preservation", *self.keep_pair(row))
-                except (ValueError, KeyError, TypeError) as exc:
-                    raise ValueError(f"{self.name}: {path}, source_index={index}: {exc}") from exc
+                yield probe(self.identity(path, index, row), "preservation", *self.keep_pair(row))
 
 
 def validate_edit_subjects(cases):

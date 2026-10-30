@@ -8,6 +8,7 @@ from util.io import project_path, read_json
 
 
 def file_digest(path):
+    """分块计算文件 SHA-256，用于核查评价期间输入是否变化。"""
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -16,16 +17,17 @@ def file_digest(path):
 
 
 def read_run(run_dir):
+    """读取完整编辑报告，为每轮确定 after 权重并登记产物摘要。"""
     run_dir = Path(run_dir).resolve()
     report = read_json(run_dir / "run_report.json")
-    if report.get("editor") != "mdlm" or report.get("status") != "complete":
-        raise ValueError("只评估已正常完成的 MDLM 编辑运行")
     mode = report.get("mode")
-    if mode not in ("independent", "sequential") or not report.get("rounds"):
-        raise ValueError("编辑报告必须包含有效模式和非空 rounds")
+    if (report.get("editor") != "mdlm" or report.get("status") != "complete"
+            or mode not in ("independent", "sequential") or not report.get("rounds")):
+        raise ValueError("需要已完成的 MDLM 报告、有效编辑模式和非空 rounds")
     rounds, artifacts, sources, facts = [], {}, set(), set()
 
     def checkpoint(reference, expected):
+        """在当前运行目录定位产物，校验引用并读取元数据和摘要。"""
         # 允许整体移动运行目录，但不信任任意目录或缺失权重。
         if not reference or str(reference).replace("\\", "/").rstrip("/").split("/")[-1] != expected:
             raise ValueError(f"编辑报告缺少或错误引用 {expected}")
@@ -39,7 +41,7 @@ def read_run(run_dir):
         return path
 
     final = checkpoint(report.get("final_checkpoint_dir"), "final_model") if mode == "sequential" else None
-    # 连续模式统一回测最终模型；独立模式只为接受案例加载各自权重。
+    # after = θ_case（独立接受）、θ_0（独立拒绝）或 θ_final（连续模式）。
     for index, row in enumerate(report["rounds"]):
         source, ids, decision = row.get("case_id"), row.get("fact_ids"), row.get("decision")
         if (not isinstance(source, str) or not source or source in sources or row.get("round_id") != index
@@ -62,6 +64,7 @@ def read_run(run_dir):
 
 
 def read_evaluation_data(report, dataset_override=None):
+    """恢复编辑时的读取器、范围和选题种子，不重新读取编辑保持池。"""
     saved = report.get("dataset_reading", {})
     options = dict(saved.get("reader_options", {}))
     # 主体标注不决定评估问题和答案，评估不要求重建编辑主体。
@@ -77,18 +80,16 @@ def read_evaluation_data(report, dataset_override=None):
 
 
 def model_settings(report, artifacts, config, override=None):
+    """从产物恢复层号和加载精度；全部拒绝时由评价配置补充。"""
     metadata = [item["metadata"] for item in artifacts.values()]
-    for item in metadata:
-        if item.get("editor") != "mdlm" or item.get("model_path") != report["original_model"]:
-            raise ValueError("模型产物与编辑报告的原始模型不一致")
     if metadata:
         layers, dtype = metadata[0]["target_layers"], metadata[0]["torch_dtype"]
-        if any(item["target_layers"] != layers or item["torch_dtype"] != dtype for item in metadata):
-            raise ValueError("同一运行的模型产物具有不同目标层或精度")
+        expected = ("mdlm", report["original_model"], layers, dtype)
+        if any((item["editor"], item["model_path"], item["target_layers"], item["torch_dtype"]) != expected
+               for item in metadata):
+            raise ValueError("模型产物的来源、目标层或精度与编辑报告不一致")
     else:
-        # 全部拒绝的旧独立运行没有 model.json，必须显式提供原模型设置。
-        if "target_layers" not in config or "torch_dtype" not in config:
-            raise ValueError("全部拒绝的独立运行需在评估配置提供 target_layers 和 torch_dtype")
+        # 全部拒绝时没有 model.json，直接从评价配置读取必要设置。
         layers, dtype = config["target_layers"], config["torch_dtype"]
     return {"model_path": str(Path(override).resolve() if override else project_path(report["original_model"])),
             "target_layers": layers, "torch_dtype": dtype}

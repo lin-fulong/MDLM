@@ -1,0 +1,9 @@
+{
+  "framework": "ultraedit",
+  "protocol": "diffusion_gold_v1",
+  "run_dir": null,
+  "device": "cuda:0",
+  "groups": ["edit", "generalization", "preservation", "persona", "portability"],
+  "generation": {"steps": null, "temperature": 0.0},
+  "output_root": "evaluations"
+}

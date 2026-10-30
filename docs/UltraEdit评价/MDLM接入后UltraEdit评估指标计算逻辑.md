@@ -1,8 +1,8 @@
 # MDLM 接入后 UltraEdit 指标的数学逻辑与实现过程
 
-本说明对应当前 evaluation 包的 diffusion_short_v1 协议。先读已完成的 MDLM 编辑产物，为实际尝试过的事实建立五类问题；同一道题分别用原始模型和编辑后模型从全 mask 答案窗口生成；计算 token 正确率，再按题目或源案例汇总。整个评估独立于 MDLM 的编辑优化过程。
+本说明专门对应 evaluation 包保留的 diffusion_short_v1 自主去噪协议。新增的 diffusion_gold_v1 标准答案回填协议见下方方案文档。先读已完成的 MDLM 编辑产物，为实际尝试过的事实建立五类问题；同一道题分别用原始模型和编辑后模型从全 mask 答案窗口生成；计算 token 正确率，再按题目或源案例汇总。整个评估独立于 MDLM 的编辑优化过程。
 
-若要对照原版，参见 [原版 UltraEdit 评价指标计算逻辑](原版UltraEdit评估指标计算逻辑.md)；计划中的标准答案回填协议参见 [MDLM 置信度顺序标准答案回填评价方案](MDLM置信度顺序标准答案回填评价方案.md)。
+若要对照原版，参见 [原版 UltraEdit 评价指标计算逻辑](原版UltraEdit评估指标计算逻辑.md)；已实现的标准答案回填协议参见 [MDLM 置信度顺序标准答案回填评价方案](MDLM置信度顺序标准答案回填评价方案.md)。
 
 ## 1. 从编辑产物建立评估任务
 
@@ -24,7 +24,7 @@ $$
 | persona | person_score | 角色化问题对应的新事实答案 |
 | portability | mhop_score | 多跳问题自己的标准答案 |
 
-字段映射由 data/readers 负责，evaluation/frameworks/ultraedit.py 负责从标准化后的题组中建立任务。LS 的标准答案是无关题自己的 gold 答案，与编辑前后输出是否相同是两回事。
+字段映射由 data/readers 负责，evaluation/framework.py 负责从标准化后的题组中建立任务。LS 的标准答案是无关题自己的 gold 答案，与编辑前后输出是否相同是两回事。
 
 ## 2. 确定每道题评估前后的模型
 
@@ -58,7 +58,7 @@ $$
 
 其中 $m$ 是 mask token。参考答案只用于**决定窗口长度**和**事后评分**，没有作为正确答案前缀输入模型。这仍是“已知目标长度”的短答案评估，尚不是未知长度的自由生成。
 
-评估种子默认继承编辑报告；每道题由“评估种子 + 协议名 + 任务 ID”的 SHA-256 派生独立种子。before 与 after 对同一道题使用相同的请求和派生种子；若请求或目标 token 再次构造时不一致，评估会停止。
+评估种子默认继承编辑报告；每道题由“评估种子 + 协议名 + 任务 ID”的 SHA-256 派生独立种子。before 与 after 对同一道题使用相同的请求和派生种子；运行器只构造一次不可变请求和目标 token，并在 before/after 中复用，保证两侧输入定义一致。
 
 ## 4. 扩散模型如何逐步生成答案
 
@@ -121,7 +121,7 @@ $$
 
 例如源案例 A 只有一题，得 1；源案例 B 有三题，都得 0，则 probe_macro 为 $1/4=0.25$，case_macro 为 $(1+0)/2=0.5$。看到 ES 等名称时，必须一并查看采用了哪种口径和子集。
 
-没有预期题目的组标记 not_applicable，数值为 null。任务中断时，已完成题可能形成部分均值，但状态为 incomplete；只有 complete 的结果可当作完整实验汇总。summary.json 还记录总体 expected_tasks、completed_tasks 和 coverage；各指标也记录该组的预期与完成数量。
+存在至少一道可评价题时，没有预期题目的组标记 not_applicable，数值为 null；若所选组全部无题，入口报错，不创建全空评价报告。任务中断时，已完成题可能形成部分均值，但状态为 incomplete；需同时确认整个运行 status=complete 和对应指标 complete，才能当作完整实验汇总。summary.json 还记录总体 expected_tasks、completed_tasks 和 coverage；各指标也记录该组的预期与完成数量。
 
 ## 7. 额外诊断量的公式
 

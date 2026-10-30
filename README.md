@@ -124,7 +124,7 @@ adapter, model = load_final_model("runs/<run_id>/final_model", device_map="cuda:
 
 ## 独立 UltraEdit 评估
 
-UltraEdit 评价资料集中在 [docs/UltraEdit评价](docs/UltraEdit评价/)：[原版指标计算逻辑](docs/UltraEdit评价/原版UltraEdit评估指标计算逻辑.md) 解释正确答案前缀与逐题评分；[当前 MDLM 评价实现](docs/UltraEdit评价/MDLM接入后UltraEdit评估指标计算逻辑.md) 说明自主去噪评分；[标准答案回填评价方案](docs/UltraEdit评价/MDLM置信度顺序标准答案回填评价方案.md) 是尚未实现的新协议设计；[evaluation 文件职责](docs/UltraEdit评价/evaluation文件功能说明.md) 说明评价模块各文件的功能边界。
+UltraEdit 评价资料集中在 [docs/UltraEdit评价](docs/UltraEdit评价/)：[原版指标计算逻辑](docs/UltraEdit评价/原版UltraEdit评估指标计算逻辑.md) 解释正确答案前缀与逐题评分；[当前 MDLM 评价实现](docs/UltraEdit评价/MDLM接入后UltraEdit评估指标计算逻辑.md) 说明自主去噪评分；[标准答案回填评价方案](docs/UltraEdit评价/MDLM置信度顺序标准答案回填评价方案.md) 说明已实现的 diffusion_gold_v1；[evaluation 文件职责](docs/UltraEdit评价/evaluation文件功能说明.md) 说明评价模块各文件的功能边界。
 
 完成编辑后，在 WSL 的 `mdlm` 环境中执行（将目录名替换为实际运行目录）：
 
@@ -134,9 +134,9 @@ python -u evaluate.py --run-dir "runs/<run_id>" --config configs/evaluation/ultr
 
 这是独立评估入口，读取已经完成的编辑报告和最终目标层权重。`evaluation/` 不调用编辑、取键、残差优化或合并验收；现有 MDLM 算法文件、模型适配器和数据读取器保持原实现。评估使用独立模型实例，串行切换案例时先恢复原始权重。原始 JSON/JSONL 和编辑产物只读，输出放在 `evaluations/<eval_id>/`。
 
-当前仅实现 `ultraedit` 框架及 `diffusion_short_v1` 协议。对应指标为 edit→ES、generalization→GS、preservation→LS、persona→person_score、portability→mhop_score。它们均为逐题答案 token 正确比例；LS 相对于无关题标准答案计算。另记录整段 token 完全匹配率和编辑前后输出一致率。
+当前实现 `ultraedit` 框架，支持 `diffusion_short_v1`（自主去噪）和 `diffusion_gold_v1`（先预测、先评分、再回填）。旧配置 `configs/evaluation/ultraedit.json` 保持原协议；新协议使用 `configs/evaluation/ultraedit_gold.json`，也可修改配置的 `protocol` 切换。对应指标为 edit→ES、generalization→GS、preservation→LS、persona→person_score、portability→mhop_score。它们均为逐题答案 token 正确比例；LS 相对于无关题标准答案计算。另记录整段 token 完全匹配率和编辑前后输出一致率。
 
-推理输入采用模型原聊天模板和全 mask 答案窗口，参考答案仅决定窗口长度并独立用于评分，不输入答案前缀。每步预测剩余位置，按预测置信度揭示 token，并列时按位置排序。`generation.steps: null` 表示每步揭示一个 token；指定正整数时实际步数取 min(steps, 答案 token 数)，各步均分揭示数量，余数优先分配给前几步。`temperature: 0.0` 为贪心预测，正数使用任务专属随机流；特殊 token 全部屏蔽。基线与编辑后使用同一任务派生种子。该协议是有目标长度条件的扩散短答案诊断，不能将其数值视为原 UltraEdit 自回归 teacher forcing 的直接复现，也不用于长答案自由生成。
+两个协议均采用模型原聊天模板和全 mask 答案窗口。旧协议只用参考答案确定长度并事后评分；新协议在每轮选位后先保存预测并评分，再将本轮所选位置统一回填标准 token，供下一轮使用。新协议返回的 token_ids/text 是评分预测的拼接，correct 保存逐位置对错，trace 保存逐轮记录，不能将其视为自主生成答案。每步预测剩余位置，按预测置信度揭示 token，并列时按位置排序。`generation.steps: null` 表示每步揭示一个 token；指定正整数时实际步数取 min(steps, 答案 token 数)，各步均分揭示数量，余数优先分配给前几步。`temperature: 0.0` 为贪心预测，正数使用任务专属随机流；特殊 token 全部屏蔽。基线与编辑后使用同一任务派生种子。该协议是有目标长度条件的扩散短答案诊断，不能将其数值视为原 UltraEdit 自回归 teacher forcing 的直接复现，也不用于长答案自由生成。
 
 `summary.json` 同时提供 `case_macro`（先源案例内平均，再跨案例平均，主口径）和 `probe_macro`（逐题平均，对应原 UltraEdit 的汇总口径）。分组包括 all、accepted、rejected；缺少 persona/mhop 等题目时标为 not_applicable，分数为 null。独立拒绝案例的最终状态为原始模型，计入全部案例并复用基线预测；连续编辑统一使用 final_model 回测所有已尝试事实，包括当轮拒绝的事实。当前没有逐轮快照，因此不提供连续编辑逐轮曲线。
 
@@ -144,7 +144,7 @@ python -u evaluate.py --run-dir "runs/<run_id>" --config configs/evaluation/ultr
 
 | 参数 | 含义 |
 | --- | --- |
-| `framework` / `protocol` | 当前分别为 ultraedit / diffusion_short_v1 |
+| `framework` / `protocol` | ultraedit；协议选 diffusion_short_v1 或 diffusion_gold_v1 |
 | `run_dir` | 已完成编辑目录，可由 --run-dir 覆盖；命令行路径相对当前目录，配置资源路径相对项目根 |
 | `groups` | 选择要评估的问题组，默认全部五组 |
 | `device` | cpu、cuda 或 cuda:N，可由 --device 覆盖 |
@@ -156,11 +156,13 @@ python -u evaluate.py --run-dir "runs/<run_id>" --config configs/evaluation/ultr
 
 若独立运行全部被拒绝，原流程不保存 model.json；此时需要在评估配置中显式提供本次编辑原有的 target_layers 和 torch_dtype。也可通过 model_config 引用原模型配置（相对评估配置目录），并补充 torch_dtype。例如原编辑确实采用第 0 层和自动加载精度时，填写 `"target_layers": [0], "torch_dtype": "auto"`。存在已保存模型时，以产物 metadata 的层与精度为准。
 
+新协议运行示例：`python -u evaluate.py --run-dir "runs/<run_id>" --config configs/evaluation/ultraedit_gold.json`。两个配置默认 `temperature=0.0`、`steps=null`。新协议两侧各自重新按置信度选位，顺序可能不同；trace.positions 为从 0 开始的答案位置，trace 长度即实际轮数，每轮 positions 长度即选位数量。新协议的完全匹配和前后一致率均比较评分预测，不使用回填后的输入。
+
 每次运行生成 manifest.json、predictions.jsonl、summary.json。manifest 记录源数据/目标权重/评估代码摘要、任务摘要、配置及环境；predictions 保存逐题基线和配对预测、参考标签与分数；summary 保存覆盖率及错误信息。失败即停止并标为 failed，部分指标不可当作完整结果；不静默略过运行错误，不覆盖已有评估目录。无效产物在加载模型前报错。
 
 现有编辑产物没有源数据和原模型权重的编辑时摘要，因此 manifest 会明确注明这两项历史身份未验证，当前摘要只证明评估时版本。当前 LS 属于 benchmark preservation，未验证与编辑保持池独立，不应称为独立保持测试集。原始模型路径迁移必须指向同一份基础权重。
 
-以后可继承 `evaluation.types.EvaluationFramework`，实现 build_tasks、score，按需覆盖 aggregate，并在 `evaluation.registry.FRAMEWORKS` 登记。当前已实现的推理协议仅服务短答案；长答案任务和新的推理后端需要另行接入，不能通过修改协议名称就启用。
+以后可用普通类实现 metrics、build_tasks、score、aggregate，在 `evaluation.framework.FRAMEWORKS` 登记；无需继承基类。当前已实现的推理协议仅服务短答案；长答案任务和新的推理后端需要另行接入，不能通过修改协议名称就启用。
 
 ## 增加其他编辑算法
 

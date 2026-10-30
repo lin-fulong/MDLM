@@ -1,6 +1,6 @@
 # MDLM 标准答案回填评价方案：先预测、先评分，再回填
 
-**文档状态：设计方案，尚未实现。** 当前 evaluation 仍使用 diffusion_short_v1，将模型预测写入下一轮输入，完成全部预测后评分。本文描述拟新增的评价协议，供后续实现参考。
+**文档状态：已实现，协议名 diffusion_gold_v1。** 实现位于 evaluation/inference.py，配置为 configs/evaluation/ultraedit_gold.json。原 diffusion_short_v1 保留，仍将模型预测写入下一轮输入并在完成后评分。本文说明新协议的流程、数学定义和实现边界。
 
 ## 1. 先理解这套评价在做什么
 
@@ -210,7 +210,7 @@ $$
 
 分母是标准答案 token 数；比较的是同位置 token ID 是否相同，不是文字相似度或预测概率平均值。
 
-## 7. 伪代码：后续实现时对照这段流程
+## 7. 伪代码：与当前实现对应的流程
 
 ~~~text
 输入：模型、问题提示 prompt、标准 token 序列 target、轮数 K、温度 T、种子
@@ -256,7 +256,7 @@ target 始终只读。回填发生在评价进程的模型输入张量中，不�
 | person_score | persona | 角色化问题对应的新事实答案 |
 | mhop_score | portability | 多跳题自己的答案 |
 
-每道题都完整执行上述流程，得到 \(s_q\)。LS 也是标准答案 token 正确率，不是 KL 散度或前后预测一致率。缺少可选题组时报告无适用题，而非 0 分。
+每道题都完整执行上述流程，得到 \(s_q\)。LS 也是标准答案 token 正确率，不是 KL 散度或前后预测一致率。存在至少一道可评价题时，缺少的可选题组报告无适用题，而非 0 分；若所选题组全部无题，当前入口直接报错，不生成全空评价报告。
 
 ### 编辑前后分别评价
 
@@ -314,15 +314,15 @@ probe_macro 与原版 UltraEdit 一样先算单题比例、再对题目等权平
 
 长答案场景中，已回填内容还可能直接提示后续内容。因此，本协议可用于研究条件预测变化；研究短答案编辑是否影响实际长答案生成时，还需要配套的生成评价。
 
-## 10. 后续接入时的实现边界与核查要点
+## 10. 当前实现位置与核查要点
 
-新方案应作为独立评价协议接入，拥有独立名称和结果标识；保留现有 diffusion_short_v1。主实验默认值建议明确为 temperature=0、steps=null（即 \(K=L\)）。
+新协议以 diffusion_gold_v1 独立标识；现有 diffusion_short_v1 及其默认配置保持不变。新配置 ultraedit_gold.json 默认 temperature=0、steps=null（即 \(K=L\)）。命令：python -u evaluate.py --run-dir runs/<run_id> --config configs/evaluation/ultraedit_gold.json。
 
-当前生成请求没有携带标准答案，返回结果是最终生成序列。实现新协议时，需要为回填提供标准答案，并保存评分预测与逐轮轨迹，不能只修改“写入 token”的一行后继续返回回填序列评分。
+GenerationRequest 仍不携带标准答案。runner 仅为新协议向 generate 独立传入 target；generate 内部区分 state、scored_predictions 和 correct。Prediction.token_ids/text 保存评分预测，correct 保存逐位置对错，trace 保存逐轮选位及评分。最终回填 state 不返回用于评分。
 
-结果至少记录协议、题目标识、模型阶段、温度、种子、实际轮数，以及两侧每轮的选位、所选位置预测、置信度、标准 token 和对错。初始输入、配置和逐轮选位记录应足以重建每轮回填输入。
+manifest.json 记录协议、温度、种子及结果含义；predictions.jsonl 保存题目标识、before/paired 阶段、初始请求及两侧 Prediction。trace 每轮记录 step、positions、predicted_ids、confidence、target_ids、correct，其中 positions 是从 0 开始的答案区域下标。trace 长度是实际轮数，各轮 positions 长度是选位数量，结合初始请求可以重建回填输入。
 
-实现完成后，应核查以下性质：
+实现与测试需保持以下性质：
 
 - 每个答案位置恰好评价一次；未选中位置继续保持 mask。
 - 评分发生在回填之前；同轮所有评分使用同一次前向结果。

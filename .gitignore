@@ -26,7 +26,8 @@ data/datasets/*
 !data/datasets/.gitkeep
 
 # Tests
-tests/
+tests/*
+!tests/test_evaluation.py
 
 # Experiment runs and generated intermediate data
 runs/*

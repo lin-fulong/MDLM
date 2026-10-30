@@ -1,6 +1,7 @@
 """仅对已完成编辑的产物进行评估，完全独立于 MDLM 编辑运行器。"""
 
 from dataclasses import asdict
+from contextlib import ExitStack
 import hashlib
 import json
 from pathlib import Path
@@ -8,20 +9,22 @@ import platform
 
 from util.io import choose_run_id, config_digest, project_path, read_config, write_json
 from .artifacts import file_digest, model_settings, read_evaluation_data, read_run
-from .registry import get_framework
+from .framework import get_framework
 from .reporting import write_record
 
 
 def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, dataset_path=None, eval_id=None):
+    """读取产物 → 全部 before → 按权重分组 after → 评分和保存。"""
     # 模型依赖只在执行评估时导入；--help 不加载模型或导入 MDLM。
     import torch
     from util.gpu_runtime import execution_context
-    from .inference import LLaDABackend, PROTOCOL, validate_generation
+    from .inference import (GOLD_PROTOCOL, PROTOCOL, PROTOCOLS, LLaDABackend,
+                            generate, prepare_request, validate_generation)
 
     config = read_config(Path(config_file))
     framework = get_framework(config.get("framework", "ultraedit"))
-    if config.get("protocol", PROTOCOL) != PROTOCOL:
-        raise ValueError(f"当前只实现 {PROTOCOL}，自由生成/长答案协议尚未接入")
+    protocol = config.get("protocol", PROTOCOL)
+    description = PROTOCOLS[protocol]
     generation = validate_generation(config.get("generation", {}))
     if run_dir is None and not config.get("run_dir"):
         raise ValueError("请通过 --run-dir 或评估配置指定已完成的编辑目录")
@@ -37,8 +40,6 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
     tasks = framework.build_tasks(bundle.cases, rounds, groups)
     settings = model_settings(report, artifacts, config, override=model_path)
     device = device or config.get("device", "cuda:0")
-    if not isinstance(device, str) or not (device == "cpu" or device == "cuda" or device.startswith("cuda:")):
-        raise ValueError("评估 device 需为 cpu、cuda 或 cuda:N")
     identifier = choose_run_id(config.get("eval_id"), eval_id)
     output = project_path(config.get("output_root", "evaluations")) / identifier
     for protected in (run_dir, Path(settings["model_path"])):
@@ -49,13 +50,16 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
     accepted = sum(row["decision"] == "accepted" for row in rounds)
     # 运行口径只定义一次，运行清单和最终汇总使用相同统计。
     run_info = {
-        "framework": config.get("framework", "ultraedit"), "protocol": PROTOCOL,
+        "framework": config.get("framework", "ultraedit"), "protocol": protocol,
         "mode": report["mode"], "case_count": len(rounds), "accepted_count": accepted,
         "rejected_count": len(rounds) - accepted, "acceptance_rate": accepted / len(rounds),
     }
     manifest = {
         **run_info,
-        "protocol_description": "参考答案仅决定窗口长度；全 mask 自主去噪；不是原自回归 teacher forcing",
+        "protocol_description": description,
+        "prediction_semantics": ("各位置被选中时的评分预测；完全匹配及一致率不代表自由生成"
+                                 if protocol == GOLD_PROTOCOL else "自主去噪最终答案"),
+        "trace_positions": "zero_based_answer_offsets; step_count=len(trace); count=len(positions)",
         "generation": generation, "seed": seed, "device": device, "model": settings,
         "run_dir": str(run_dir), "run_report_sha256": report_hash, "artifacts": artifacts,
         "dataset": bundle.metadata, "source_sha256_at_evaluation": source_hash,
@@ -72,13 +76,14 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
         task_hash.update(b"\n")
     manifest["tasks_sha256"] = task_hash.hexdigest()
     write_json(output / "manifest.json", manifest)
-    backend, current, status, failure = None, None, "running", None
+    current, status, failure = None, "running", None
     baseline = {}
     try:
         # 驻留精度设置仅作用于独立评估进程，退出时由原公共上下文恢复。
         with execution_context({"backend": "resident", "device": device}), \
-                (output / "predictions.jsonl").open("x", encoding="utf-8") as stream:
+                (output / "predictions.jsonl").open("x", encoding="utf-8") as stream, ExitStack() as resources:
             backend = LLaDABackend(settings, device)
+            resources.callback(backend.close)
             manifest["tokenizer_class"] = type(backend.adapter.tokenizer).__name__
             manifest["mask_token_id"] = backend.adapter.mask_token_id
             manifest["model_config"] = backend.model.config.to_dict() if hasattr(backend.model.config, "to_dict") else None
@@ -88,17 +93,20 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
             write_json(output / "manifest.json", manifest)
             for index, task in enumerate(tasks):
                 current = task.task_id
-                request, target = backend.prepare(task, seed)
-                prediction = backend.predict(request, generation)
-                signature = config_digest(asdict(request))
-                baseline[task.task_id] = (prediction, target, signature)
+                request, target = prepare_request(backend.adapter, task, seed, protocol)
+                prediction = generate(backend.model, backend.adapter, request, **generation,
+                                      protocol=protocol, target=target if protocol == GOLD_PROTOCOL else None)
+                request_data = asdict(request)
+                baseline[task.task_id] = (prediction, target, request)
                 write_record(stream, {"phase": "before", "task_id": task.task_id,
                                       "case_id": task.case_id, "probe_id": task.probe_id,
                                       "prompt": task.prompt, "answer": task.answer,
                                       "prediction": asdict(prediction), "target_ids": target,
-                                      "request_sha256": signature, "seed": request.seed})
+                                      "request": request_data, "request_sha256": config_digest(request_data),
+                                      "seed": request.seed})
                 if index % 100 == 0:
                     print(f"[baseline {index + 1}/{len(tasks)}]", flush=True)
+            current = None
             by_checkpoint = {}
             for task in tasks:
                 by_checkpoint.setdefault(task.checkpoint, []).append(task)
@@ -110,23 +118,23 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
                 print(f"[evaluate] {checkpoint or 'original (rejected)'}: {len(selected)} probes", flush=True)
                 for task in selected:
                     current = task.task_id
-                    before, target, signature = baseline.pop(task.task_id)
+                    before, target, request = baseline.pop(task.task_id)
                     if checkpoint is None:
                         # 独立拒绝案例的最终模型就是 theta_0，复用完全相同的配对预测。
                         after = before
                     else:
-                        request, repeated_target = backend.prepare(task, seed)
-                        if config_digest(asdict(request)) != signature or repeated_target != target:
-                            raise ValueError("基线与编辑后的评估输入不一致")
-                        after = backend.predict(request, generation)
+                        # 复用不可变请求与标准标签，两侧各自从全 mask 开始预测。
+                        after = generate(backend.model, backend.adapter, request, **generation,
+                                         protocol=protocol, target=target if protocol == GOLD_PROTOCOL else None)
                     scores = framework.score(before, after, target)
-                    summary.add(task, scores)
                     write_record(stream, {"phase": "paired", "task_id": task.task_id,
                         "source_case_id": task.source_case_id, "case_id": task.case_id,
                         "probe_id": task.probe_id, "group": task.group, "decision": task.decision,
                         "checkpoint": str(checkpoint) if checkpoint else None,
                         "before": asdict(before), "after": asdict(after), "scores": scores})
-            current = None
+                    # 只有逐题结果成功保存，才计入已完成数量。
+                    summary.add(task, scores)
+                    current = None
             if file_digest(run_dir / "run_report.json") != report_hash or file_digest(bundle.metadata["source_path"]) != source_hash:
                 raise ValueError("评估期间编辑报告或源数据发生变化")
             for path, item in artifacts.items():
@@ -138,17 +146,11 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
         status, failure = "failed", str(exc)
         raise
     finally:
-        try:
-            if backend is not None:
-                backend.close()
-        except BaseException as exc:
-            status, failure = "failed", f"恢复评估模型失败: {exc}; 原错误: {failure}"
-            raise
-        finally:
-            result = {**run_info, "status": status, "failure": failure, "current_task_id": current,
-                      "eval_id": identifier, "output_dir": str(output),
-                      "expected_tasks": len(tasks), "completed_tasks": summary.completed,
-                      "error_count": int(failure is not None),
-                      "coverage": summary.completed / len(tasks), "metrics": summary.export()}
-            write_json(output / "summary.json", result)
+        # coverage = 已成功保存的配对题数 / 预期题数；失败状态始终随汇总保存。
+        result = {**run_info, "status": status, "failure": failure, "current_task_id": current,
+                  "eval_id": identifier, "output_dir": str(output),
+                  "expected_tasks": len(tasks), "completed_tasks": summary.completed,
+                  "error_count": int(failure is not None),
+                  "coverage": summary.completed / len(tasks), "metrics": summary.export()}
+        write_json(output / "summary.json", result)
     return result
