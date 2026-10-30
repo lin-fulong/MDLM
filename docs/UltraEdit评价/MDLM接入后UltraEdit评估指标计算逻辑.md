@@ -6,7 +6,7 @@
 
 ## 1. 从编辑产物建立评估任务
 
-入口是仓库根目录的 evaluate.py，默认配置为 configs/evaluation/ultraedit.json。运行器读取已完成且 status=complete 的 run_report.json，检查编辑模式、轮次、案例与事实 ID，并按原报告的数据读取器和读取参数重新读取数据。评估源文件、编辑报告和模型产物只读。
+入口是仓库根目录的 evaluate.py，默认配置为 configs/evaluation/mdlm_ultraedit.json；其中 `protocol` 用于选择自主去噪或标准答案回填协议。运行器读取已完成且 status=complete 的 run_report.json，检查编辑模式、轮次、案例与事实 ID，并按原报告的数据读取器和读取参数重新读取数据。评估源文件、编辑报告和模型产物只读。
 
 设编辑报告中实际尝试的事实集合为 $F$，配置所选问题组为 $G$。对每个事实 $f\in F$、问题组 $g\in G$ 以及该组的一道探针 $q$，建立一个任务：
 

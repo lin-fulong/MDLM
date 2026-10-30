@@ -1,6 +1,6 @@
 # MDLM 标准答案回填评价方案：先预测、先评分，再回填
 
-**文档状态：已实现，协议名 diffusion_gold_v1。** 实现位于 evaluation/inference.py，配置为 configs/evaluation/ultraedit_gold.json。原 diffusion_short_v1 保留，仍将模型预测写入下一轮输入并在完成后评分。本文说明新协议的流程、数学定义和实现边界。
+**文档状态：已实现，协议名 diffusion_gold_v1。** 实现位于 evaluation/inference.py，统一配置为 configs/evaluation/mdlm_ultraedit.json，通过 `protocol` 选择评价协议。diffusion_short_v1 仍将模型预测写入下一轮输入并在完成后评分。本文说明回填协议的流程、数学定义和实现边界。
 
 ## 1. 先理解这套评价在做什么
 
@@ -316,7 +316,7 @@ probe_macro 与原版 UltraEdit 一样先算单题比例、再对题目等权平
 
 ## 10. 当前实现位置与核查要点
 
-新协议以 diffusion_gold_v1 独立标识；现有 diffusion_short_v1 及其默认配置保持不变。新配置 ultraedit_gold.json 默认 temperature=0、steps=null（即 \(K=L\)）。命令：python -u evaluate.py --run-dir runs/<run_id> --config configs/evaluation/ultraedit_gold.json。
+回填协议以 diffusion_gold_v1 标识，自主去噪协议以 diffusion_short_v1 标识；二者共用 mdlm_ultraedit.json。将 `protocol` 设为所需协议即可切换，temperature 默认 0，steps 默认 null（即 \(K=L\)）。命令：python -u evaluate.py --run-dir runs/<run_id> --config configs/evaluation/mdlm_ultraedit.json。
 
 GenerationRequest 仍不携带标准答案。runner 仅为新协议向 generate 独立传入 target；generate 内部区分 state、scored_predictions 和 correct。Prediction.token_ids/text 保存评分预测，correct 保存逐位置对错，trace 保存逐轮选位及评分。最终回填 state 不返回用于评分。
 

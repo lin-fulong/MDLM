@@ -7,7 +7,8 @@ from pathlib import Path
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parent / "configs/evaluation/ultraedit.json")
+    parser.add_argument("--config", type=Path,
+                        default=Path(__file__).resolve().parent / "configs/evaluation/mdlm_ultraedit.json")
     parser.add_argument("--run-dir", type=Path, help="已完成编辑的 runs/<run_id> 目录")
     parser.add_argument("--device", help="cpu 或 cuda:0")
     parser.add_argument("--model-path", type=Path, help="原始模型迁移后的本地路径")
