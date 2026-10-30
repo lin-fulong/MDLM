@@ -17,12 +17,10 @@ class LLaDA8BInstructAdapter(ModelAdapter):
 
     def __init__(self, tokenizer: Any, *, mask_token_id: int, target_layers: tuple[int, ...]):
         """固定 tokenizer、mask 标记及可编辑层；目标为独立的 ff_out 线性层。"""
-        if not target_layers or len(set(target_layers)) != len(target_layers) or any(
-            type(layer) is not int or layer < 0 for layer in target_layers
-        ):
-            raise ValueError("target_layers must be unique nonnegative layer indices")
-        if type(mask_token_id) is not int or mask_token_id < 0:
-            raise ValueError("mask_token_id must be a nonnegative integer")
+        assert target_layers and len(set(target_layers)) == len(target_layers) and all(
+            type(layer) is int and layer >= 0 for layer in target_layers
+        ), "target_layers must be unique nonnegative layer indices"
+        assert type(mask_token_id) is int and mask_token_id >= 0, "mask_token_id must be a nonnegative integer"
         self.tokenizer = tokenizer
         self.mask_token_id = mask_token_id
         self.target_layers = target_layers
@@ -37,8 +35,7 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         model_path = str(Path(model_path))
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
-        if any(layer >= config.n_layers for layer in target_layers):
-            raise ValueError(f"target layer must be below {config.n_layers}")
+        assert all(layer < config.n_layers for layer in target_layers), f"target layer must be below {config.n_layers}"
         return cls(tokenizer, mask_token_id=config.mask_token_id, target_layers=target_layers)
 
     @staticmethod
@@ -66,24 +63,22 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         """确认独立的 FFN 输出线性层，返回 W 为 [d_out, d_in] 的实际维度。"""
         import torch
 
-        if getattr(model.config, "block_group_size", None) != 1:
-            raise ValueError("this LLaDA adapter requires block_group_size=1")
+        assert getattr(model.config, "block_group_size", None) == 1, "this LLaDA adapter requires block_group_size=1"
         modules = dict(model.named_modules())
         result: dict[str, dict[str, int | bool]] = {}
         seen_weights: set[tuple[str, int]] = set()
         for name in self.target_module_names():
             module = modules.get(name)
-            if module is None or not isinstance(module, torch.nn.Linear):
-                raise ValueError(f"target FFN output linear module absent: {name}")
+            assert module is not None and isinstance(module, torch.nn.Linear), (
+                f"target FFN output linear module absent: {name}")
             weight_key = (
                 str(module.weight.device),
                 module.weight.untyped_storage().data_ptr() if not module.weight.is_meta else id(module.weight),
             )
-            if weight_key in seen_weights:
-                raise ValueError(f"target FFN weight is shared: {name}")
+            assert weight_key not in seen_weights, f"target FFN weight is shared: {name}"
             seen_weights.add(weight_key)
-            if tuple(module.weight.shape) != (module.out_features, module.in_features):
-                raise ValueError(f"unexpected weight direction: {name}")
+            assert tuple(module.weight.shape) == (module.out_features, module.in_features), (
+                f"unexpected weight direction: {name}")
             result[name] = {
                 "in_features": module.in_features,
                 "out_features": module.out_features,
@@ -105,13 +100,11 @@ class LLaDA8BInstructAdapter(ModelAdapter):
         self, model: Any, requests: tuple, *, module_names=None, require_all_logits_finite=True,
     ) -> list[ForwardCapture]:
         """单条/等长批量共用前向；捕获哪些层和位置均由调用方指定，不做 padding。"""
-        if not requests:
-            raise ValueError("capture batch must be nonempty")
+        assert requests, "capture batch must be nonempty"
         descriptions = self.inspect_target_modules(model)
         if module_names is not None:
             descriptions = {name: descriptions[name] for name in module_names}
-        if len({len(item.input_ids) for item, _ in requests}) != 1:
-            raise ValueError("capture batch requires equal input lengths")
+        assert len({len(item.input_ids) for item, _ in requests}) == 1, "capture batch requires equal input lengths"
         for model_input, positions in requests:
             self._check_capture_input(model, model_input, positions)
         return self._forward_capture(model, requests, descriptions,
@@ -120,26 +113,23 @@ class LLaDA8BInstructAdapter(ModelAdapter):
     def _check_capture_input(self, model: Any, model_input: MaskedEditInput | KeepModelInput,
                              capture_positions: tuple[int, ...]) -> None:
         """核对模型输入和显式捕获位置；允许没有 mask 的上下文。"""
-        if getattr(model.config, "mask_token_id", None) != self.mask_token_id:
-            raise ValueError("model and adapter mask_token_id disagree")
-        if model.training:
-            raise ValueError("preservation capture requires model.eval() for reproducible outputs")
+        assert getattr(model.config, "mask_token_id", None) == self.mask_token_id, (
+            "model and adapter mask_token_id disagree")
+        assert not model.training, "preservation capture requires model.eval() for reproducible outputs"
         length = len(model_input.input_ids)
-        if not 0 < length <= model.config.max_sequence_length:
-            raise ValueError("preservation input length must be within model max_sequence_length")
-        if len(model_input.attention_mask) != length or any(value != 1 for value in model_input.attention_mask):
-            raise ValueError("preservation input requires an all-ones attention mask")
-        if not capture_positions or len(set(capture_positions)) != len(capture_positions) or any(
-            type(position) is not int or not 0 <= position < length for position in capture_positions
-        ):
-            raise ValueError("capture positions must be unique in-range token positions")
-        if len(set(model_input.mask_positions)) != len(model_input.mask_positions) or any(
-            type(position) is not int or not 0 <= position < length for position in model_input.mask_positions
-        ):
-            raise ValueError("preservation mask positions must be unique in-range token positions")
+        assert 0 < length <= model.config.max_sequence_length, (
+            "preservation input length must be within model max_sequence_length")
+        assert len(model_input.attention_mask) == length and all(value == 1 for value in model_input.attention_mask), (
+            "preservation input requires an all-ones attention mask")
+        assert capture_positions and len(set(capture_positions)) == len(capture_positions) and all(
+            type(position) is int and 0 <= position < length for position in capture_positions
+        ), "capture positions must be unique in-range token positions"
+        assert len(set(model_input.mask_positions)) == len(model_input.mask_positions) and all(
+            type(position) is int and 0 <= position < length for position in model_input.mask_positions
+        ), "preservation mask positions must be unique in-range token positions"
         actual_masks = {i for i, token in enumerate(model_input.input_ids) if token == self.mask_token_id}
-        if set(model_input.mask_positions) != actual_masks:
-            raise ValueError("preservation mask positions differ from actual mask tokens")
+        assert set(model_input.mask_positions) == actual_masks, (
+            "preservation mask positions differ from actual mask tokens")
 
     def _forward(self, model: Any, model_inputs: tuple[MaskedEditInput | KeepModelInput, ...]):
         """同位置读取完整词表 logits；梯度模式由调用方决定，不进行因果移位。"""
@@ -166,47 +156,43 @@ class LLaDA8BInstructAdapter(ModelAdapter):
             # 同一模型后续要优化 R；no_grad 生成的 RoPE 缓存可安全用于反向传播。
             with torch.no_grad():
                 logits = self._forward(model, tuple(item for item, _ in requests))
-            if logits.ndim != 3 or logits.shape[:2] != (len(requests), len(requests[0][0].input_ids)):
-                raise ValueError("unexpected LLaDA logits shape")
-            if require_all_logits_finite and not torch.isfinite(logits).all():
-                raise ValueError("nonfinite preservation logits")
-            if any(call_counts[name] != 1 for name in names):
-                raise ValueError(f"target FFN call counts are not one: {call_counts}")
+            assert logits.ndim == 3 and logits.shape[:2] == (len(requests), len(requests[0][0].input_ids)), (
+                "unexpected LLaDA logits shape")
+            assert not require_all_logits_finite or torch.isfinite(logits).all(), "nonfinite preservation logits"
+            assert all(call_counts[name] == 1 for name in names), f"target FFN call counts are not one: {call_counts}"
             results = []
             for index, (model_input, positions) in enumerate(requests):
                 mask_logits = logits[index, list(model_input.mask_positions)].detach().clone()
                 # 沿用原返回顺序：单条按实际调用顺序，批量按配置的目标层顺序。
                 module_inputs = {name: captured[name][index]
                                  for name in (captured if len(requests) == 1 else names)}
-                if not torch.isfinite(mask_logits).all():
-                    raise ValueError("nonfinite mask logits")
-                if any(value.shape != (len(positions), descriptions[name]["in_features"])
-                       for name, value in module_inputs.items()):
-                    raise ValueError("captured FFN input dimension differs from linear in_features")
-                if any(not torch.isfinite(value).all() for value in module_inputs.values()):
-                    raise ValueError("nonfinite target module input")
+                assert torch.isfinite(mask_logits).all(), "nonfinite mask logits"
+                assert all(value.shape == (len(positions), descriptions[name]["in_features"])
+                           for name, value in module_inputs.items()), (
+                    "captured FFN input dimension differs from linear in_features")
+                assert all(torch.isfinite(value).all() for value in module_inputs.values()), (
+                    "nonfinite target module input")
                 results.append(ForwardCapture(mask_logits, module_inputs))
             return results
 
     def forward_logits(
-        self, model: Any, model_input: MaskedEditInput | KeepModelInput, positions: tuple[int, ...]
+        self, model: Any, model_input: MaskedEditInput | KeepModelInput, positions: tuple[int, ...],
+        *, check_finite: bool = True,
     ):
         """公式（2）（10）～（12）（16）（17）：完整词表读出，保留 R 的跨层计算图。"""
         import torch
 
         length = len(model_input.input_ids)
-        if model.training or getattr(model.config, "mask_token_id", None) != self.mask_token_id:
-            raise ValueError("P4 requires eval mode and the frozen mask token identity")
-        if not 0 < length <= model.config.max_sequence_length or len(model_input.attention_mask) != length:
-            raise ValueError("P4 input length differs from the model contract")
-        if any(value != 1 for value in model_input.attention_mask) or not positions or any(
-            type(position) is not int or not 0 <= position < length for position in positions
-        ):
-            raise ValueError("P4 requires all-ones attention and in-range readout positions")
+        assert not model.training and getattr(model.config, "mask_token_id", None) == self.mask_token_id, (
+            "P4 requires eval mode and the frozen mask token identity")
+        assert 0 < length <= model.config.max_sequence_length and len(model_input.attention_mask) == length, (
+            "P4 input length differs from the model contract")
+        assert all(value == 1 for value in model_input.attention_mask) and positions and all(
+            type(position) is int and 0 <= position < length for position in positions
+        ), "P4 requires all-ones attention and in-range readout positions"
         logits = self._forward(model, (model_input,))
-        if logits.ndim != 3 or logits.shape[:2] != (1, length):
-            raise ValueError("unexpected P4 logits shape")
+        assert logits.ndim == 3 and logits.shape[:2] == (1, length), "unexpected P4 logits shape"
         selected = logits[0, list(positions)]
-        if not torch.isfinite(selected).all():
-            raise FloatingPointError("nonfinite P4 readout logits")
+        # P5 自行把非有限输出记为候选拒绝；普通编辑和评价仍立即终止。
+        assert not check_finite or torch.isfinite(selected).all(), "nonfinite P4 readout logits"
         return selected

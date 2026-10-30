@@ -15,8 +15,7 @@ class WikiBigEditReader(BaseReader):
         missing = lambda value: value is None or (isinstance(value, str) and value.strip() in ("", "null"))
         question_missing = missing(question)
         # 多跳题可以缺失，但问题和答案必须成对存在。
-        if question_missing != missing(target):
-            raise ValueError("mhop 和 mhop_ans 必须同时存在或同时缺失")
+        assert question_missing == missing(target), "mhop 和 mhop_ans 必须同时存在或同时缺失"
         if not question_missing:
             case["prompts"]["portability"] = [probe(case["case_id"], "portability", question, target)]
         case["metadata"].update(target_field="ans", tag=row.get("tag"))

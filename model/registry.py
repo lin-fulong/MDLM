@@ -5,8 +5,7 @@ from __future__ import annotations
 
 def get_adapter(model_name: str = "LLaDA-8B-Instruct", **kwargs):
     """集中选择模型和加载 tokenizer；默认沿用现有 LLaDA，无需新增配置字段。"""
-    if model_name == "LLaDA-8B-Instruct":
-        from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
+    assert model_name == "LLaDA-8B-Instruct", f"no model adapter for {model_name!r}"
+    from model.adapters.llada_8b_instruct import LLaDA8BInstructAdapter
 
-        return LLaDA8BInstructAdapter.from_local_tokenizer(**kwargs)
-    raise ValueError(f"no model adapter for {model_name!r}")
+    return LLaDA8BInstructAdapter.from_local_tokenizer(**kwargs)

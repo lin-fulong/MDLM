@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import sys
 
 import torch
 from torch import nn
@@ -26,13 +27,15 @@ def remove_hooks(handles) -> None:
 def register_output_hooks(model: nn.Module, callbacks: dict) -> list:
     """按给定顺序安装输出 hook；原样传递张量，由回调决定是否保留梯度。"""
     handles = []
+    installed = False
     try:
         for name, callback in callbacks.items():
             handles.append(model.get_submodule(name).register_forward_hook(callback))
+        installed = True
         return handles
-    except Exception:
-        remove_hooks(handles)
-        raise
+    finally:
+        if not installed and isinstance(sys.exc_info()[1], Exception):
+            remove_hooks(handles)
 
 
 @contextmanager
@@ -95,8 +98,7 @@ def snapshot_weights(model: nn.Module, names) -> TargetWeightSnapshot:
     weights, parameter_ids = {}, {}
     for name in names:
         weight = modules[name].weight
-        if weight.is_meta:
-            raise ValueError(f"cannot snapshot offloaded/meta weight: {name}")
+        assert not weight.is_meta, f"cannot snapshot offloaded/meta weight: {name}"
         weights[name] = weight.detach().to("cpu", copy=True)
         parameter_ids[name] = id(weight)
     return TargetWeightSnapshot(id(model), parameter_ids, weights)
@@ -104,19 +106,20 @@ def snapshot_weights(model: nn.Module, names) -> TargetWeightSnapshot:
 
 def restore_weights(model: nn.Module, snapshot: TargetWeightSnapshot, names) -> None:
     """先核对全部参数，再原位复制快照，保留参数身份和设备。"""
-    if snapshot.model_id != id(model):
-        raise ValueError("snapshot belongs to another model instance")
-    if set(snapshot.weights) != set(names) or set(snapshot.parameter_ids) != set(names):
-        raise ValueError("snapshot layer names differ from selected target layers")
+    assert snapshot.model_id == id(model), "snapshot belongs to another model instance"
+    assert (
+        set(snapshot.weights) == set(names)
+        and set(snapshot.parameter_ids) == set(names)
+    ), "snapshot layer names differ from selected target layers"
     modules = dict(model.named_modules())
     for name in names:
         weight, original = modules[name].weight, snapshot.weights[name]
-        if id(weight) != snapshot.parameter_ids[name]:
-            raise ValueError(f"target parameter was replaced after snapshot: {name}")
-        if weight.is_meta or not isinstance(original, torch.Tensor):
-            raise ValueError(f"invalid or offloaded snapshot: {name}")
-        if weight.shape != original.shape or weight.dtype != original.dtype:
-            raise ValueError(f"snapshot shape/dtype differs from model: {name}")
+        assert id(weight) == snapshot.parameter_ids[name], f"target parameter was replaced after snapshot: {name}"
+        assert not weight.is_meta and isinstance(original, torch.Tensor), f"invalid or offloaded snapshot: {name}"
+        assert (
+            weight.shape == original.shape
+            and weight.dtype == original.dtype
+        ), f"snapshot shape/dtype differs from model: {name}"
     with torch.no_grad():
         for name in names:
             weight = modules[name].weight

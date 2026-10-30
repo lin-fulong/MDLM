@@ -46,6 +46,10 @@ def choose_run_id(configured: str | None, override: str | None) -> str:
     """按命令行、配置、自动生成的优先级选取单层输出目录名。"""
     run_id = override or configured or (
         "edit_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
-    if not isinstance(run_id, str) or run_id in ("", ".", "..") or "/" in run_id or "\\" in run_id:
-        raise ValueError("run_id must be one directory name")
+    assert (
+        isinstance(run_id, str)
+        and run_id not in ('', '.', '..')
+        and '/' not in run_id
+        and '\\' not in run_id
+    ), "run_id must be one directory name"
     return run_id

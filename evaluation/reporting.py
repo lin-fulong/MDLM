@@ -6,8 +6,7 @@ import json
 
 def token_accuracy(predicted, target):
     """s = (1/L) Σ_i 1[ŷ_i = y_i]；要求非空、等长、同位置对齐。"""
-    if not target or len(predicted) != len(target):
-        raise ValueError("短答案 token accuracy 要求非空且等长的预测和标签")
+    assert target and len(predicted) == len(target), "短答案 token accuracy 要求非空且等长的预测和标签"
     return sum(a == b for a, b in zip(predicted, target)) / len(target)
 
 

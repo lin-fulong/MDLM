@@ -11,7 +11,7 @@ import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from safetensors.torch import save_file
@@ -222,36 +222,36 @@ class ProtocolTests(unittest.TestCase):
         gold_request, _ = prepare_request(self.adapter, task(), 2026, GOLD_PROTOCOL)
         self.assertNotEqual(request.seed, gold_request.seed)
         for answer in ("", "\x7f", "\x00"):
-            with self.subTest(answer=answer), self.assertRaises(ValueError):
+            with self.subTest(answer=answer), self.assertRaises(AssertionError):
                 prepare_request(self.adapter, replace(task(), answer=answer), 1)
         with patch.object(self.adapter.tokenizer, "encode", side_effect=[[81], [82, 65]]):
-            with self.assertRaisesRegex(ValueError, "边界"):
+            with self.assertRaisesRegex(AssertionError, "边界"):
                 prepare_request(self.adapter, task(), 1)
         with patch.object(self.adapter.tokenizer, "decode", return_value="wrong"):
-            with self.assertRaisesRegex(ValueError, "解码"):
+            with self.assertRaisesRegex(AssertionError, "解码"):
                 prepare_request(self.adapter, task(), 1)
 
     def test_invalid_generation_and_boundaries(self):
         for values in ({"steps": 0}, {"steps": True}, {"temperature": -1},
                        {"temperature": float("nan")}, {"temperature": float("inf")},
                        {"extra": 1}, None):
-            with self.subTest(values=values), self.assertRaises(ValueError):
+            with self.subTest(values=values), self.assertRaises(AssertionError):
                 validate_generation(values)
         for target in (None, (), (65,), (0, 66, 67), (999, 66, 67)):
-            with self.subTest(target=target), self.assertRaises(ValueError):
+            with self.subTest(target=target), self.assertRaises(AssertionError):
                 generate(self.model, self.adapter, self.request, protocol=GOLD_PROTOCOL, target=target)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(AssertionError):
             generate(self.model, self.adapter, self.request, target=TARGET)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(AssertionError):
             generate(self.model, self.adapter, self.request, protocol="unknown")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(AssertionError):
             generate(self.model, self.adapter, replace(self.request, answer_length=0))
         self.model.config.max_sequence_length = 4
-        with self.assertRaisesRegex(ValueError, "上下文"):
+        with self.assertRaisesRegex(AssertionError, "上下文"):
             self.gold()
         self.model.config.max_sequence_length = 256
         with patch.object(self.adapter, "forward_logits", return_value=torch.full((3, 128), -torch.inf)):
-            with self.assertRaisesRegex(ValueError, "普通 token"):
+            with self.assertRaisesRegex(AssertionError, "普通 token"):
                 self.gold()
 
     def test_old_protocol_matches_committed_implementation(self):
@@ -300,7 +300,8 @@ class ReportingTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    def run_fixture(self, mode, decisions, protocol, fail=False, write_failure=False, checkpoint_failure=False):
+    def run_fixture(self, mode, decisions, protocol, fail=False, write_failure=False,
+                    checkpoint_failure=False, close_failure=False):
         with tempfile.TemporaryDirectory(prefix="mdlm_eval_") as temporary:
             root = Path(temporary)
             run = root / "run"
@@ -344,25 +345,35 @@ class RunnerTests(unittest.TestCase):
                              [mode == "sequential" or d == "accepted" for d in decisions])
             adapter = Adapter()
             if fail:
-                adapter.forward_logits = lambda *args: (_ for _ in ()).throw(RuntimeError("模拟前向失败"))
+                adapter.forward_logits = Mock(side_effect=RuntimeError("模拟前向失败"))
             if checkpoint_failure:
                 adapter.target_module_names = lambda: ("other",)
 
+            failed_write = Mock(side_effect=OSError("模拟写入失败"))
+            failed_close = Mock(side_effect=RuntimeError("模拟恢复失败"))
+            original_close = LLaDABackend.close
+
             def persist(stream, record):
                 if write_failure and record["phase"] == "paired":
-                    raise OSError("模拟写入失败")
+                    failed_write()
                 write_record(stream, record)
 
+            def close(backend):
+                original_close(backend)
+                if close_failure:
+                    failed_close()
+
             with patch("evaluation.inference.get_adapter", return_value=adapter), \
-                    patch("evaluation.runner.write_record", side_effect=persist), redirect_stdout(io.StringIO()):
-                if fail or write_failure or checkpoint_failure:
-                    with self.assertRaises((RuntimeError, OSError, ValueError)):
+                    patch("evaluation.runner.write_record", side_effect=persist), \
+                    patch.object(LLaDABackend, "close", close), redirect_stdout(io.StringIO()):
+                if fail or write_failure or checkpoint_failure or close_failure:
+                    with self.assertRaises((RuntimeError, OSError, AssertionError)):
                         run_evaluation(config, run_dir=run, eval_id="test")
                     result = read_json(root / "out/test/summary.json")
                     self.assertEqual(result["status"], "failed")
                     self.assertEqual(result["error_count"], 1)
-                    self.assertEqual(result["completed_tasks"], 0)
-                    self.assertEqual(result["coverage"], 0)
+                    self.assertEqual(result["completed_tasks"], 5 * len(decisions) if close_failure else 0)
+                    self.assertEqual(result["coverage"], 1 if close_failure else 0)
                     if checkpoint_failure:
                         self.assertIsNone(result["current_task_id"])
                 else:
@@ -398,7 +409,7 @@ class RunnerTests(unittest.TestCase):
                             {"layer": torch.ones(1, 1, dtype=torch.float64)},
                             {"layer": torch.full((1, 1), float("nan"))}):
                 save_file(weights, str(path / "target_weights.safetensors"))
-                with self.assertRaises(ValueError):
+                with self.assertRaises(AssertionError):
                     backend.use_checkpoint(path)
                 self.assertEqual(float(adapter.model.layer.weight.detach()), 0)
             backend.close()
@@ -419,6 +430,15 @@ class RunnerTests(unittest.TestCase):
 
     def test_checkpoint_failure_does_not_blame_previous_probe(self):
         self.run_fixture("independent", ["accepted"], GOLD_PROTOCOL, checkpoint_failure=True)
+
+    def test_cleanup_failure_is_not_marked_complete(self):
+        self.run_fixture("independent", ["accepted"], GOLD_PROTOCOL, close_failure=True)
+
+    def test_handled_outer_exception_does_not_mark_success_failed(self):
+        try:
+            int("模拟外层异常")
+        except ValueError:
+            self.run_fixture("independent", ["accepted"], GOLD_PROTOCOL)
 
 
 class ReaderTests(unittest.TestCase):
@@ -446,7 +466,7 @@ class ReaderTests(unittest.TestCase):
             path = Path(temporary) / "data.json"
             for text in ("42", "[42]", "{", ""):
                 path.write_text(text, encoding="utf-8")
-                with self.subTest(text=text), self.assertRaises((ValueError, ijson.JSONError)):
+                with self.subTest(text=text), self.assertRaises((AssertionError, ijson.JSONError)):
                     list(iter_records(path))
             path = path.with_suffix(".jsonl")
             path.write_text('{"id": 1}\nnot-json\n', encoding="utf-8")
@@ -454,7 +474,7 @@ class ReaderTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 list(iter_records(path))
             for limit in (0, -1, True):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(AssertionError):
                     list(iter_records(path, limit=limit))
             path.write_text('{"id": 1}\n{"id": 2}\n', encoding="utf-8")
             opened, original_open = [], Path.open
@@ -472,7 +492,7 @@ class ReaderTests(unittest.TestCase):
             row = {"case_id": 1, "subject": "Alice", "src": "Alice?", "ans": " A ",
                    "rephrase": "Where is Alice?", "loc": "Bob", "loc_ans": " B "}
             write_json(path.with_suffix(".json"), [row, row])
-            with self.assertRaisesRegex(ValueError, "duplicate case_id"):
+            with self.assertRaisesRegex(AssertionError, "duplicate case_id"):
                 list(ZSREReader().iter_cases(path.with_suffix(".json")))
 
     def test_reader_fields_keep_probes_and_zsre_target_choice(self):
@@ -520,7 +540,7 @@ class ReaderTests(unittest.TestCase):
             for missing in (None, "", "null", " null "):
                 case = WikiBigEditReader().convert(path, 0, {**wiki, "mhop": missing, "mhop_ans": missing})
                 self.assertEqual(case["prompts"]["portability"], [])
-            with self.assertRaises(ValueError):
+            with self.assertRaises(AssertionError):
                 WikiBigEditReader().convert(path, 0, {**wiki, "mhop": "Next?", "mhop_ans": None})
 
 

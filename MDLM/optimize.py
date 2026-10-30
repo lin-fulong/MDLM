@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import math
+import sys
 
 import torch
 from torch import nn
@@ -42,6 +43,7 @@ class CandidateModel:
         model.eval()
         for parameter, _ in self.original_flags:
             parameter.requires_grad_(False)
+        installed = False
         try:
             for name in self.branches:
                 modules[name]._mdlm_candidate_owner = self
@@ -49,9 +51,10 @@ class CandidateModel:
                 name: (lambda module, inputs, output, branch=branch: branch(inputs[0], output))
                 for name, branch in self.branches.items()
             })
-        except Exception:
-            self.close()
-            raise
+            installed = True
+        finally:
+            if not installed and isinstance(sys.exc_info()[1], Exception):
+                self.close()
 
     def parameters(self) -> list[nn.Parameter]:
         """公式（10）：优化器只接收 R，Q 和基准参数保持固定。"""

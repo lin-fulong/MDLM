@@ -41,13 +41,12 @@ class Prediction:
 
 def validate_generation(config):
     """归一化轮数和温度；只接受正整数步数或 null、有限非负温度。"""
-    if not isinstance(config, dict) or set(config) - {"steps", "temperature"}:
-        raise ValueError("generation 只支持 steps 和 temperature")
+    assert isinstance(config, dict) and not set(config) - {"steps", "temperature"}, \
+        "generation 只支持 steps 和 temperature"
     steps, temperature = config.get("steps"), config.get("temperature", 0.0)
-    if steps is not None and (type(steps) is not int or steps < 1):
-        raise ValueError("steps 必须为正整数或 null")
-    if type(temperature) not in (int, float) or not math.isfinite(temperature) or temperature < 0:
-        raise ValueError("temperature 必须为有限非负数")
+    assert steps is None or (type(steps) is int and steps >= 1), "steps 必须为正整数或 null"
+    assert type(temperature) in (int, float) and math.isfinite(temperature) and temperature >= 0, \
+        "temperature 必须为有限非负数"
     return {"steps": steps, "temperature": temperature}
 
 
@@ -58,12 +57,12 @@ def prepare_request(adapter, task, seed, protocol=PROTOCOL):
     prompt = tuple(adapter.tokenizer.encode(rendered, add_special_tokens=False))
     full = tuple(adapter.tokenizer.encode(rendered + task.answer, add_special_tokens=False))
     target = full[len(prompt):]
-    if not prompt or full[:len(prompt)] != prompt or not target:
-        raise ValueError(f"{task.case_id}/{task.probe_id}: 无法建立稳定的答案 token 边界")
-    if adapter.mask_token_id in prompt or set(target) & (set(adapter.tokenizer.all_special_ids) | {adapter.mask_token_id}):
-        raise ValueError("问题含预置 mask 或参考答案含特殊 token")
-    if adapter.tokenizer.decode(target, skip_special_tokens=False, clean_up_tokenization_spaces=False) != task.answer:
-        raise ValueError("参考答案无法精确分词/解码")
+    assert prompt and full[:len(prompt)] == prompt and target, \
+        f"{task.case_id}/{task.probe_id}: 无法建立稳定的答案 token 边界"
+    assert adapter.mask_token_id not in prompt and not set(target) & (set(adapter.tokenizer.all_special_ids) | {adapter.mask_token_id}), \
+        "问题含预置 mask 或参考答案含特殊 token"
+    assert adapter.tokenizer.decode(target, skip_special_tokens=False, clean_up_tokenization_spaces=False) == task.answer, \
+        "参考答案无法精确分词/解码"
     derived = int.from_bytes(hashlib.sha256(f"{seed}:{protocol}:{task.task_id}".encode()).digest()[:8], "big") % (2**63)
     # 请求只含提示、长度和种子；标准答案由运行器按协议单独传递。
     return GenerationRequest(prompt, len(target), derived), target
@@ -73,25 +72,22 @@ def prepare_request(adapter, task, seed, protocol=PROTOCOL):
 def generate(model, adapter, request, *, steps=None, temperature=0.0, protocol=PROTOCOL, target=None):
     """从全 mask 窗口去噪；按协议写预测或先评分后回填，返回评分预测。"""
     validate_generation({"steps": steps, "temperature": temperature})
-    if protocol not in PROTOCOLS:
-        raise ValueError(f"未知评价协议: {protocol}")
+    assert protocol in PROTOCOLS, f"未知评价协议: {protocol}"
     gold = protocol == GOLD_PROTOCOL
     length = request.answer_length
-    if type(length) is not int or length < 1:
-        raise ValueError("答案窗口必须非空")
+    assert type(length) is int and length >= 1, "答案窗口必须非空"
     blocked = set(adapter.tokenizer.all_special_ids) | {adapter.mask_token_id}
     if gold:
         target = tuple(target) if target is not None else ()
-        if len(target) != length or any(type(v) is not int or v < 0 or v in blocked for v in target):
-            raise ValueError("回填协议要求与窗口等长的普通标准 token")
-    elif target is not None:
-        raise ValueError("自主去噪协议不接收标准答案")
+        assert len(target) == length and all(type(v) is int and v >= 0 and v not in blocked for v in target), \
+            "回填协议要求与窗口等长的普通标准 token"
+    else:
+        assert target is None, "自主去噪协议不接收标准答案"
     begin = len(request.prompt_ids)
     # K = L（steps=null），否则 K = min(steps, L)；state 初态为 [p, MASK × L]。
     steps = min(steps, length) if steps is not None else length
     state = list(request.prompt_ids) + [adapter.mask_token_id] * length
-    if len(state) > model.config.max_sequence_length:
-        raise ValueError("评估输入超过模型上下文长度；不自动截断")
+    assert len(state) <= model.config.max_sequence_length, "评估输入超过模型上下文长度；不自动截断"
     remaining = list(range(begin, len(state)))
     scored_predictions = [None] * length if gold else []
     correct, trace = [None] * length if gold else [], []
@@ -99,13 +95,11 @@ def generate(model, adapter, request, *, steps=None, temperature=0.0, protocol=P
     for step in range(steps):
         current = KeepModelInput(tuple(state), (1,) * len(state), tuple(remaining))
         logits = adapter.forward_logits(model, current, tuple(remaining)).to(dtype=torch.float32, copy=True)
-        if gold and step == 0 and any(v >= logits.shape[-1] for v in target):
-            raise ValueError("标准 token 超出模型词表")
+        assert not gold or step != 0 or all(v < logits.shape[-1] for v in target), "标准 token 超出模型词表"
         logits[:, [i for i in blocked if 0 <= i < logits.shape[-1]]] = -torch.inf
         # P = softmax(logits / T)；T=0 时用 softmax(logits) 计算置信度，预测取 argmax。
         probabilities = torch.softmax(logits / temperature if temperature else logits, dim=-1)
-        if not torch.isfinite(probabilities).all():
-            raise ValueError("没有可生成的普通 token，或生成概率非有限")
+        assert torch.isfinite(probabilities).all(), "没有可生成的普通 token，或生成概率非有限"
         if temperature:
             if generator is None:
                 # 每道题独立随机流，不推进全局 RNG。
@@ -160,14 +154,13 @@ class LLaDABackend:
             return
         weights = load_file(str(path / "target_weights.safetensors"))
         names = self.adapter.target_module_names()
-        if set(weights) != set(names):
-            raise ValueError("最终权重的目标层集合不匹配")
+        assert set(weights) == set(names), "最终权重的目标层集合不匹配"
         parameters = {name: self.model.get_submodule(name).weight for name in names}
         # 先验证全部权重，再统一复制，防止只写入一部分层。
         for name, parameter in parameters.items():
             value = weights[name]
-            if value.shape != parameter.shape or value.dtype != parameter.dtype or not torch.isfinite(value).all():
-                raise ValueError(f"最终权重形状、精度或数值非法: {name}")
+            assert value.shape == parameter.shape and value.dtype == parameter.dtype and torch.isfinite(value).all(), \
+                f"最终权重形状、精度或数值非法: {name}"
         with torch.no_grad():
             for name, parameter in parameters.items():
                 parameter.copy_(weights[name].to(parameter.device))

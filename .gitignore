@@ -28,6 +28,7 @@ data/datasets/*
 # Tests
 tests/*
 !tests/test_evaluation.py
+!tests/test_cleanup.py
 
 # Experiment runs and generated intermediate data
 runs/*

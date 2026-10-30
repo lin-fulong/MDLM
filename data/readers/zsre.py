@@ -11,8 +11,7 @@ class ZSREReader(BaseReader):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.target_field = self.options.get("target_field", "ans")
-        if self.target_field not in ("ans", "alt"):
-            raise ValueError("zsre.target_field 只支持 ans 或 alt")
+        assert self.target_field in ("ans", "alt"), "zsre.target_field 只支持 ans 或 alt"
 
     def keep_pair(self, row):
         question, answer = super().keep_pair(row)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 import math
+import sys
 
 import torch
 
@@ -29,10 +30,6 @@ class AcceptanceConfig:
     chunk_size: int = 256
 
 
-class EquivalenceError(RuntimeError):
-    """同一输入、同一 α 下的因子前向与实际合并前向超出预定容差。"""
-
-
 class WeightMerge:
     """保存本轮基准 W_b 和固定增量 ΔW，每次试步都从 W_b 重建。
 
@@ -55,13 +52,12 @@ class WeightMerge:
             for begin in range(0, q.shape[1], chunk_size):
                 # 公式（13）：真正写回的是 RQ；按列分块限制中间内存。
                 delta[:, begin:begin + chunk_size] = r_device @ q_device[:, begin:begin + chunk_size]
-            if not torch.isfinite(delta).all():
-                raise FloatingPointError(f"nonfinite actual increment at {name}")
+            assert torch.isfinite(delta).all(), f"nonfinite actual increment at {name}"
             self.increments[name] = delta
 
     @torch.no_grad()
-    def apply(self, alpha: float) -> None:
-        """公式（15）：全部编辑层共用 α，仅覆盖目标权重，偏置保持原值。"""
+    def apply(self, alpha: float) -> str | None:
+        """公式（15）：全部编辑层共用 α；数值溢出返回本试步的拒绝原因。"""
         for name, weight in self.parameters.items():
             for begin in range(0, weight.shape[1], self.chunk_size):
                 columns = slice(begin, begin + self.chunk_size)
@@ -69,7 +65,7 @@ class WeightMerge:
                 value = (self.baseline[name][:, columns].to(self.dtype)
                          + alpha * self.increments[name][:, columns]).to(dtype=weight.dtype, device=weight.device)
                 if not torch.isfinite(value).all():
-                    raise FloatingPointError(f"merged weight overflows its model dtype at {name}")
+                    return f"merged weight overflows its model dtype at {name}"
                 weight[:, columns].copy_(value)
 
     @torch.no_grad()
@@ -83,9 +79,10 @@ class WeightMerge:
 def capture_outputs(adapter, model, model_input, positions, names):
     """记录因子/实际合并模型的读出；通用 hook 只负责逐次复制目标层输出。"""
     with capture_module_outputs(model, names) as outputs:
-        logits = adapter.forward_logits(model, model_input, positions).detach().clone()
-        if any(not values for values in outputs.values()):
-            raise RuntimeError("a P5 target module was not called")
+        logits = adapter.forward_logits(model, model_input, positions, check_finite=False).detach().clone()
+        if not torch.isfinite(logits).all():
+            return None
+        assert all(outputs.values()), "a P5 target module was not called"
         return logits, outputs
 
 
@@ -98,28 +95,37 @@ def merge_with_equivalence(merger: WeightMerge, adapter, factors: dict, residual
     expected = []
     scaled = {name: alpha * value for name, value in residuals.items()}
     if any(not torch.isfinite(value).all() for value in scaled.values()):
-        raise FloatingPointError("scaled factor candidate is nonfinite")
+        return {"passed": False, "reason": "scaled factor candidate is nonfinite"}
     dtype = str(next(iter(factors.values())).dtype).removeprefix("torch.")
     with CandidateModel(merger.model, factors, dtype=dtype) as candidate:
         candidate.set_residuals(scaled)
         for model_input, positions in inputs:
-            expected.append(capture_outputs(adapter, merger.model, model_input, positions, factors))
-    merger.apply(alpha)  # 临时分支已关闭，实际权重只加入一次 αRQ。
+            captured = capture_outputs(adapter, merger.model, model_input, positions, factors)
+            if captured is None:
+                return {"passed": False, "reason": "nonfinite P4 readout logits"}
+            expected.append(captured)
+    # 临时分支已关闭，实际权重只加入一次 αRQ；溢出沿用原试步拒绝条件。
+    failure = merger.apply(alpha)
+    if failure is not None:
+        return {"passed": False, "reason": failure}
     maxima = {name: 0.0 for name in factors}
     logits_max = 0.0
     for (model_input, positions), (expected_logits, expected_outputs) in zip(inputs, expected):
-        logits, outputs = capture_outputs(adapter, merger.model, model_input, positions, factors)
+        captured = capture_outputs(adapter, merger.model, model_input, positions, factors)
+        if captured is None:
+            return {"passed": False, "reason": "nonfinite P4 readout logits"}
+        logits, outputs = captured
         if logits.shape != expected_logits.shape or not torch.allclose(logits, expected_logits, atol=atol, rtol=rtol):
-            raise EquivalenceError("actual merged logits differ from the scaled factor candidate")
+            return {"passed": False, "reason": "actual merged logits differ from the scaled factor candidate"}
         if merged_logits is not None:
             merged_logits.append(logits)
         logits_max = max(logits_max, float((logits.double() - expected_logits.double()).abs().max()))
         for name in factors:
             if len(outputs[name]) != len(expected_outputs[name]):
-                raise EquivalenceError(f"target invocation count differs at {name}")
+                return {"passed": False, "reason": f"target invocation count differs at {name}"}
             for actual, reference in zip(outputs[name], expected_outputs[name]):
                 if actual.shape != reference.shape or not torch.allclose(actual, reference, atol=atol, rtol=rtol):
-                    raise EquivalenceError(f"actual merged target outputs differ at {name}")
+                    return {"passed": False, "reason": f"actual merged target outputs differ at {name}"}
                 maxima[name] = max(maxima[name], float((actual.double() - reference.double()).abs().max()))
     return {"passed": True, "input_count": len(inputs), "logits_max_abs": logits_max, "target_max_abs": maxima}
 
@@ -140,7 +146,7 @@ def development_edits(cases: list[dict], selections: tuple, adapter) -> list[Edi
 
 
 @torch.no_grad()
-def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float) -> float:
+def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float, *, check_finite=True) -> float:
     """公式（17）：当前实际存储权重相对最初 W_0 的整体净变化比例。"""
     scale = epsilon
     for name, weight in merger.parameters.items():
@@ -158,25 +164,24 @@ def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float) -> f
             denominator = math.hypot(denominator, float(stable_frobenius_norm(w0)))
     divisor = max(denominator, epsilon / scale)
     value = numerator / divisor if divisor else math.inf
-    if not math.isfinite(value):
-        raise FloatingPointError("nonfinite cumulative parameter change")
+    if check_finite:
+        assert math.isfinite(value), "nonfinite cumulative parameter change"
     return value
 
 
 @torch.no_grad()
-def development_metrics(merger, adapter, edits, keeps, originals, epsilon, logits=None) -> dict:
+def development_metrics(merger, adapter, edits, keeps, originals, epsilon, logits=None, *, check_finite=True) -> dict:
     """计算 F_dev、完整词表 G_dev 和累计 U，可复用合并一致性前向的 logits。"""
-    if not edits or not keeps:
-        raise ValueError("P5 requires both development edit and preservation readouts even when training beta=0")
+    assert edits and keeps, "P5 requires both development edit and preservation readouts even when training beta=0"
     edit = math.fsum(float(edit_loss(adapter, merger.model, item) if logits is None
                           else edit_loss_from_logits(logits[index], item)) for index, item in enumerate(edits))
     # 公式（16）：复用完整词表 KL(theta_0 || theta_alpha)，开发保持始终执行。
     keep = math.fsum(float(keep_loss(adapter, merger.model, item) if logits is None
                           else keep_loss_from_logits(logits[len(edits) + index], item))
                      for index, item in enumerate(keeps))
-    change = cumulative_change(merger, originals, epsilon)
-    if not all(math.isfinite(value) for value in (edit, keep, change)):
-        raise FloatingPointError("nonfinite P5 development metrics")
+    change = cumulative_change(merger, originals, epsilon, check_finite=check_finite)
+    if check_finite:
+        assert all(math.isfinite(value) for value in (edit, keep, change)), "nonfinite P5 development metrics"
     return {"f_dev": edit, "g_dev": keep, "u": change}
 
 
@@ -202,13 +207,24 @@ def select_merged_candidate(merger: WeightMerge, adapter, factors: dict, residua
             try:
                 # 先证明同 alpha 的因子/合并前向一致，再对实际合并模型验收。
                 merged_logits = []
-                row["equivalence"] = merge_with_equivalence(merger, adapter, factors, residuals, inputs, alpha,
+                equivalence = merge_with_equivalence(merger, adapter, factors, residuals, inputs, alpha,
                     atol=settings.equivalence_atol, rtol=settings.equivalence_rtol, merged_logits=merged_logits)
-                row["metrics"] = development_metrics(merger, adapter, edits, keeps, originals, settings.epsilon,
-                                                     merged_logits)
-                row["gate"] = gate_decision(row["metrics"], report["baseline"]["f_dev"], settings)
-                row["accepted"] = row["gate"]["passed"]
-            except (EquivalenceError, FloatingPointError) as error:
+                if not equivalence["passed"]:
+                    row["reasons"] = [equivalence["reason"]]
+                else:
+                    row["equivalence"] = equivalence
+                    metrics = development_metrics(merger, adapter, edits, keeps, originals, settings.epsilon,
+                                                  merged_logits, check_finite=False)
+                    # 仍先检查累计变化，再检查全部开发指标，保持原拒绝原因和报告字段。
+                    if not math.isfinite(metrics["u"]):
+                        row["reasons"] = ["nonfinite cumulative parameter change"]
+                    elif not all(math.isfinite(value) for value in metrics.values()):
+                        row["reasons"] = ["nonfinite P5 development metrics"]
+                    else:
+                        row["metrics"] = metrics
+                        row["gate"] = gate_decision(metrics, report["baseline"]["f_dev"], settings)
+                        row["accepted"] = row["gate"]["passed"]
+            except FloatingPointError as error:
                 row["reasons"] = [str(error)]
             if row["accepted"]:
                 report.update(status="accepted", selected_alpha=alpha, failure=None)
@@ -217,6 +233,6 @@ def select_merged_candidate(merger: WeightMerge, adapter, factors: dict, residua
             row["baseline_restored"] = True
         report.update(status="rejected", baseline_restored=True, failure=None)
         return report
-    except Exception:
-        merger.restore()
-        raise
+    finally:
+        if report["status"] == "running" and isinstance(sys.exc_info()[1], Exception):
+            merger.restore()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -26,8 +27,7 @@ def select_cases(cases, case_ids):
         return cases
     selected = set(case_ids)
     available = {case["case_id"] for case in cases} | {case.get("source_case_id", case["case_id"]) for case in cases}
-    if selected - available:
-        raise ValueError(f"数据集中没有这些可编辑案例：{sorted(selected - available)}")
+    assert not selected - available, f"数据集中没有这些可编辑案例：{sorted(selected - available)}"
     return [case for case in cases if case["case_id"] in selected
             or case.get("source_case_id", case["case_id"]) in selected]
 
@@ -53,13 +53,11 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
         ("statistics_scale", "statistics_scale")) if key in choices}}
     mode = choices.get("mode", "independent") if sequential is None else (
         "sequential" if sequential else "independent")
-    if mode not in ("independent", "sequential"):
-        raise ValueError("mode 必须为 independent 或 sequential")
+    assert mode in ('independent', 'sequential'), "mode 必须为 independent 或 sequential"
     sequential = mode == "sequential"
     case_ids = case_ids if case_ids is not None else choices.get("case_ids")
     max_cases = max_cases_override if max_cases_override is not None else choices.get("max_cases")
-    if max_cases is not None and (type(max_cases) is not int or max_cases < 1):
-        raise ValueError("max_cases 必须为正整数或 null")
+    assert max_cases is None or (type(max_cases) is int and max_cases >= 1), "max_cases 必须为正整数或 null"
     dataset = dataset_override.resolve() if dataset_override is not None else project_path(choices["dataset_path"])
     model_path = model_override.resolve() if model_override is not None else project_path(choices["model_path"])
     layers = tuple(choices["target_layers"])
@@ -130,6 +128,7 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
                 print(f"[round {index + 1}/{len(groups)}] {case_id}", flush=True)
                 # 文档 3.1（未编号）：theta_b 为当前模型；快照用于本轮恢复。
                 baseline = adapter.snapshot_target_weights(model)
+                round_complete = False
                 try:
                     # 公式（1）～（3）的前置采样：使用本轮 theta_b，自主生成固定轨迹。
                     trajectories = collect_trajectories(model, adapter, group, **sampling)
@@ -150,23 +149,24 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
                         "selected_alpha": result["selected_alpha"],
                         "selected_step": result["optimization"]["selected_step"], "selection": result["selection"],
                         "final_model_dir": str(final_dir) if final_dir is not None else None})
-                except Exception:
-                    adapter.restore_target_weights(model, baseline)
-                    raise
+                    round_complete = True
+                finally:
+                    if not round_complete and isinstance(sys.exc_info()[1], Exception):
+                        adapter.restore_target_weights(model, baseline)
                 # 独立模式保存结果后恢复 theta_0；连续模式保留本轮接受模型，再处理下一案例。
                 if not sequential:
                     adapter.restore_target_weights(model, baseline)
             # 文档 11.2（未编号）：theta_final=theta_acc；只保存最终权重和运行摘要。
             final_dir = save_final_model(model, adapter, output / "final_model", model_path=model_path,
                                          torch_dtype=dtype, device_map=device) if sequential else None
-            report.update(status="complete", current_case_id=None,
-                          accepted_count=sum(row["decision"] == "accepted" for row in report["rounds"]),
-                          rejected_count=sum(row["decision"] == "rejected" for row in report["rounds"]),
-                          final_checkpoint_dir=str(final_dir) if final_dir is not None else None)
-    except Exception as error:
-        report.update(status="failed", failure=str(error))
-        raise
+        report.update(status="complete", current_case_id=None,
+                      accepted_count=sum(row["decision"] == "accepted" for row in report["rounds"]),
+                      rejected_count=sum(row["decision"] == "rejected" for row in report["rounds"]),
+                      final_checkpoint_dir=str(final_dir) if final_dir is not None else None)
     finally:
+        error = sys.exc_info()[1]
+        if report["status"] != "complete" and isinstance(error, Exception):
+            report.update(status="failed", failure=str(error))
         write_json(output / "run_report.json", report)
     return report
 

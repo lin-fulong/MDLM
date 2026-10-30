@@ -43,35 +43,29 @@ class ModelAdapter(ABC):
     @abstractmethod
     def render_prompt(self, prompt: str) -> str:
         """按模型的聊天模板渲染提示；答案窗口和监督由算法构造。"""
-        raise NotImplementedError
 
     @abstractmethod
     def target_module_names(self) -> tuple[str, ...]:
         """返回模型实际的目标线性层名称，保留配置层序。"""
-        raise NotImplementedError
 
     @abstractmethod
     def inspect_target_modules(self, model: Any) -> dict:
         """核对具体模型的层结构，返回目标层输入/输出维度。"""
-        raise NotImplementedError
 
     @abstractmethod
     def forward_with_capture(self, model: Any, requests: tuple, *, module_names=None,
                              require_all_logits_finite: bool = True) -> list[ForwardCapture]:
         """对等长的 (输入, 捕获位置) 请求前向，保留请求顺序及原精度。"""
-        raise NotImplementedError
 
+    @abstractmethod
     def forward_logits(self, model: Any, model_input: MaskedEditInput | KeepModelInput,
-                       positions: tuple[int, ...]) -> Any:
+                       positions: tuple[int, ...], *, check_finite: bool = True) -> Any:
         """读取给定位置的完整词表 logits，保留调用方所需计算图。"""
-        raise NotImplementedError("differentiable candidate forward is unavailable for this adapter")
 
     @abstractmethod
     def snapshot_target_weights(self, model: Any) -> TargetWeightSnapshot:
         """复制目标权重，供调用方恢复本轮基准。"""
-        raise NotImplementedError
 
     @abstractmethod
     def restore_target_weights(self, model: Any, snapshot: TargetWeightSnapshot) -> None:
         """将快照复制回原参数，保留参数身份、精度和设备。"""
-        raise NotImplementedError

@@ -59,8 +59,7 @@ class FactTrajectory:
     @classmethod
     def from_sample(cls, target: EditTarget, seed: int, trace: DenoiseTrace) -> "FactTrajectory":
         """从全 mask 初态取得答案窗口，组装事实轨迹。"""
-        if not trace.pre_forward_inputs:
-            raise ValueError(f"{target.case_id}: sampler returned no pre-forward input")
+        assert trace.pre_forward_inputs, f"{target.case_id}: sampler returned no pre-forward input"
         return cls(target.case_id, target.probe_id, trace.pre_forward_inputs[0].mask_positions,
                    target.token_ids, seed, trace)
 
@@ -89,8 +88,9 @@ def input_record(model_input: MaskedEditInput) -> dict:
 
 def input_from_record(record: dict) -> MaskedEditInput:
     """还原模型输入，核对 LLaDA 从零开始的隐式位置编号。"""
-    if record["implicit_position_ids"] != list(range(len(record["input_ids"]))):
-        raise ValueError("saved implicit position IDs differ from the model input length")
+    assert (
+        record['implicit_position_ids'] == list(range(len(record['input_ids'])))
+    ), "saved implicit position IDs differ from the model input length"
     return MaskedEditInput(
         tuple(record["input_ids"]),
         tuple(record["attention_mask"]),
@@ -102,8 +102,7 @@ def input_from_record(record: dict) -> MaskedEditInput:
 def keep_input_from_record(record):
     """还原已准备的保持输入，核对从零开始的隐式位置编号。"""
     position_ids = list(range(len(record["input_ids"])))
-    if record.get("implicit_position_ids", position_ids) != position_ids:
-        raise ValueError("保持输入的位置编号与序列长度不一致")
+    assert record.get('implicit_position_ids', position_ids) == position_ids, "保持输入的位置编号与序列长度不一致"
     return KeepModelInput(tuple(record["input_ids"]), tuple(record["attention_mask"]), tuple(record["mask_positions"]))
 
 
@@ -125,8 +124,9 @@ def _prepare_short_answer(adapter, case: dict, probe: dict) -> tuple[MaskedEditI
     alignment = align_edit_prompt(
         adapter.tokenizer, rendered, case["fact_core"]["subject"], probe["answer"]
     )
-    if adapter.mask_token_id in alignment.prompt_ids:
-        raise ValueError(f"{case['case_id']}: edit prompt already contains the model mask token")
+    assert (
+        adapter.mask_token_id not in alignment.prompt_ids
+    ), f"{case['case_id']}: edit prompt already contains the model mask token"
     begin = len(alignment.prompt_ids)
     positions = tuple(range(begin, begin + len(alignment.answer_ids)))
     token_ids = alignment.prompt_ids + (adapter.mask_token_id,) * len(positions)
@@ -152,10 +152,11 @@ def encode_keep(adapter, prompt: str, answer: str) -> tuple[dict, list[int], lis
     full_ids = list(adapter.tokenizer.encode(rendered + answer, add_special_tokens=False))
     begin = len(prompt_ids)
     answer_ids = full_ids[begin:]
-    if not prompt_ids or full_ids[:begin] != prompt_ids or not answer_ids:
-        raise ValueError("保持题无法建立稳定的短答案 mask 边界")
-    if adapter.mask_token_id in prompt_ids or set(answer_ids) & set(adapter.tokenizer.all_special_ids):
-        raise ValueError("保持题含有不允许的预置 mask 或答案特殊 token")
+    assert prompt_ids and full_ids[:begin] == prompt_ids and answer_ids, "保持题无法建立稳定的短答案 mask 边界"
+    assert (
+        adapter.mask_token_id not in prompt_ids
+        and not set(answer_ids) & set(adapter.tokenizer.all_special_ids)
+    ), "保持题含有不允许的预置 mask 或答案特殊 token"
     # 公式（10）（16）（17）：KL 只读答案 mask；答案内容不进入模型输入。
     positions = list(range(begin, begin + len(answer_ids)))
     tokens = prompt_ids + [adapter.mask_token_id] * len(answer_ids)
@@ -167,19 +168,25 @@ def prepare_inputs(cases: list[dict], adapter, *, settings: dict | None = None,
                    keep_pool: list[dict] | None = None) -> dict:
     """从显式保持池或完整案例集准备输入；沿用原去重、划分和位置权重。"""
     policy = {**DEFAULT_SETTINGS, **(settings or {})}
-    if set(policy) != set(DEFAULT_SETTINGS) or policy["dev_edit_policy"] != "edit_probe":
-        raise ValueError("不支持的输入生成参数；dev_edit_policy 当前支持 edit_probe")
-    if type(policy["seed"]) is not int or policy["seed"] < 0:
-        raise ValueError("seed 必须为非负整数")
+    assert (
+        set(policy) == set(DEFAULT_SETTINGS)
+        and policy['dev_edit_policy'] == 'edit_probe'
+    ), "不支持的输入生成参数；dev_edit_policy 当前支持 edit_probe"
+    assert type(policy['seed']) is int and policy['seed'] >= 0, "seed 必须为非负整数"
     fractions = (policy["dev_fraction"], policy["test_fraction"])
-    if any(not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(x) or not 0 <= x < 1
-           for x in fractions) or not 0 < fractions[0] or sum(fractions) >= 1:
-        raise ValueError("保持题划分比例必须满足 dev>0、test>=0、dev+test<1")
+    assert (
+        not any((not isinstance(x, (int, float)) or isinstance(x, bool) or (not math.isfinite(x)) or (not 0 <= x < 1) for x in fractions))
+        and 0 < fractions[0]
+        and sum(fractions) < 1
+    ), "保持题划分比例必须满足 dev>0、test>=0、dev+test<1"
     scale = policy["statistics_scale"]
-    if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not math.isfinite(scale) or scale <= 0:
-        raise ValueError("statistics_scale 必须为有限正数")
-    if not cases:
-        raise ValueError("所选数据集没有可执行的编辑案例")
+    assert (
+        isinstance(scale, (int, float))
+        and not isinstance(scale, bool)
+        and math.isfinite(scale)
+        and scale > 0
+    ), "statistics_scale 必须为有限正数"
+    assert cases, "所选数据集没有可执行的编辑案例"
 
     # 按 strip 后的题目摘要去重，保留首次出现的原始 prompt 和 answer。
     pool = {}
@@ -190,8 +197,7 @@ def prepare_inputs(cases: list[dict], adapter, *, settings: dict | None = None,
         pool.setdefault(key, {"prompt": probe["prompt"], "answer": probe["answer"]})
     ordered = sorted(pool, key=lambda key: config_digest({"seed": policy["seed"], "prompt": key}))
     count = len(ordered)
-    if count < 2:
-        raise ValueError("自动生成保持统计和开发保持输入至少需要两道不同的 preservation 题")
+    assert count >= 2, "自动生成保持统计和开发保持输入至少需要两道不同的 preservation 题"
     # 摘要排序不使用全局随机状态；计数沿用截断、至少一条开发题及一条训练题的规则。
     dev_count = min(count - 1, max(1, int(count * policy["dev_fraction"])))
     test_count = min(count - dev_count - 1, max(1, int(count * policy["test_fraction"]))) \
@@ -230,12 +236,11 @@ def fact_seed(seed: int, case_id: str, probe_id: str) -> int:
 
 def capture_edit(model, adapter, model_input: MaskedEditInput) -> ForwardCapture:
     """公式（4）：由算法选择主体末位置，适配器只捕获指定位置的实际输入。"""
-    if not 0 <= model_input.subject_last_position < len(model_input.input_ids):
-        raise ValueError("subject token position is out of range")
-    if not model_input.mask_positions:
-        raise ValueError("mask positions do not contain the model mask token")
-    if model_input.subject_last_position >= min(model_input.mask_positions):
-        raise ValueError("subject token must precede the answer mask window")
+    assert 0 <= model_input.subject_last_position < len(model_input.input_ids), "subject token position is out of range"
+    assert model_input.mask_positions, "mask positions do not contain the model mask token"
+    assert (
+        model_input.subject_last_position < min(model_input.mask_positions)
+    ), "subject token must precede the answer mask window"
     result = adapter.forward_with_capture(
         model, ((model_input, (model_input.subject_last_position,)),),
         require_all_logits_finite=False,
@@ -248,10 +253,11 @@ def sample_denoise(
 ) -> DenoiseTrace:
     """公式（1）的状态来源：自主采样并按置信度揭示现有答案 mask，不接收目标答案。"""
     mask_count = len(model_input.mask_positions)
-    if type(steps) is not int or not 1 <= steps <= mask_count:
-        raise ValueError("denoising steps must be between 1 and the answer mask count")
-    if not math.isfinite(temperature) or temperature < 0:
-        raise ValueError("temperature must be finite and nonnegative")
+    assert (
+        type(steps) is int
+        and 1 <= steps <= mask_count
+    ), "denoising steps must be between 1 and the answer mask count"
+    assert math.isfinite(temperature) and temperature >= 0, "temperature must be finite and nonnegative"
 
     generator = None
     current_ids = list(model_input.input_ids)
@@ -272,12 +278,10 @@ def sample_denoise(
         logit_digests.append(tensor_sha256(raw_logits))
         logits = raw_logits.float().clone()
         logits[:, [token for token in blocked_ids if 0 <= token < logits.shape[-1]]] = -torch.inf
-        if not torch.isfinite(logits).any(dim=-1).all():
-            raise ValueError("no finite non-special token can be sampled")
+        assert torch.isfinite(logits).any(dim=-1).all(), "no finite non-special token can be sampled"
         # 当前采样约定（无独立公式编号）：屏蔽特殊 token 后，T>0 按 softmax(logits/T) 抽样。
         probabilities = torch.softmax(logits / temperature if temperature else logits, dim=-1)
-        if not torch.isfinite(probabilities).all():
-            raise ValueError("nonfinite sampling probabilities")
+        assert torch.isfinite(probabilities).all(), "nonfinite sampling probabilities"
         if temperature:
             if generator is None:
                 generator = torch.Generator(device=logits.device)
@@ -309,36 +313,37 @@ def sample_denoise(
 def collect_trajectories(model, adapter, cases: list[dict], *, seed=2026, steps=None,
                          temperature=0.0, replay_count=1) -> list[FactTrajectory]:
     """每事实采集一条全 mask 起始的轨迹，并按原种子抽样核对可重放性。"""
-    if type(seed) is not int or seed < 0 or (steps is not None and (type(steps) is not int or steps < 1)):
-        raise ValueError("seed 必须为非负整数，steps 必须为正整数或 null")
-    if not math.isfinite(temperature) or temperature < 0:
-        raise ValueError("temperature 必须为有限非负数")
-    if type(replay_count) is not int or not 0 <= replay_count <= len(cases):
-        raise ValueError("replay_count 必须在 0 与本轮事实数之间")
+    assert (
+        type(seed) is int
+        and seed >= 0
+        and (steps is None or (type(steps) is int and steps >= 1))
+    ), "seed 必须为非负整数，steps 必须为正整数或 null"
+    assert math.isfinite(temperature) and temperature >= 0, "temperature 必须为有限非负数"
+    assert type(replay_count) is int and 0 <= replay_count <= len(cases), "replay_count 必须在 0 与本轮事实数之间"
     target_names = set(adapter.inspect_target_modules(model))
     trajectories = []
     for case in cases:
         probes = case["prompts"]["edit"]
-        if len(probes) != 1:
-            raise ValueError("每个编辑事实必须且只能选择一个编辑探针")
+        assert len(probes) == 1, "每个编辑事实必须且只能选择一个编辑探针"
         probe_id = probes[0]["probe_id"]
         initial, target = prepare_edit_input(adapter, case, probe_id)
         answer_positions = initial.mask_positions
-        if len(answer_positions) != len(target.token_ids) or any(
-            initial.input_ids[p] != adapter.mask_token_id for p in answer_positions
-        ):
-            raise ValueError("P0 要求完整短答案 mask 输入")
+        assert (
+            len(answer_positions) == len(target.token_ids)
+            and not any((initial.input_ids[p] != adapter.mask_token_id for p in answer_positions))
+        ), "P0 要求完整短答案 mask 输入"
 
         # P0：同一全 mask 输入前向两次，核对目标层、logits 和捕获输入。
         captured = capture_edit(model, adapter, initial)
         repeated = capture_edit(model, adapter, initial)
-        if set(captured.module_inputs) != target_names or set(repeated.module_inputs) != target_names:
-            raise ValueError("P0 捕获层与目标层不一致")
-        if not torch.allclose(captured.mask_logits, repeated.mask_logits, atol=1e-2, rtol=1e-3) or any(
-            not torch.allclose(captured.module_inputs[name], repeated.module_inputs[name], atol=1e-2, rtol=1e-3)
-            for name in target_names
-        ):
-            raise ValueError("P0 前向未能在原有容差内重放")
+        assert (
+            set(captured.module_inputs) == target_names
+            and set(repeated.module_inputs) == target_names
+        ), "P0 捕获层与目标层不一致"
+        assert (
+            torch.allclose(captured.mask_logits, repeated.mask_logits, atol=0.01, rtol=0.001)
+            and not any((not torch.allclose(captured.module_inputs[name], repeated.module_inputs[name], atol=0.01, rtol=0.001) for name in target_names))
+        ), "P0 前向未能在原有容差内重放"
 
         # 目标答案只附在监督侧；采样器仅接收 initial，不接收 target。
         selected_seed = fact_seed(seed, case["case_id"], probe_id)
@@ -352,8 +357,7 @@ def collect_trajectories(model, adapter, cases: list[dict], *, seed=2026, steps=
         replay = sample_denoise(model, adapter, saved.trace.pre_forward_inputs[0],
                                        steps=len(saved.trace.pre_forward_inputs),
                                        temperature=temperature, seed=saved.seed)
-        if replay != saved.trace:
-            raise ValueError(f"{saved.case_id}: 去噪轨迹或 logits 未能重放")
+        assert replay == saved.trace, f"{saved.case_id}: 去噪轨迹或 logits 未能重放"
     return trajectories
 
 
@@ -365,40 +369,42 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
     targets = trajectory.target_token_ids
 
     # 本算法使用非空答案窗口、全 mask 初态和不重新掩码的受控去噪轨迹。
-    if not answer_positions or answer_positions != tuple(sorted(set(answer_positions))):
-        raise ValueError(f"{trajectory.case_id}: answer positions must be nonempty, unique and ordered")
-    if len(answer_positions) != len(targets):
-        raise ValueError(f"{trajectory.case_id}: answer positions and target length differ")
-    if not inputs:
-        raise ValueError(f"{trajectory.case_id}: full-mask initial state is missing")
+    assert (
+        answer_positions
+        and answer_positions == tuple(sorted(set(answer_positions)))
+    ), f"{trajectory.case_id}: answer positions must be nonempty, unique and ordered"
+    assert len(answer_positions) == len(targets), f"{trajectory.case_id}: answer positions and target length differ"
+    assert inputs, f"{trajectory.case_id}: full-mask initial state is missing"
     initial = inputs[0]
-    if any(position < 0 or position >= len(initial.input_ids) for position in answer_positions):
-        raise ValueError(f"{trajectory.case_id}: answer position is out of range")
-    if not 0 <= initial.subject_last_position < min(answer_positions):
-        raise ValueError(f"{trajectory.case_id}: subject must precede the answer window")
-    if initial.mask_positions != answer_positions:
-        raise ValueError(f"{trajectory.case_id}: first state is not the full-mask initial state")
-    if len(trace.revealed_tokens) != len(inputs):
-        raise ValueError(f"{trajectory.case_id}: reveal count differs from forward count")
-    if len(trace.mask_logit_sha256) != len(inputs):
-        raise ValueError(f"{trajectory.case_id}: logit digest count differs from forward count")
+    assert (
+        not any((position < 0 or position >= len(initial.input_ids) for position in answer_positions))
+    ), f"{trajectory.case_id}: answer position is out of range"
+    assert (
+        0 <= initial.subject_last_position < min(answer_positions)
+    ), f"{trajectory.case_id}: subject must precede the answer window"
+    assert (
+        initial.mask_positions == answer_positions
+    ), f"{trajectory.case_id}: first state is not the full-mask initial state"
+    assert len(trace.revealed_tokens) == len(inputs), f"{trajectory.case_id}: reveal count differs from forward count"
+    assert (
+        len(trace.mask_logit_sha256) == len(inputs)
+    ), f"{trajectory.case_id}: logit digest count differs from forward count"
 
     compatible: list[dict] = []
     discarded: list[dict] = []
     seen: set[MaskedEditInput] = set()
     previous_masks = set(answer_positions)
     for step, state in enumerate(inputs):
-        if (len(state.input_ids) != len(initial.input_ids)
-                or len(state.input_ids) != len(state.attention_mask)
-                or any(value != 1 for value in state.attention_mask)):
-            raise ValueError(f"{trajectory.case_id}: saved attention input differs from the forward contract")
+        assert (
+            len(state.input_ids) == len(initial.input_ids)
+            and len(state.input_ids) == len(state.attention_mask)
+            and not any((value != 1 for value in state.attention_mask))
+        ), f"{trajectory.case_id}: saved attention input differs from the forward contract"
         current_masks = set(state.mask_positions)
-        if not current_masks <= previous_masks:
-            raise ValueError(f"{trajectory.case_id}: a revealed token was masked again")
-        if state.mask_positions != tuple(
-            position for position, token in enumerate(state.input_ids) if token == mask_token_id
-        ):
-            raise ValueError(f"{trajectory.case_id}: saved mask positions differ from input IDs")
+        assert current_masks <= previous_masks, f"{trajectory.case_id}: a revealed token was masked again"
+        assert (
+            state.mask_positions == tuple((position for position, token in enumerate(state.input_ids) if token == mask_token_id))
+        ), f"{trajectory.case_id}: saved mask positions differ from input IDs"
         previous_masks = current_masks
         # 按全部模型输入字段去重，不能只比较剩余 mask 或可见文本。
         if state in seen:
@@ -418,15 +424,20 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
                                "remaining_mask_positions": list(state.mask_positions)})
 
     # 核对每次揭示确实产生下一输入，保持上下文、已揭示内容和 mask 变化一致。
-    if trace.final_input.mask_positions or mask_token_id in trace.final_input.input_ids:
-        raise ValueError(f"{trajectory.case_id}: denoising did not reach a terminal state")
+    assert (
+        not trace.final_input.mask_positions
+        and mask_token_id not in trace.final_input.input_ids
+    ), f"{trajectory.case_id}: denoising did not reach a terminal state"
     for step, current in enumerate(inputs):
         following = inputs[step + 1] if step + 1 < len(inputs) else trace.final_input
         expected_ids = list(current.input_ids)
         revealed_positions = set()
         for position, token in trace.revealed_tokens[step]:
-            if position not in current.mask_positions or position in revealed_positions or token == mask_token_id:
-                raise ValueError(f"{trajectory.case_id}: invalid revealed token at step {step}")
+            assert (
+                position in current.mask_positions
+                and position not in revealed_positions
+                and token != mask_token_id
+            ), f"{trajectory.case_id}: invalid revealed token at step {step}"
             expected_ids[position] = token
             revealed_positions.add(position)
         expected = MaskedEditInput(
@@ -435,8 +446,9 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
             tuple(position for position in current.mask_positions if position not in revealed_positions),
             current.subject_last_position,
         )
-        if following != expected:
-            raise ValueError(f"{trajectory.case_id}: saved input transition differs from revealed tokens at step {step}")
+        assert (
+            following == expected
+        ), f"{trajectory.case_id}: saved input transition differs from revealed tokens at step {step}"
     report = {
         "case_id": trajectory.case_id,
         "probe_id": trajectory.probe_id,
@@ -456,8 +468,7 @@ def classify_fact(trajectory: FactTrajectory, mask_token_id: int) -> tuple[list[
 def build_supervision(trajectories: list[FactTrajectory], mask_token_id: int) -> tuple[list[dict], dict]:
     """公式（2）（3）：为事实、兼容状态、剩余 mask 三级平均准备位置权重。"""
     fact_count = len(trajectories)
-    if not fact_count:
-        raise ValueError("no selected facts were collected")
+    assert fact_count, "no selected facts were collected"
     fixed: list[dict] = []
     reports: list[dict] = []
     for trajectory in trajectories:

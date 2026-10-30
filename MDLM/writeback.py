@@ -21,8 +21,7 @@ class WritebackConfig:
 def extract_keys(model, adapter, trajectories, *, storage_dtype="float32",
                  replay_atol=1e-2, replay_rtol=1e-3) -> dict:
     """公式（4）：K_ell = [k_1,ell, ..., k_N,ell]，形状为 [输入维度, 事实数]。"""
-    if storage_dtype not in ("float32", "float64"):
-        raise ValueError("K 精度必须为 float32 或 float64")
+    assert storage_dtype in ('float32', 'float64'), "K 精度必须为 float32 或 float64"
     descriptions = adapter.inspect_target_modules(model)
     target_names = set(descriptions)
     dtype = getattr(torch, storage_dtype)
@@ -35,20 +34,24 @@ def extract_keys(model, adapter, trajectories, *, storage_dtype="float32",
 
         # 两次前向都须与 P1 初态的原始精度 logits 摘要一致。
         initial_digest = trajectory.trace.mask_logit_sha256[0]
-        if any(tensor_sha256(value.mask_logits) != initial_digest
-               for value in (captured, repeated)):
-            raise ValueError("K 初态 logits 与 P1 基准不一致")
-        if set(captured.module_inputs) != target_names or set(repeated.module_inputs) != target_names:
-            raise ValueError("K 捕获层与目标层不一致")
+        assert (
+            not any((tensor_sha256(value.mask_logits) != initial_digest for value in (captured, repeated)))
+        ), "K 初态 logits 与 P1 基准不一致"
+        assert (
+            set(captured.module_inputs) == target_names
+            and set(repeated.module_inputs) == target_names
+        ), "K 捕获层与目标层不一致"
         for name, info in descriptions.items():
             key, replay = captured.module_inputs[name], repeated.module_inputs[name]
-            if key.shape != (info["in_features"],) or not torch.isfinite(key).all() or not torch.allclose(
-                key, replay, atol=replay_atol, rtol=replay_rtol
-            ):
-                raise ValueError(f"K 的形状、有限性或重放检查失败：{name}")
+            assert (
+                key.shape == (info['in_features'],)
+                and torch.isfinite(key).all()
+                and torch.allclose(key, replay, atol=replay_atol, rtol=replay_rtol)
+            ), f"K 的形状、有限性或重放检查失败：{name}"
             stored = key.detach().to(device="cpu", dtype=dtype)
-            if not torch.allclose(key.double().cpu(), stored.double(), atol=replay_atol, rtol=replay_rtol):
-                raise ValueError("K 的配置精度超出原有重放容差")
+            assert (
+                torch.allclose(key.double().cpu(), stored.double(), atol=replay_atol, rtol=replay_rtol)
+            ), "K 的配置精度超出原有重放容差"
             columns[name].append(stored)
     # 沿第 1 维堆叠，保持与 trajectories 完全相同的事实列序，不作状态平均或归一化。
     return {name: torch.stack(values, dim=1).contiguous() for name, values in columns.items()}

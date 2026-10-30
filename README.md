@@ -18,6 +18,7 @@ python -m pip check
 模型目录默认为 `model/models/LLaDA-8B-Instruct`，数据集默认为 `data/datasets/cases.jsonl`。
 模型文件和数据集不上传至 Git。
 小模型测试能验证计算和接口；完整 8B 实验仍需要足够的显存与内存。
+算法输入、分词对齐和权重约束使用 `assert`，请使用普通 `python` 启动，不使用会移除断言的 `python -O` / `-OO`。
 
 ## 启动
 
