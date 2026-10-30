@@ -8,7 +8,7 @@ from itertools import islice
 import json
 from pathlib import Path
 
-from data.readers.base import iter_records, validate_limit
+from data.readers.base import iter_records
 from data.readers.fever import FEVERReader
 from data.readers.ultraeditbench import UltraEditBenchReader
 from data.readers.wikibigedit import WikiBigEditReader
@@ -46,22 +46,17 @@ def load_dataset(config: dict, *, dataset_path_override=None) -> DatasetBundle:
     未提供 keep_path 时返回 None，让原算法沿用案例内的保持题来源。
     """
     name = config.get("dataset_reader", "native")
-    assert isinstance(name, str) and name in READERS, f"未知 dataset_reader: {name!r}；可选 {', '.join(READERS)}"
-    limit = validate_limit(config.get("source_limit"), "source_limit")
-    keep_limit = validate_limit(config.get("keep_limit"), "keep_limit")
+    limit, keep_limit = config.get("source_limit"), config.get("keep_limit")
     path = (Path(dataset_path_override).resolve() if dataset_path_override is not None
             else project_path(config["dataset_path"]))
     keep_path = project_path(config["keep_path"]) if config.get("keep_path") is not None else None
-    assert keep_limit is None or keep_path is not None, "keep_limit 需要同时指定 keep_path"
     options = config.get("reader_options", {})
-    assert isinstance(options, dict), "reader_options 必须是对象"
     options = dict(options)  # 路径展开不回写调用方的配置。
     if options.get("subject_path") is not None:
         options["subject_path"] = str(project_path(options["subject_path"]))
     seed = config.get("seed", 2026)
     keep_pool = None
     if name == "native":
-        assert not options, "native 读取器不接受 reader_options"
         cases = _native_cases(path, limit)
         if keep_path is not None:
             keep_pool = list(islice((p for case in load_cases(keep_path)
@@ -71,7 +66,6 @@ def load_dataset(config: dict, *, dataset_path_override=None) -> DatasetBundle:
         cases = list(reader.iter_cases(path, limit=limit))
         if keep_path is not None:
             keep_pool = list(reader.iter_keep_probes(keep_path, limit=keep_limit))
-    assert keep_pool is None or keep_pool, f"保持题来源为空: {keep_path}"
     return DatasetBundle(cases, keep_pool, {
         "reader": name, "source_path": str(path), "source_limit": limit,
         "case_count": len(cases), "reader_options": options, "seed": seed,
@@ -121,8 +115,7 @@ def adapt_reviewed_cases(rows: list[dict]) -> list[dict]:
             continue
         requests, questions = row["edit_requests"], row["edit_questions"]
         count = len(requests)
-        assert count == len(questions), f"{row['case_id']}: edit_requests and edit_questions cannot be paired by index"
-        for index, (request, question) in enumerate(zip(requests, questions)):
+        for index, (request, question) in enumerate(zip(requests, questions, strict=True)):
             # 编辑题没有 request_id，沿用同下标配对；公式（2）（3）（4）沿用此事实顺序。
             case_id = row["case_id"] if count == 1 else request["request_id"]
             # 保持题只挂在首个请求下，供后续公式（5）（10）（16）的固定输入划分使用。

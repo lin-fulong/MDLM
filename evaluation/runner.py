@@ -20,19 +20,17 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
     import torch
     from util.gpu_runtime import execution_context
     from .inference import (GOLD_PROTOCOL, PROTOCOL, PROTOCOLS, LLaDABackend,
-                            generate, prepare_request, validate_generation)
+                            generate, prepare_request)
 
     config = read_config(Path(config_file))
     framework = get_framework(config.get("framework", "ultraedit"))
     protocol = config.get("protocol", PROTOCOL)
     description = PROTOCOLS[protocol]
-    generation = validate_generation(config.get("generation", {}))
-    assert run_dir is not None or config.get("run_dir"), "请通过 --run-dir 或评估配置指定已完成的编辑目录"
+    generation = {"steps": None, "temperature": 0.0, **config.get("generation", {})}
     run_dir = Path(run_dir).resolve() if run_dir is not None else project_path(config["run_dir"])
     report_hash = file_digest(run_dir / "run_report.json")
     report, rounds, artifacts = read_run(run_dir)
     seed = config.get("seed", report.get("seed", 2026))
-    assert type(seed) is int and seed >= 0, "评估 seed 必须为非负整数"
     bundle = read_evaluation_data(report, dataset_override=dataset_path)
     source_hash = file_digest(bundle.metadata["source_path"])
     groups = config.get("groups", list(framework.metrics))
@@ -41,8 +39,6 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
     device = device or config.get("device", "cuda:0")
     identifier = choose_run_id(config.get("eval_id"), eval_id)
     output = project_path(config.get("output_root", "evaluations")) / identifier
-    for protected in (run_dir, Path(settings["model_path"])):
-        assert not output.resolve().is_relative_to(protected.resolve()), "评估输出不能位于编辑产物或原始模型目录内"
     output.mkdir(parents=True, exist_ok=False)
     summary = framework.aggregate(tasks, groups)
     accepted = sum(row["decision"] == "accepted" for row in rounds)
@@ -110,8 +106,6 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
                 by_checkpoint.setdefault(task.checkpoint, []).append(task)
             for checkpoint, selected in by_checkpoint.items():
                 if checkpoint is not None:
-                    assert file_digest(checkpoint / "target_weights.safetensors") == artifacts[str(checkpoint)]["weights_sha256"], \
-                        "评估期间模型产物发生变化"
                     backend.use_checkpoint(checkpoint)
                 print(f"[evaluate] {checkpoint or 'original (rejected)'}: {len(selected)} probes", flush=True)
                 for task in selected:
@@ -133,12 +127,6 @@ def run_evaluation(config_file, *, run_dir=None, device=None, model_path=None, d
                     # 只有逐题结果成功保存，才计入已完成数量。
                     summary.add(task, scores)
                     current = None
-            assert file_digest(run_dir / "run_report.json") == report_hash and file_digest(bundle.metadata["source_path"]) == source_hash, \
-                "评估期间编辑报告或源数据发生变化"
-            for path, item in artifacts.items():
-                assert (file_digest(Path(path) / "model.json") == item["metadata_sha256"]
-                        and file_digest(Path(path) / "target_weights.safetensors") == item["weights_sha256"]), \
-                    "评估期间模型产物发生变化"
         status = "complete"
     finally:
         # 上下文退出和权重恢复成功后才算完成；异常在记录后自然传播。

@@ -1,7 +1,6 @@
 """通用模型操作：激活捕获、临时 hook、权重快照及原精度张量摘要。"""
 
 from contextlib import contextmanager
-from dataclasses import dataclass
 import hashlib
 import sys
 
@@ -84,43 +83,17 @@ def prepare_autograd(model: nn.Module) -> None:
                             cache[key] = value.clone()
 
 
-@dataclass(frozen=True)
-class TargetWeightSnapshot:
-    """同一模型的指定模块权重副本；参数身份用于精确原位恢复。"""
-    model_id: int
-    parameter_ids: dict[str, int]
-    weights: dict[str, torch.Tensor]
+TargetWeightSnapshot = dict[str, torch.Tensor]
 
 
 def snapshot_weights(model: nn.Module, names) -> TargetWeightSnapshot:
     """按给定模块名复制 weight 到 CPU，不改变精度或原参数。"""
-    modules = dict(model.named_modules())
-    weights, parameter_ids = {}, {}
-    for name in names:
-        weight = modules[name].weight
-        assert not weight.is_meta, f"cannot snapshot offloaded/meta weight: {name}"
-        weights[name] = weight.detach().to("cpu", copy=True)
-        parameter_ids[name] = id(weight)
-    return TargetWeightSnapshot(id(model), parameter_ids, weights)
+    return {name: model.get_submodule(name).weight.detach().to("cpu", copy=True) for name in names}
 
 
 def restore_weights(model: nn.Module, snapshot: TargetWeightSnapshot, names) -> None:
-    """先核对全部参数，再原位复制快照，保留参数身份和设备。"""
-    assert snapshot.model_id == id(model), "snapshot belongs to another model instance"
-    assert (
-        set(snapshot.weights) == set(names)
-        and set(snapshot.parameter_ids) == set(names)
-    ), "snapshot layer names differ from selected target layers"
-    modules = dict(model.named_modules())
-    for name in names:
-        weight, original = modules[name].weight, snapshot.weights[name]
-        assert id(weight) == snapshot.parameter_ids[name], f"target parameter was replaced after snapshot: {name}"
-        assert not weight.is_meta and isinstance(original, torch.Tensor), f"invalid or offloaded snapshot: {name}"
-        assert (
-            weight.shape == original.shape
-            and weight.dtype == original.dtype
-        ), f"snapshot shape/dtype differs from model: {name}"
+    """将同一模型的目标层快照原位复制回参数，保留参数身份和设备。"""
     with torch.no_grad():
         for name in names:
-            weight = modules[name].weight
-            weight.copy_(snapshot.weights[name].to(weight.device))
+            weight = model.get_submodule(name).weight
+            weight.copy_(snapshot[name].to(weight.device))

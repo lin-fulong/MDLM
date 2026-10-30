@@ -53,13 +53,12 @@ class ModelAdapter(ABC):
         """核对具体模型的层结构，返回目标层输入/输出维度。"""
 
     @abstractmethod
-    def forward_with_capture(self, model: Any, requests: tuple, *, module_names=None,
-                             require_all_logits_finite: bool = True) -> list[ForwardCapture]:
+    def forward_with_capture(self, model: Any, requests: tuple, *, module_names=None) -> list[ForwardCapture]:
         """对等长的 (输入, 捕获位置) 请求前向，保留请求顺序及原精度。"""
 
     @abstractmethod
     def forward_logits(self, model: Any, model_input: MaskedEditInput | KeepModelInput,
-                       positions: tuple[int, ...], *, check_finite: bool = True) -> Any:
+                       positions: tuple[int, ...]) -> Any:
         """读取给定位置的完整词表 logits，保留调用方所需计算图。"""
 
     @abstractmethod

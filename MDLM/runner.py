@@ -15,7 +15,6 @@ from MDLM.states import (build_supervision, collect_trajectories, edit_training_
                          keep_input_from_record, prepare_inputs)
 from MDLM.writeback import WritebackConfig, extract_keys, keep_matrices, solve_writeback_factor
 from data.dataset import load_dataset
-from data.readers.base import validate_edit_subjects
 from model.registry import get_adapter
 from util.gpu_runtime import execution_context
 from util.io import choose_run_id, project_path, read_config, read_json, write_json
@@ -26,8 +25,6 @@ def select_cases(cases, case_ids):
     if not case_ids:
         return cases
     selected = set(case_ids)
-    available = {case["case_id"] for case in cases} | {case.get("source_case_id", case["case_id"]) for case in cases}
-    assert not selected - available, f"数据集中没有这些可编辑案例：{sorted(selected - available)}"
     return [case for case in cases if case["case_id"] in selected
             or case.get("source_case_id", case["case_id"]) in selected]
 
@@ -53,11 +50,9 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
         ("statistics_scale", "statistics_scale")) if key in choices}}
     mode = choices.get("mode", "independent") if sequential is None else (
         "sequential" if sequential else "independent")
-    assert mode in ('independent', 'sequential'), "mode 必须为 independent 或 sequential"
     sequential = mode == "sequential"
     case_ids = case_ids if case_ids is not None else choices.get("case_ids")
     max_cases = max_cases_override if max_cases_override is not None else choices.get("max_cases")
-    assert max_cases is None or (type(max_cases) is int and max_cases >= 1), "max_cases 必须为正整数或 null"
     dataset = dataset_override.resolve() if dataset_override is not None else project_path(choices["dataset_path"])
     model_path = model_override.resolve() if model_override is not None else project_path(choices["model_path"])
     layers = tuple(choices["target_layers"])
@@ -71,17 +66,11 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
     # 先选例、再按源案例限量；不拆散同源事实，也不截断保持输入的数据源。
     if max_cases is not None:
         groups = dict(list(groups.items())[:max_cases])
-    if dataset_bundle.metadata["reader"] != "native":
-        validate_edit_subjects(case for group in groups.values() for case in group)
-
     execution = dict(choices.get("execution", {}))
     if device_override is not None:
         execution["device"] = device_override
         execution.setdefault("backend", "resident")
-    sampling = {"seed": seed, "steps": choices.get("denoise_steps"),
-                **{key: choices[key] for key in ("temperature", "replay_count") if key in choices}}
-    key_options = {name: choices["key_" + name] for name in ("replay_atol", "replay_rtol")
-                   if "key_" + name in choices}
+    sampling = {"seed": seed, "steps": choices.get("denoise_steps"), "temperature": choices.get("temperature", 0.0)}
     dtype, device = choices.get("torch_dtype", "auto"), choices.get("device_map", "auto")
     compute_device = "cpu"
     # 执行设备优先于模型 device_map；C/Q 沿用同一设备与保持批处理规则。
@@ -139,7 +128,7 @@ def run_dataset(config_file: Path, *, sequential=None, run_id_override=None, dat
                     result = edit_round(
                         model, adapter, trajectories, prepared["statistics"], dev_edits, dev_keeps, originals,
                         writeback=q, optimization=optimization, acceptance=acceptance, keep_train=train_keeps,
-                        key_options=key_options, keep_options=keep_options)
+                        keep_options=keep_options)
                     final_dir = None
                     if not sequential and result["decision"] == "accepted":
                         final_dir = save_final_model(model, adapter, output / f"case_{index}",
@@ -188,14 +177,14 @@ def reference_examples(model, adapter, rows) -> list[KeepTrainingExample]:
 
 def edit_round(model, adapter, trajectories, statistics, dev_edits, dev_keeps, originals, *,
                writeback: WritebackConfig, optimization: ResidualOptimizationConfig,
-               acceptance: AcceptanceConfig, keep_train=(), key_options=None, keep_options=None) -> dict:
+               acceptance: AcceptanceConfig, keep_train=(), keep_options=None) -> dict:
     """执行一轮编辑：theta_b 为传入模型，originals 始终为最初 W_0。"""
     # 公式（1）～（3）：筛选固定兼容状态，沿用事实/状态/位置的全局监督权重。
     facts, supervision = build_supervision(trajectories, adapter.mask_token_id)
     edits = edit_training_examples(facts)
 
     # 公式（4）～（9）：按事实顺序提取 K，逐层累计 C、解 HX=K，得到固定 Q=Xᵀ。
-    keys = extract_keys(model, adapter, trajectories, **(key_options or {}))
+    keys = extract_keys(model, adapter, trajectories)
     factors = {}
     for name, matrix in keep_matrices(model, adapter, statistics, **(keep_options or {})):
         factors[name] = solve_writeback_factor(

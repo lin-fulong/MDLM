@@ -19,7 +19,7 @@ from safetensors.torch import save_file
 from evaluation.artifacts import file_digest, read_evaluation_data, read_run
 from evaluation.framework import EvalTask, UltraEditFramework, get_framework
 from evaluation.inference import (GOLD_PROTOCOL, PROTOCOL, GenerationRequest, LLaDABackend,
-                                  Prediction, generate, prepare_request, validate_generation)
+                                  Prediction, generate, prepare_request)
 from evaluation.reporting import ScoreSummary, paired_scores, token_accuracy, write_record
 from evaluation.runner import run_evaluation
 from util.io import read_json, write_json
@@ -221,38 +221,24 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(request.seed, expected)
         gold_request, _ = prepare_request(self.adapter, task(), 2026, GOLD_PROTOCOL)
         self.assertNotEqual(request.seed, gold_request.seed)
-        for answer in ("", "\x7f", "\x00"):
-            with self.subTest(answer=answer), self.assertRaises(AssertionError):
-                prepare_request(self.adapter, replace(task(), answer=answer), 1)
-        with patch.object(self.adapter.tokenizer, "encode", side_effect=[[81], [82, 65]]):
-            with self.assertRaisesRegex(AssertionError, "边界"):
-                prepare_request(self.adapter, task(), 1)
-        with patch.object(self.adapter.tokenizer, "decode", return_value="wrong"):
-            with self.assertRaisesRegex(AssertionError, "解码"):
-                prepare_request(self.adapter, task(), 1)
 
-    def test_invalid_generation_and_boundaries(self):
-        for values in ({"steps": 0}, {"steps": True}, {"temperature": -1},
-                       {"temperature": float("nan")}, {"temperature": float("inf")},
-                       {"extra": 1}, None):
-            with self.subTest(values=values), self.assertRaises(AssertionError):
-                validate_generation(values)
-        for target in (None, (), (65,), (0, 66, 67), (999, 66, 67)):
-            with self.subTest(target=target), self.assertRaises(AssertionError):
+    def test_native_generation_and_scoring_errors(self):
+        for target in (None, (), (65,)):
+            with self.subTest(target=target), self.assertRaises(IndexError):
                 generate(self.model, self.adapter, self.request, protocol=GOLD_PROTOCOL, target=target)
-        with self.assertRaises(AssertionError):
-            generate(self.model, self.adapter, self.request, target=TARGET)
-        with self.assertRaises(AssertionError):
-            generate(self.model, self.adapter, self.request, protocol="unknown")
-        with self.assertRaises(AssertionError):
-            generate(self.model, self.adapter, replace(self.request, answer_length=0))
-        self.model.config.max_sequence_length = 4
-        with self.assertRaisesRegex(AssertionError, "上下文"):
-            self.gold()
-        self.model.config.max_sequence_length = 256
+        with self.assertRaises(TypeError):
+            self.gold(steps="two")
+        with self.assertRaises(TypeError):
+            self.gold(temperature="hot")
+        with self.assertRaises(TypeError):
+            generate(self.model, self.adapter, self.request, extra=1)
         with patch.object(self.adapter, "forward_logits", return_value=torch.full((3, 128), -torch.inf)):
-            with self.assertRaisesRegex(AssertionError, "普通 token"):
-                self.gold()
+            with self.assertRaises(RuntimeError):
+                self.gold(temperature=1)
+        with self.assertRaises(ValueError):
+            token_accuracy((65,), TARGET)
+        with self.assertRaises(ZeroDivisionError):
+            token_accuracy((), ())
 
     def test_old_protocol_matches_committed_implementation(self):
         # 使用本次修改前的真实源码对照，不在仓库内复制一套旧生成实现。
@@ -367,7 +353,7 @@ class RunnerTests(unittest.TestCase):
                     patch("evaluation.runner.write_record", side_effect=persist), \
                     patch.object(LLaDABackend, "close", close), redirect_stdout(io.StringIO()):
                 if fail or write_failure or checkpoint_failure or close_failure:
-                    with self.assertRaises((RuntimeError, OSError, AssertionError)):
+                    with self.assertRaises((RuntimeError, OSError, KeyError, AttributeError)):
                         run_evaluation(config, run_dir=run, eval_id="test")
                     result = read_json(root / "out/test/summary.json")
                     self.assertEqual(result["status"], "failed")
@@ -399,19 +385,45 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(float(adapter.model.layer.weight.detach()), 0)
             self.assertEqual(hashes, {p: file_digest(p) for p in hashes})
 
-    def test_checkpoint_validation_is_atomic(self):
+    def test_native_checkpoint_errors_restore_baseline(self):
         adapter = Adapter()
         with tempfile.TemporaryDirectory(prefix="mdlm_weights_") as temporary, \
                 patch("evaluation.inference.get_adapter", return_value=adapter):
             path = Path(temporary)
             backend = LLaDABackend({"model_path": temporary, "target_layers": [0], "torch_dtype": "float32"}, "cpu")
-            for weights in ({"other": torch.ones(1, 1)}, {"layer": torch.ones(2, 2)},
-                            {"layer": torch.ones(1, 1, dtype=torch.float64)},
-                            {"layer": torch.full((1, 1), float("nan"))}):
+            for weights, error in (({"other": torch.ones(1, 1)}, KeyError),
+                                   ({"layer": torch.ones(2, 2)}, RuntimeError)):
                 save_file(weights, str(path / "target_weights.safetensors"))
-                with self.assertRaises(AssertionError):
+                with self.assertRaises(error):
                     backend.use_checkpoint(path)
                 self.assertEqual(float(adapter.model.layer.weight.detach()), 0)
+            # 原生 copy_ 按参数精度复制，不再额外拒绝可转换的源 dtype。
+            save_file({"layer": torch.ones(1, 1, dtype=torch.float64)}, str(path / "target_weights.safetensors"))
+            backend.use_checkpoint(path)
+            self.assertEqual(adapter.model.layer.weight.dtype, torch.float32)
+            self.assertEqual(float(adapter.model.layer.weight.detach()), 1)
+            backend.close()
+
+        # 第二层复制失败时，第一层已经写入的值也必须恢复。
+        from util.nethook import restore_weights, snapshot_weights
+
+        model = TinyModel()
+        model.other = torch.nn.Linear(1, 1, bias=False)
+        model.other.weight.data.zero_()
+        adapter.load_model = Mock(return_value=model)
+        adapter.target_module_names = lambda: ("layer", "other")
+        adapter.snapshot_target_weights = lambda m: snapshot_weights(m, ("layer", "other"))
+        adapter.restore_target_weights = lambda m, s: restore_weights(m, s, ("layer", "other"))
+        with tempfile.TemporaryDirectory(prefix="mdlm_partial_") as temporary, \
+                patch("evaluation.inference.get_adapter", return_value=adapter):
+            path = Path(temporary)
+            backend = LLaDABackend({"model_path": temporary, "target_layers": [0], "torch_dtype": "float32"}, "cpu")
+            save_file({"layer": torch.ones(1, 1), "other": torch.ones(2, 2)},
+                      str(path / "target_weights.safetensors"))
+            with self.assertRaises(RuntimeError):
+                backend.use_checkpoint(path)
+            self.assertEqual(float(model.layer.weight.detach()), 0)
+            self.assertEqual(float(model.other.weight.detach()), 0)
             backend.close()
 
     def test_modes_and_rejected_cases_for_both_protocols(self):
@@ -459,22 +471,22 @@ class ReaderTests(unittest.TestCase):
                         self.assertEqual(list(iter_records(path)), list(enumerate(expected)))
                         self.assertEqual(list(iter_records(path, limit=1)), [(0, expected[0])])
 
-    def test_invalid_records_duplicate_ids_and_generator_cleanup(self):
+    def test_native_parsing_field_errors_and_generator_cleanup(self):
         import ijson
 
         with tempfile.TemporaryDirectory(prefix="mdlm_reader_") as temporary:
             path = Path(temporary) / "data.json"
-            for text in ("42", "[42]", "{", ""):
+            for text in ("{", ""):
                 path.write_text(text, encoding="utf-8")
-                with self.subTest(text=text), self.assertRaises((AssertionError, ijson.JSONError)):
+                with self.subTest(text=text), self.assertRaises(ijson.JSONError):
                     list(iter_records(path))
             path = path.with_suffix(".jsonl")
             path.write_text('{"id": 1}\nnot-json\n', encoding="utf-8")
             self.assertEqual(list(iter_records(path, limit=1)), [(0, {"id": 1})])
             with self.assertRaises(ValueError):
                 list(iter_records(path))
-            for limit in (0, -1, True):
-                with self.assertRaises(AssertionError):
+            for limit in (-1, "one"):
+                with self.assertRaises(ValueError):
                     list(iter_records(path, limit=limit))
             path.write_text('{"id": 1}\n{"id": 2}\n', encoding="utf-8")
             opened, original_open = [], Path.open
@@ -491,8 +503,9 @@ class ReaderTests(unittest.TestCase):
             self.assertTrue(opened and all(stream.closed for stream in opened))
             row = {"case_id": 1, "subject": "Alice", "src": "Alice?", "ans": " A ",
                    "rephrase": "Where is Alice?", "loc": "Bob", "loc_ans": " B "}
-            write_json(path.with_suffix(".json"), [row, row])
-            with self.assertRaisesRegex(AssertionError, "duplicate case_id"):
+            del row["src"]
+            write_json(path.with_suffix(".json"), [row])
+            with self.assertRaises(KeyError):
                 list(ZSREReader().iter_cases(path.with_suffix(".json")))
 
     def test_reader_fields_keep_probes_and_zsre_target_choice(self):
@@ -540,8 +553,6 @@ class ReaderTests(unittest.TestCase):
             for missing in (None, "", "null", " null "):
                 case = WikiBigEditReader().convert(path, 0, {**wiki, "mhop": missing, "mhop_ans": missing})
                 self.assertEqual(case["prompts"]["portability"], [])
-            with self.assertRaises(AssertionError):
-                WikiBigEditReader().convert(path, 0, {**wiki, "mhop": "Next?", "mhop_ans": None})
 
 
 class ByteTokenizer:

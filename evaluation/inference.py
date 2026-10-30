@@ -1,7 +1,6 @@
 """评估专用的定长全 mask 推理；不使用编辑轨迹、取键或优化代码。"""
 
 import hashlib
-import math
 from dataclasses import dataclass
 
 import torch
@@ -39,30 +38,13 @@ class Prediction:
     trace: tuple[dict, ...] = ()
 
 
-def validate_generation(config):
-    """归一化轮数和温度；只接受正整数步数或 null、有限非负温度。"""
-    assert isinstance(config, dict) and not set(config) - {"steps", "temperature"}, \
-        "generation 只支持 steps 和 temperature"
-    steps, temperature = config.get("steps"), config.get("temperature", 0.0)
-    assert steps is None or (type(steps) is int and steps >= 1), "steps 必须为正整数或 null"
-    assert type(temperature) in (int, float) and math.isfinite(temperature) and temperature >= 0, \
-        "temperature 必须为有限非负数"
-    return {"steps": steps, "temperature": temperature}
-
-
 def prepare_request(adapter, task, seed, protocol=PROTOCOL):
     """p = Tok(Render(q))，y = Tok(Render(q) + answer)[len(p):]。"""
-    # 连同提示分词，再核对前缀，避免答案边界处的 token 合并改变标签。
+    # 联合分词后按提示长度取答案；数据与 tokenizer 需满足稳定的答案边界。
     rendered = adapter.render_prompt(task.prompt)
     prompt = tuple(adapter.tokenizer.encode(rendered, add_special_tokens=False))
     full = tuple(adapter.tokenizer.encode(rendered + task.answer, add_special_tokens=False))
     target = full[len(prompt):]
-    assert prompt and full[:len(prompt)] == prompt and target, \
-        f"{task.case_id}/{task.probe_id}: 无法建立稳定的答案 token 边界"
-    assert adapter.mask_token_id not in prompt and not set(target) & (set(adapter.tokenizer.all_special_ids) | {adapter.mask_token_id}), \
-        "问题含预置 mask 或参考答案含特殊 token"
-    assert adapter.tokenizer.decode(target, skip_special_tokens=False, clean_up_tokenization_spaces=False) == task.answer, \
-        "参考答案无法精确分词/解码"
     derived = int.from_bytes(hashlib.sha256(f"{seed}:{protocol}:{task.task_id}".encode()).digest()[:8], "big") % (2**63)
     # 请求只含提示、长度和种子；标准答案由运行器按协议单独传递。
     return GenerationRequest(prompt, len(target), derived), target
@@ -71,23 +53,15 @@ def prepare_request(adapter, task, seed, protocol=PROTOCOL):
 @torch.no_grad()
 def generate(model, adapter, request, *, steps=None, temperature=0.0, protocol=PROTOCOL, target=None):
     """从全 mask 窗口去噪；按协议写预测或先评分后回填，返回评分预测。"""
-    validate_generation({"steps": steps, "temperature": temperature})
-    assert protocol in PROTOCOLS, f"未知评价协议: {protocol}"
     gold = protocol == GOLD_PROTOCOL
     length = request.answer_length
-    assert type(length) is int and length >= 1, "答案窗口必须非空"
     blocked = set(adapter.tokenizer.all_special_ids) | {adapter.mask_token_id}
     if gold:
         target = tuple(target) if target is not None else ()
-        assert len(target) == length and all(type(v) is int and v >= 0 and v not in blocked for v in target), \
-            "回填协议要求与窗口等长的普通标准 token"
-    else:
-        assert target is None, "自主去噪协议不接收标准答案"
     begin = len(request.prompt_ids)
     # K = L（steps=null），否则 K = min(steps, L)；state 初态为 [p, MASK × L]。
     steps = min(steps, length) if steps is not None else length
     state = list(request.prompt_ids) + [adapter.mask_token_id] * length
-    assert len(state) <= model.config.max_sequence_length, "评估输入超过模型上下文长度；不自动截断"
     remaining = list(range(begin, len(state)))
     scored_predictions = [None] * length if gold else []
     correct, trace = [None] * length if gold else [], []
@@ -95,11 +69,9 @@ def generate(model, adapter, request, *, steps=None, temperature=0.0, protocol=P
     for step in range(steps):
         current = KeepModelInput(tuple(state), (1,) * len(state), tuple(remaining))
         logits = adapter.forward_logits(model, current, tuple(remaining)).to(dtype=torch.float32, copy=True)
-        assert not gold or step != 0 or all(v < logits.shape[-1] for v in target), "标准 token 超出模型词表"
         logits[:, [i for i in blocked if 0 <= i < logits.shape[-1]]] = -torch.inf
         # P = softmax(logits / T)；T=0 时用 softmax(logits) 计算置信度，预测取 argmax。
         probabilities = torch.softmax(logits / temperature if temperature else logits, dim=-1)
-        assert torch.isfinite(probabilities).all(), "没有可生成的普通 token，或生成概率非有限"
         if temperature:
             if generator is None:
                 # 每道题独立随机流，不推进全局 RNG。
@@ -154,16 +126,18 @@ class LLaDABackend:
             return
         weights = load_file(str(path / "target_weights.safetensors"))
         names = self.adapter.target_module_names()
-        assert set(weights) == set(names), "最终权重的目标层集合不匹配"
         parameters = {name: self.model.get_submodule(name).weight for name in names}
-        # 先验证全部权重，再统一复制，防止只写入一部分层。
-        for name, parameter in parameters.items():
-            value = weights[name]
-            assert value.shape == parameter.shape and value.dtype == parameter.dtype and torch.isfinite(value).all(), \
-                f"最终权重形状、精度或数值非法: {name}"
-        with torch.no_grad():
-            for name, parameter in parameters.items():
-                parameter.copy_(weights[name].to(parameter.device))
+        values = {name: weights[name].to(parameter.device) for name, parameter in parameters.items()}
+        loaded = False
+        try:
+            with torch.no_grad():
+                for name, parameter in parameters.items():
+                    parameter.copy_(values[name])
+            loaded = True
+        finally:
+            # 张量复制交给 PyTorch；中途失败时恢复，防止留下半加载的模型。
+            if not loaded:
+                self.adapter.restore_target_weights(self.model, self.original)
 
     def close(self):
         """恢复原始目标层，并释放后端持有的模型和快照引用。"""

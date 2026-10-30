@@ -1,6 +1,6 @@
 """读取 WikiBigEdit 字段；缺失多跳题时不生成探针。"""
 
-from .base import BaseReader, probe, required_text
+from .base import BaseReader, probe
 
 
 class WikiBigEditReader(BaseReader):
@@ -8,14 +8,11 @@ class WikiBigEditReader(BaseReader):
     question_fields = {"generalization": "rephrase", "persona": "personas"}
 
     def convert(self, path, index, row):
-        answer = required_text(row, "ans")
-        case = self.make_case(path, index, row, required_text(row, "update"), answer,
-                              subject=required_text(row, "subject"))
+        answer = row["ans"]
+        case = self.make_case(path, index, row, row["update"], answer, subject=row["subject"])
         question, target = row.get("mhop"), row.get("mhop_ans")
-        missing = lambda value: value is None or (isinstance(value, str) and value.strip() in ("", "null"))
-        question_missing = missing(question)
-        # 多跳题可以缺失，但问题和答案必须成对存在。
-        assert question_missing == missing(target), "mhop 和 mhop_ans 必须同时存在或同时缺失"
+        question_missing = question is None or (isinstance(question, str) and question.strip() in ("", "null"))
+        # 源格式用空值或 "null" 表示没有多跳题。
         if not question_missing:
             case["prompts"]["portability"] = [probe(case["case_id"], "portability", question, target)]
         case["metadata"].update(target_field="ans", tag=row.get("tag"))

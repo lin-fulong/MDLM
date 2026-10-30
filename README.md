@@ -18,7 +18,7 @@ python -m pip check
 模型目录默认为 `model/models/LLaDA-8B-Instruct`，数据集默认为 `data/datasets/cases.jsonl`。
 模型文件和数据集不上传至 Git。
 小模型测试能验证计算和接口；完整 8B 实验仍需要足够的显存与内存。
-算法输入、分词对齐和权重约束使用 `assert`，请使用普通 `python` 启动，不使用会移除断言的 `python -O` / `-OO`。
+运行错误直接使用 Python、PyTorch、分词器和解析库的原生异常；源码不使用显式 `raise` 或 `assert`。输入应符合数据格式和模型约定，P5 的数值判定、前向等价性及接受门槛仍按算法执行，失败后的 hook 清理和权重恢复保留。
 
 ## 启动
 
@@ -69,7 +69,7 @@ python -u main.py --mode independent
 - `data/validation/alignment.py`：按实际 tokenizer 偏移定位主体 token，取得稳定边界的监督答案；为公式（1）～（4）和开发编辑提供位置与目标。
 - `model/registry.py`：runner 和最终结果重载共用的适配器工厂，默认加载 LLaDA 的本地 tokenizer。
 - `data/dataset.py`：按配置选择读取器；保留原生 JSON/JSONL、gold_ready 源案例展开及可选转换命令。
-- `data/readers/`：ZSRE、UltraEditBench、WikiBigEdit、FEVER 的文本映射、流式读取与必要字段检查；不执行模型分词或评估。
+- `data/readers/`：ZSRE、UltraEditBench、WikiBigEdit、FEVER 的文本映射和流式读取；必需字段直接按字典键读取，不执行模型分词或评估。
 - `MDLM/runner.py`：组合配置、按源案例运行独立/连续编辑，固定最初 θ₀/W₀；`edit_round` 串联单轮算法，并提供最终权重保存和重载函数。
 - `MDLM/states.py`：编辑/开发/保持输入与固定分区、自主去噪、兼容筛选、三级监督权重；公式（1）～（3）及后续 K/C/KL 的输入配方。
 - `MDLM/writeback.py`：提取 K、逐层累计 C，以 Cholesky 求解固定 Q，公式（4）～（9）；每层 C 求解后释放。
@@ -159,7 +159,7 @@ python -u evaluate.py --run-dir "runs/<run_id>" --config configs/evaluation/ultr
 
 新协议运行示例：`python -u evaluate.py --run-dir "runs/<run_id>" --config configs/evaluation/ultraedit_gold.json`。两个配置默认 `temperature=0.0`、`steps=null`。新协议两侧各自重新按置信度选位，顺序可能不同；trace.positions 为从 0 开始的答案位置，trace 长度即实际轮数，每轮 positions 长度即选位数量。新协议的完全匹配和前后一致率均比较评分预测，不使用回填后的输入。
 
-每次运行生成 manifest.json、predictions.jsonl、summary.json。manifest 记录源数据/目标权重/评估代码摘要、任务摘要、配置及环境；predictions 保存逐题基线和配对预测、参考标签与分数；summary 保存覆盖率及错误信息。失败即停止并标为 failed，部分指标不可当作完整结果；不静默略过运行错误，不覆盖已有评估目录。无效产物在加载模型前报错。
+每次运行生成 manifest.json、predictions.jsonl、summary.json。manifest 记录源数据/目标权重/评估代码摘要、任务摘要、配置及环境；predictions 保存逐题基线和配对预测、参考标签与分数；summary 保存覆盖率及错误信息。原生运行异常传播并标为 failed，部分指标不可当作完整结果；不跳过运行错误，不覆盖已有评估目录。摘要只记录评价使用的版本，不再重复扫描输入是否变化。
 
 现有编辑产物没有源数据和原模型权重的编辑时摘要，因此 manifest 会明确注明这两项历史身份未验证，当前摘要只证明评估时版本。当前 LS 属于 benchmark preservation，未验证与编辑保持池独立，不应称为独立保持测试集。原始模型路径迁移必须指向同一份基础权重。
 

@@ -1,9 +1,6 @@
 {
   "denoise_steps": null,
   "temperature": 0.0,
-  "replay_count": 1,
-  "key_replay_atol": 0.01,
-  "key_replay_rtol": 0.001,
 
   "ridge": 0.01,
   "rho": 0.001,

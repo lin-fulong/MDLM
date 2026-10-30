@@ -52,7 +52,6 @@ class WeightMerge:
             for begin in range(0, q.shape[1], chunk_size):
                 # 公式（13）：真正写回的是 RQ；按列分块限制中间内存。
                 delta[:, begin:begin + chunk_size] = r_device @ q_device[:, begin:begin + chunk_size]
-            assert torch.isfinite(delta).all(), f"nonfinite actual increment at {name}"
             self.increments[name] = delta
 
     @torch.no_grad()
@@ -79,10 +78,9 @@ class WeightMerge:
 def capture_outputs(adapter, model, model_input, positions, names):
     """记录因子/实际合并模型的读出；通用 hook 只负责逐次复制目标层输出。"""
     with capture_module_outputs(model, names) as outputs:
-        logits = adapter.forward_logits(model, model_input, positions, check_finite=False).detach().clone()
+        logits = adapter.forward_logits(model, model_input, positions).detach().clone()
         if not torch.isfinite(logits).all():
             return None
-        assert all(outputs.values()), "a P5 target module was not called"
         return logits, outputs
 
 
@@ -146,7 +144,7 @@ def development_edits(cases: list[dict], selections: tuple, adapter) -> list[Edi
 
 
 @torch.no_grad()
-def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float, *, check_finite=True) -> float:
+def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float) -> float:
     """公式（17）：当前实际存储权重相对最初 W_0 的整体净变化比例。"""
     scale = epsilon
     for name, weight in merger.parameters.items():
@@ -164,24 +162,19 @@ def cumulative_change(merger: WeightMerge, originals: dict, epsilon: float, *, c
             denominator = math.hypot(denominator, float(stable_frobenius_norm(w0)))
     divisor = max(denominator, epsilon / scale)
     value = numerator / divisor if divisor else math.inf
-    if check_finite:
-        assert math.isfinite(value), "nonfinite cumulative parameter change"
     return value
 
 
 @torch.no_grad()
-def development_metrics(merger, adapter, edits, keeps, originals, epsilon, logits=None, *, check_finite=True) -> dict:
+def development_metrics(merger, adapter, edits, keeps, originals, epsilon, logits=None) -> dict:
     """计算 F_dev、完整词表 G_dev 和累计 U，可复用合并一致性前向的 logits。"""
-    assert edits and keeps, "P5 requires both development edit and preservation readouts even when training beta=0"
     edit = math.fsum(float(edit_loss(adapter, merger.model, item) if logits is None
                           else edit_loss_from_logits(logits[index], item)) for index, item in enumerate(edits))
     # 公式（16）：复用完整词表 KL(theta_0 || theta_alpha)，开发保持始终执行。
     keep = math.fsum(float(keep_loss(adapter, merger.model, item) if logits is None
                           else keep_loss_from_logits(logits[len(edits) + index], item))
                      for index, item in enumerate(keeps))
-    change = cumulative_change(merger, originals, epsilon, check_finite=check_finite)
-    if check_finite:
-        assert all(math.isfinite(value) for value in (edit, keep, change)), "nonfinite P5 development metrics"
+    change = cumulative_change(merger, originals, epsilon)
     return {"f_dev": edit, "g_dev": keep, "u": change}
 
 
@@ -214,7 +207,7 @@ def select_merged_candidate(merger: WeightMerge, adapter, factors: dict, residua
                 else:
                     row["equivalence"] = equivalence
                     metrics = development_metrics(merger, adapter, edits, keeps, originals, settings.epsilon,
-                                                  merged_logits, check_finite=False)
+                                                  merged_logits)
                     # 仍先检查累计变化，再检查全部开发指标，保持原拒绝原因和报告字段。
                     if not math.isfinite(metrics["u"]):
                         row["reasons"] = ["nonfinite cumulative parameter change"]

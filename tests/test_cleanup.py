@@ -5,6 +5,7 @@ from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict
 import importlib
 import io
+from itertools import product
 from pathlib import Path
 import subprocess
 import sys
@@ -78,7 +79,7 @@ class AlgorithmRegressionTests(unittest.TestCase):
             file = ROOT / path
             if file.is_file():
                 found.extend((path, node.lineno) for node in ast.walk(ast.parse(file.read_text(encoding="utf-8-sig")))
-                             if isinstance(node, ast.Raise))
+                             if isinstance(node, (ast.Raise, ast.Assert)))
         self.assertEqual(found, [])
 
     def test_state_sampling_alignment_and_supervision_match_baseline(self):
@@ -92,9 +93,9 @@ class AlgorithmRegressionTests(unittest.TestCase):
                 old_model, old_adapter, old_cases = fixture(previous_adapter)
                 old_cases[0]["prompts"]["edit"][0]["answer"] = "BC"
                 before = old.collect_trajectories(old_model, old_adapter, old_cases, steps=steps,
-                                                  temperature=temperature, replay_count=1)
+                                                  temperature=temperature)
                 after = current.collect_trajectories(model, adapter, cases, steps=steps,
-                                                     temperature=temperature, replay_count=1)
+                                                     temperature=temperature)
                 self.assertEqual([asdict(t) for t in before], [asdict(t) for t in after])
                 self.assertEqual(old.build_supervision(before, 0), current.build_supervision(after, 0))
                 prepared = [module.prepare_inputs(cases, adapter) for module in (old, current)]
@@ -110,11 +111,13 @@ class AlgorithmRegressionTests(unittest.TestCase):
         for protocol in (inference.PROTOCOL, inference.GOLD_PROTOCOL):
             for steps in (None, 1, 2, 9):
                 for temperature in (0, 0.7, 1.5):
-                    for edited in (False, True):
+                    for edited, dtype in product((False, True), (torch.float32, torch.float16, torch.bfloat16)):
                         results, inputs = [], []
                         for module in (old, inference):
                             model, adapter = TinyModel(), Adapter()
                             model.layer.weight.data.fill_(float(edited))
+                            forward = adapter.forward_logits
+                            adapter.forward_logits = lambda *args, fn=forward, dt=dtype: fn(*args).to(dt)
                             prediction = module.generate(model, adapter, module.GenerationRequest((81, 124), 3, 2026),
                                 steps=steps, temperature=temperature, protocol=protocol,
                                 target=TARGET if protocol == inference.GOLD_PROTOCOL else None)
@@ -136,7 +139,7 @@ class AlgorithmRegressionTests(unittest.TestCase):
             model, adapter, cases = fixture(adapter_class)
             name = adapter.target_module_names()[0]
             prepared = s.prepare_inputs(cases, adapter)
-            trajectories = s.collect_trajectories(model, adapter, cases, replay_count=1)
+            trajectories = s.collect_trajectories(model, adapter, cases)
             facts, supervision = s.build_supervision(trajectories, 0)
             edits = s.edit_training_examples(facts)
             keys = w.extract_keys(model, adapter, trajectories)
@@ -278,10 +281,10 @@ class AlgorithmRegressionTests(unittest.TestCase):
         alignment = align_edit_prompt(tokenizer, "Alice?", "Alice", "B")
         self.assertEqual(alignment.subject_positions, tuple(range(5)))
         self.assertEqual(alignment.answer_ids, (67,))
-        for prompt, subject, answer in (("Alice Alice", "Alice", "B"), ("Bob?", "Alice", "B"),
-                                       ("Alice?", "Alice", "")):
-            with self.assertRaises(AssertionError):
-                align_edit_prompt(tokenizer, prompt, subject, answer)
+        with self.assertRaises(ValueError):
+            align_edit_prompt(tokenizer, "Bob?", "Alice", "B")
+        with self.assertRaises(TypeError):
+            align_edit_prompt(tokenizer, "Alice?", None, "B")
         with self.assertRaises(TypeError):
             ModelAdapter()
         self.assertIn("forward_logits", ModelAdapter.__abstractmethods__)
