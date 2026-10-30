@@ -2,7 +2,7 @@
 
 import ast
 from contextlib import contextmanager, redirect_stdout
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import importlib
 import io
 from itertools import product
@@ -281,13 +281,92 @@ class AlgorithmRegressionTests(unittest.TestCase):
         alignment = align_edit_prompt(tokenizer, "Alice?", "Alice", "B")
         self.assertEqual(alignment.subject_positions, tuple(range(5)))
         self.assertEqual(alignment.answer_ids, (67,))
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SystemExit):
             align_edit_prompt(tokenizer, "Bob?", "Alice", "B")
-        with self.assertRaises(TypeError):
+        with self.assertRaises(SystemExit):
             align_edit_prompt(tokenizer, "Alice?", None, "B")
         with self.assertRaises(TypeError):
             ModelAdapter()
         self.assertIn("forward_logits", ModelAdapter.__abstractmethods__)
+
+    def test_subject_ambiguity_and_unstable_answer_stop(self):
+        from data.validation.alignment import align_edit_prompt
+        from evaluation.inference import prepare_request
+        from test_evaluation import Adapter, task
+
+        # 对应真实 UltraEditBench 案例 0004695；不能取 What 的首字母作为实体 W。
+        text = "What area does W include that is known for its residential neighborhoods and local amenities?"
+        with self.assertRaisesRegex(SystemExit, "唯一"):
+            align_edit_prompt(OffsetTokenizer(), text, "W", "A")
+        adapter = Adapter()
+        with patch.object(adapter.tokenizer, "encode", side_effect=[[81], [82, 65]]):
+            with self.assertRaisesRegex(SystemExit, "边界"):
+                prepare_request(adapter, task(), 2026)
+        for answer in ("", "\x00", "\x7f"):
+            with self.assertRaises(SystemExit):
+                prepare_request(adapter, replace(task(), answer=answer), 2026)
+
+    def test_keep_data_and_statistics_constraints(self):
+        from MDLM import states, writeback, merge
+
+        model, adapter, cases = fixture()
+        for scale in (-1, 0, float("nan")):
+            with self.assertRaisesRegex(SystemExit, "statistics_scale"):
+                states.prepare_inputs(cases, adapter, settings={"statistics_scale": scale})
+        for count in (0, 1):
+            with self.assertRaisesRegex(SystemExit, "至少需要两道"):
+                states.prepare_inputs(cases, adapter, keep_pool=cases[0]["prompts"]["preservation"][:count])
+        with self.assertRaises(SystemExit):
+            writeback.SecondMomentAccumulator(2).add(torch.ones(1, 2), [-1])
+        with self.assertRaisesRegex(SystemExit, "非空开发"):
+            merge.development_metrics(None, adapter, [], [], {}, 1e-12)
+
+    def test_nan_sampling_and_invalid_trajectory_stop(self):
+        from dataclasses import replace
+        from MDLM import states, writeback
+        from model.base import ForwardCapture
+
+        model, adapter, cases = fixture()
+        initial, _ = states.prepare_edit_input(adapter, cases[0], "e")
+        with patch("MDLM.states.capture_edit", return_value=ForwardCapture(torch.full((1, 258), float("nan")), {})):
+            with self.assertRaisesRegex(SystemExit, "采样概率"):
+                states.sample_denoise(model, adapter, initial, steps=1, temperature=0, seed=2026)
+        trajectory = states.collect_trajectories(model, adapter, cases)[0]
+        bad = replace(trajectory, trace=replace(trajectory.trace, revealed_tokens=(((999, 65),),)))
+        with self.assertRaisesRegex(SystemExit, "揭示记录"):
+            states.classify_fact(bad, 0)
+        name = adapter.target_module_names()[0]
+        with torch.no_grad():
+            model.get_submodule(name).weight.fill_(2)
+        with self.assertRaisesRegex(SystemExit, "K 取键"):
+            writeback.extract_keys(model, adapter, [trajectory])
+
+    def test_semantic_stop_saves_report_and_restores_round(self):
+        from MDLM import runner
+
+        for mode in ("independent", "sequential", "misspelled"):
+            with tempfile.TemporaryDirectory(prefix="mdlm_stop_") as temporary:
+                root = Path(temporary)
+                model, adapter, cases = fixture()
+                name = adapter.target_module_names()[0]
+                write_json(root / "cases.json", cases)
+                write_json(root / "config.json", {"dataset_path": str(root / "cases.json"),
+                    "model_path": str(root / "base"), "target_layers": [0], "mode": mode,
+                    "output_root": str(root / "runs"), "ridge": 0.01, "rho": 0.001,
+                    "execution": {"backend": "resident", "device": "cpu"}})
+                def fail_round(*args, **kwargs):
+                    with torch.no_grad():
+                        model.get_submodule(name).weight.fill_(42)
+                    sys.exit("模拟语义错误")
+                adapter.load_model = Mock(return_value=model)
+                with patch("MDLM.runner.get_adapter", return_value=adapter), \
+                        patch("MDLM.runner.edit_round", side_effect=fail_round), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        runner.run_dataset(root / "config.json", run_id_override="stop")
+                report = read_json(root / "runs/stop/run_report.json")
+                self.assertEqual(report["status"], "failed")
+                self.assertIn("mode" if mode == "misspelled" else "模拟语义错误", report["failure"])
+                self.assertTrue(torch.equal(model.get_submodule(name).weight, torch.zeros(2, 2)))
 
     def test_p5_numerical_equivalence_and_gate_rejections_match_baseline(self):
         from MDLM import merge, optimize, states

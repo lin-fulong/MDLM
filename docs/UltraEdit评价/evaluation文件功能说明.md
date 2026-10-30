@@ -1,6 +1,6 @@
 # evaluation 文件、函数与数学逻辑说明
 
-本文按当前代码说明文件职责、每个手写函数的作用及对应公式。公式不编号；未涉及数学计算的函数明确标为读取或保存操作。运行错误由 Python、PyTorch、tokenizer 和解析库原生异常处理。
+本文按当前代码说明文件职责、每个手写函数的作用及对应公式。公式不编号；未涉及数学计算的函数明确标为读取或保存操作。文件、字段和张量运行错误由底层库原生异常处理；关键语义错误用 sys.exit(原因) 结束运行，并由入口保存 failed 摘要。
 
 建议先阅读“与既定方案是否对齐”，再看文件和函数表；需要理解一次预测时，阅读后面的数学逻辑。
 
@@ -59,7 +59,7 @@ manifest.json / predictions.jsonl / summary.json
 | --- | --- | --- |
 | file_digest(path) | 分块读取文件，返回 SHA-256 摘要，记录评价时的输入版本 | 文件摘要，无评价公式 |
 | read_run(run_dir) | 读取 run_report，按模式确定每轮 checkpoint，返回 report、rounds 和产物摘要表 | 为 before/after 确定模型状态 |
-| read_run.checkpoint(expected) | 内部函数：按 MDLM 保存规则定位 case_N/final_model，读取 model.json 和权重摘要 | 产物定位，无评分公式 |
+| read_run.checkpoint(reference, expected) | 核对报告引用，按 MDLM 保存规则定位 case_N/final_model，读取 model.json 和权重摘要 | 产物定位，无评分公式 |
 | read_evaluation_data(report, dataset_override) | 恢复原读取器、限量、参数和选题种子，调用 data.dataset.load_dataset，返回 DatasetBundle；主体标注不影响评价题目，不要求重建编辑保持池 | 决定题目集合，不生成或修改标签 |
 | model_settings(report, artifacts, config, override) | 从产物确定原始模型、目标层和加载精度；全部独立拒绝而无产物时由配置补充层与精度 | 模型加载配置，无评分公式 |
 
@@ -111,7 +111,7 @@ metrics 是题组到结果名的固定映射：
 | prepare_request(adapter, task, seed, protocol) | 渲染问题并联合分词，返回不含标签的请求及单独的 target；按协议和任务派生种子 | p、y、L 的定义；随机流初始化 |
 | generate(model, adapter, request, steps, temperature, protocol, target) | 一次题目的完整去噪过程；两协议共用预测和选位，仅输入更新不同 | 下文全部预测、选位及状态更新公式 |
 | LLaDABackend.__init__(settings, device) | 加载独立评价模型并保存原始目标层快照 | 固定 W_0，为模型切换提供恢复基准 |
-| LLaDABackend.use_checkpoint(path) | 先恢复原始目标权重，再用 PyTorch 原位复制保存权重；复制失败后恢复原始模型，异常自然传播；None 仅恢复 | W←W_0，再 W_target←W_saved；不是重新计算编辑增量 |
+| LLaDABackend.use_checkpoint(path) | 先恢复原始目标权重，检查完整层集合、形状、精度和有限性，再统一复制；失败时保持或恢复原模型；None 仅恢复 | W←W_0，再 W_target←W_saved；不是重新计算编辑增量 |
 | LLaDABackend.close() | 恢复原始目标权重，释放后端持有的模型和快照引用 | 恢复操作，不计算分数 |
 
 ### 分词和初始状态
@@ -255,7 +255,8 @@ $$
 
 | 函数 | 作用 | 数学对应 |
 | --- | --- | --- |
-| run_evaluation(config_file, run_dir, device, model_path, dataset_path, eval_id) | 补齐默认生成参数，读取配置和产物，构造任务；执行全部 before，再按 checkpoint 分组执行 after；记录逐题预测、汇总与失败状态 | 调用上文公式；另计算接受率和覆盖率 |
+| run_evaluation(config_file, **options) | 读取配置、创建新的输出目录，保证准备阶段失败也写入 summary.json | 运行边界，不计算分数 |
+| _evaluate(config, output, identifier, ...) | 检查产物与任务，执行全部 before，再按 checkpoint 分组执行 after；核对输入摘要并保存统计 | 调用上文公式；计算接受率和覆盖率 |
 
 $$
 \operatorname{acceptance\_rate}=\frac{\text{接受的编辑源案例数}}{\text{尝试的编辑源案例数}},
@@ -264,6 +265,8 @@ $$
 $$
 
 两者分母不同。拒绝案例不会从评价分母中消失。每题在配对结果成功写入后才累计 completed；中断时保存 failed 和当前任务信息，模型恢复由 ExitStack 调用 close 完成。
+
+准备阶段尚未建立合法任务集合时，失败摘要的 expected_tasks 和 coverage 为 null，不能把它解释为已完成的零题评价。
 
 manifest.json 保存协议、配置、任务和输入摘要及环境信息；predictions.jsonl 保存 before/paired 预测和新协议轨迹；summary.json 保存完成状态、覆盖率和统计结果。
 
@@ -277,12 +280,12 @@ manifest.json 保存协议、配置、任务和输入摘要及环境信息；pre
 
 ## 本轮精简及验证范围
 
-保留六文件结构，公式注释不编号。源码不使用显式 raise 或 assert，移除输入类型、重复 ID、语义一致性和运行期间文件变化的手写检查。runner 使用 finally 保存失败状态，异常在恢复后自然传播，模型恢复仍由 ExitStack 完成。
+保留六文件结构，公式注释不编号。源码不使用显式 raise 或 assert；主体/答案对齐、任务唯一性、产物来源、权重形状/精度/有限性及输入版本等必要约束不满足时，调用 sys.exit(原因)。runner 的 finally 同时处理原生错误与 SystemExit，保存失败状态；模型恢复由 ExitStack 完成。
 
-迁入的数据读取器共用 JSON/JSONL 迭代，必需字段直接读取字典键；读取上限交给 islice，解析交给 json/ijson。删除 validate_limit、required_text 和主体预检等空壳函数。文件关闭、有效读取限量、字段映射、原始文本、案例编号、FEVER 改写选择和缺失多跳题的处理不变。
+迁入的数据读取器共用 JSON/JSONL 迭代，必需字段直接读取字典键；validate_limit 检查正整数/null，解析交给 json/ijson。重复 ID、未知读取参数和非空题目等必要语义约束在转换时检查；原始文本和字段映射不变，不回写数据集。
 
 未知框架、缺失必要字典字段等错误直接由 Python 抛出，JSON 解析和依赖错误直接使用库的原始异常；不再保证所有错误都包装成 ValueError。错误仍会中断执行，不跳过坏记录、不回退默认答案、不改变标准答案或评分结果。
 
-问题和标签应满足非空、同位置等长、稳定分词前缀及唯一 ID 等输入约定。Python 和 PyTorch 的原生异常不能替代这些语义约定，程序不再主动逐项验证。评分配对使用 zip(strict=True)，空标签产生原生除零错误。P5 的数值或等价性失败仍返回明确的拒绝结果，这些条件属于算法接受规则。
+问题和标签必须满足非空、同位置等长、稳定分词前缀及唯一 ID 等约定。prepare_request 复用 data.validation.alignment.encode_answer，统一检查编辑/保持/评价的答案边界。空任务在模型加载前终止并保存失败摘要；评分配对仍用 zip(strict=True)。P5 候选的数值或等价性失败仍返回 rejected，不混同于输入错误。
 
 测试入口：python -B -m unittest discover -s tests -p 'test_*.py' -v。测试包含方案示例、温度和轮数、权重模式、原生错误恢复、旧协议回归、真实样本配模拟模型的完整入口及清理前后的算法数值对照。真实大模型验证与模拟验证分开，不以测试通过替代真实权重验收。

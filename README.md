@@ -18,7 +18,7 @@ python -m pip check
 模型目录默认为 `model/models/LLaDA-8B-Instruct`，数据集默认为 `data/datasets/cases.jsonl`。
 模型文件和数据集不上传至 Git。
 小模型测试能验证计算和接口；完整 8B 实验仍需要足够的显存与内存。
-运行错误直接使用 Python、PyTorch、分词器和解析库的原生异常；源码不使用显式 `raise` 或 `assert`。输入应符合数据格式和模型约定，P5 的数值判定、前向等价性及接受门槛仍按算法执行，失败后的 hook 清理和权重恢复保留。
+文件、字段和张量运算错误使用底层库原生异常。主体歧义、答案对齐、空开发集、非有限概率及不合法权重等关键语义错误用 `sys.exit(原因)` 非零退出；运行器先保存 failed 报告，并在退出前清理 hook、恢复权重。源码不使用显式 `raise` 或 `assert`。P5 的正常候选拒绝仍按既定门槛返回 rejected，与运行失败区分。
 
 ## 启动
 
@@ -159,7 +159,7 @@ python -u evaluate.py --run-dir "runs/<run_id>" --config configs/evaluation/ultr
 
 新协议运行示例：`python -u evaluate.py --run-dir "runs/<run_id>" --config configs/evaluation/ultraedit_gold.json`。两个配置默认 `temperature=0.0`、`steps=null`。新协议两侧各自重新按置信度选位，顺序可能不同；trace.positions 为从 0 开始的答案位置，trace 长度即实际轮数，每轮 positions 长度即选位数量。新协议的完全匹配和前后一致率均比较评分预测，不使用回填后的输入。
 
-每次运行生成 manifest.json、predictions.jsonl、summary.json。manifest 记录源数据/目标权重/评估代码摘要、任务摘要、配置及环境；predictions 保存逐题基线和配对预测、参考标签与分数；summary 保存覆盖率及错误信息。原生运行异常传播并标为 failed，部分指标不可当作完整结果；不跳过运行错误，不覆盖已有评估目录。摘要只记录评价使用的版本，不再重复扫描输入是否变化。
+每次运行生成 manifest.json、predictions.jsonl、summary.json。manifest 记录源数据/目标权重/评估代码摘要、任务摘要、配置及环境；predictions 保存逐题基线和配对预测、参考标签与分数；summary 保存覆盖率及错误信息。原生运行异常传播并标为 failed，部分指标不可当作完整结果；不跳过运行错误，不覆盖已有评估目录。运行前登记输入摘要，加载权重前和评价结束后复核；这些摘要仅保证本次评价期间输入未变，不能证明与编辑当时版本相同。
 
 现有编辑产物没有源数据和原模型权重的编辑时摘要，因此 manifest 会明确注明这两项历史身份未验证，当前摘要只证明评估时版本。当前 LS 属于 benchmark preservation，未验证与编辑保持池独立，不应称为独立保持测试集。原始模型路径迁移必须指向同一份基础权重。
 

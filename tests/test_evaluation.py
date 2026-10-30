@@ -224,21 +224,32 @@ class ProtocolTests(unittest.TestCase):
 
     def test_native_generation_and_scoring_errors(self):
         for target in (None, (), (65,)):
-            with self.subTest(target=target), self.assertRaises(IndexError):
+            with self.subTest(target=target), self.assertRaises(SystemExit):
                 generate(self.model, self.adapter, self.request, protocol=GOLD_PROTOCOL, target=target)
-        with self.assertRaises(TypeError):
+        with self.assertRaises(SystemExit):
             self.gold(steps="two")
-        with self.assertRaises(TypeError):
+        with self.assertRaises(SystemExit):
             self.gold(temperature="hot")
         with self.assertRaises(TypeError):
             generate(self.model, self.adapter, self.request, extra=1)
         with patch.object(self.adapter, "forward_logits", return_value=torch.full((3, 128), -torch.inf)):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(SystemExit):
                 self.gold(temperature=1)
         with self.assertRaises(ValueError):
             token_accuracy((65,), TARGET)
         with self.assertRaises(ZeroDivisionError):
             token_accuracy((), ())
+
+    def test_invalid_protocol_inputs_stop_before_forward(self):
+        for protocol in (PROTOCOL, GOLD_PROTOCOL):
+            for steps in (0, -1, True):
+                with self.assertRaises(SystemExit):
+                    generate(self.model, self.adapter, self.request, protocol=protocol,
+                             target=TARGET if protocol == GOLD_PROTOCOL else None, steps=steps)
+        self.assertEqual(self.adapter.inputs, [])
+        self.model.config.max_sequence_length = 4
+        with self.assertRaisesRegex(SystemExit, "上下文"):
+            self.gold()
 
     def test_old_protocol_matches_committed_implementation(self):
         # 使用本次修改前的真实源码对照，不在仓库内复制一套旧生成实现。
@@ -287,7 +298,7 @@ class ReportingTests(unittest.TestCase):
 
 class RunnerTests(unittest.TestCase):
     def run_fixture(self, mode, decisions, protocol, fail=False, write_failure=False,
-                    checkpoint_failure=False, close_failure=False):
+                    checkpoint_failure=False, close_failure=False, nonfinite=False, source_change=False):
         with tempfile.TemporaryDirectory(prefix="mdlm_eval_") as temporary:
             root = Path(temporary)
             run = root / "run"
@@ -330,8 +341,17 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual([r["checkpoint"] is not None for r in parsed_rounds],
                              [mode == "sequential" or d == "accepted" for d in decisions])
             adapter = Adapter()
+            if source_change:
+                forward = adapter.forward_logits
+                def mutate_source(*args):
+                    # 只改本测试临时源文件，模拟评价期间被外部进程替换。
+                    source.write_text(source.read_text(encoding="utf-8") + " ", encoding="utf-8")
+                    return forward(*args)
+                adapter.forward_logits = mutate_source
             if fail:
                 adapter.forward_logits = Mock(side_effect=RuntimeError("模拟前向失败"))
+            if nonfinite:
+                adapter.forward_logits = Mock(return_value=torch.full((3, 128), float("nan")))
             if checkpoint_failure:
                 adapter.target_module_names = lambda: ("other",)
 
@@ -352,14 +372,14 @@ class RunnerTests(unittest.TestCase):
             with patch("evaluation.inference.get_adapter", return_value=adapter), \
                     patch("evaluation.runner.write_record", side_effect=persist), \
                     patch.object(LLaDABackend, "close", close), redirect_stdout(io.StringIO()):
-                if fail or write_failure or checkpoint_failure or close_failure:
-                    with self.assertRaises((RuntimeError, OSError, KeyError, AttributeError)):
+                if fail or write_failure or checkpoint_failure or close_failure or nonfinite or source_change:
+                    with self.assertRaises((RuntimeError, OSError, KeyError, AttributeError, SystemExit)):
                         run_evaluation(config, run_dir=run, eval_id="test")
                     result = read_json(root / "out/test/summary.json")
                     self.assertEqual(result["status"], "failed")
                     self.assertEqual(result["error_count"], 1)
-                    self.assertEqual(result["completed_tasks"], 5 * len(decisions) if close_failure else 0)
-                    self.assertEqual(result["coverage"], 1 if close_failure else 0)
+                    self.assertEqual(result["completed_tasks"], 5 * len(decisions) if close_failure or source_change else 0)
+                    self.assertEqual(result["coverage"], 1 if close_failure or source_change else 0)
                     if checkpoint_failure:
                         self.assertIsNone(result["current_task_id"])
                 else:
@@ -383,6 +403,8 @@ class RunnerTests(unittest.TestCase):
                             self.assertEqual(len(row["before"]["trace"]), 3)
                     self.assertFalse(any(name == "MDLM" or name.startswith("MDLM.") for name in sys.modules))
             self.assertEqual(float(adapter.model.layer.weight.detach()), 0)
+            if source_change:
+                self.assertNotEqual(hashes.pop(source), file_digest(source))
             self.assertEqual(hashes, {p: file_digest(p) for p in hashes})
 
     def test_native_checkpoint_errors_restore_baseline(self):
@@ -392,21 +414,43 @@ class RunnerTests(unittest.TestCase):
             path = Path(temporary)
             backend = LLaDABackend({"model_path": temporary, "target_layers": [0], "torch_dtype": "float32"}, "cpu")
             for weights, error in (({"other": torch.ones(1, 1)}, KeyError),
-                                   ({"layer": torch.ones(2, 2)}, RuntimeError)):
+                                   ({"layer": torch.ones(2, 2)}, SystemExit),
+                                   ({"layer": torch.ones(1, 1, dtype=torch.float64)}, SystemExit),
+                                   ({"layer": torch.full((1, 1), float("nan"))}, SystemExit)):
                 save_file(weights, str(path / "target_weights.safetensors"))
                 with self.assertRaises(error):
                     backend.use_checkpoint(path)
                 self.assertEqual(float(adapter.model.layer.weight.detach()), 0)
-            # 原生 copy_ 按参数精度复制，不再额外拒绝可转换的源 dtype。
-            save_file({"layer": torch.ones(1, 1, dtype=torch.float64)}, str(path / "target_weights.safetensors"))
+            # 只有符合模型精度的完整权重才可进入评价。
+            save_file({"layer": torch.ones(1, 1)}, str(path / "target_weights.safetensors"))
             backend.use_checkpoint(path)
             self.assertEqual(adapter.model.layer.weight.dtype, torch.float32)
             self.assertEqual(float(adapter.model.layer.weight.detach()), 1)
             backend.close()
 
-        # 第二层复制失败时，第一层已经写入的值也必须恢复。
+    def test_broadcast_checkpoint_is_rejected(self):
+        adapter, model = Adapter(), AdapterModel()
+        name = "model.transformer.blocks.0.ff_out"
+        from util.nethook import restore_weights, snapshot_weights
+        adapter.load_model = Mock(return_value=model)
+        adapter.target_module_names = lambda: (name,)
+        adapter.snapshot_target_weights = lambda m: snapshot_weights(m, (name,))
+        adapter.restore_target_weights = lambda m, s: restore_weights(m, s, (name,))
+        with tempfile.TemporaryDirectory(prefix="mdlm_broadcast_") as temporary, \
+                patch("evaluation.inference.get_adapter", return_value=adapter):
+            path = Path(temporary)
+            backend = LLaDABackend({"model_path": temporary, "target_layers": [0], "torch_dtype": "float32"}, "cpu")
+            save_file({name: torch.ones(1, 2)}, str(path / "target_weights.safetensors"))
+            with self.assertRaises(SystemExit):
+                backend.use_checkpoint(path)
+            self.assertTrue(torch.equal(model.get_submodule(name).weight, torch.zeros(2, 2)))
+            backend.close()
+
+    def test_all_checkpoint_layers_are_validated_before_copy(self):
+        # 第二层不合法时，第一层也不能写入；模型保持原始权重。
         from util.nethook import restore_weights, snapshot_weights
 
+        adapter = Adapter()
         model = TinyModel()
         model.other = torch.nn.Linear(1, 1, bias=False)
         model.other.weight.data.zero_()
@@ -420,7 +464,7 @@ class RunnerTests(unittest.TestCase):
             backend = LLaDABackend({"model_path": temporary, "target_layers": [0], "torch_dtype": "float32"}, "cpu")
             save_file({"layer": torch.ones(1, 1), "other": torch.ones(2, 2)},
                       str(path / "target_weights.safetensors"))
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(SystemExit):
                 backend.use_checkpoint(path)
             self.assertEqual(float(model.layer.weight.detach()), 0)
             self.assertEqual(float(model.other.weight.detach()), 0)
@@ -452,8 +496,66 @@ class RunnerTests(unittest.TestCase):
         except ValueError:
             self.run_fixture("independent", ["accepted"], GOLD_PROTOCOL)
 
+    def test_nonfinite_greedy_is_failed_not_zero_score(self):
+        for protocol in (PROTOCOL, GOLD_PROTOCOL):
+            self.run_fixture("independent", ["accepted"], protocol, nonfinite=True)
+
+    def test_input_version_change_is_reported_failed(self):
+        self.run_fixture("independent", ["accepted"], GOLD_PROTOCOL, source_change=True)
+
+    def test_preflight_failures_are_recorded_without_model_loading(self):
+        for failure in ("failed_report", "empty_group", "bad_steps", "duplicate_id"):
+            with tempfile.TemporaryDirectory(prefix="mdlm_preflight_") as temporary:
+                root = Path(temporary)
+                cases = [{"case_id": "s", "prompts": {"edit": [{"probe_id": "e", "prompt": "Q", "answer": "ABC"}]}}]
+                if failure == "duplicate_id":
+                    cases *= 2
+                write_json(root / "cases.json", cases)
+                report = {"editor": "mdlm", "status": "failed" if failure == "failed_report" else "complete",
+                          "mode": "independent", "case_count": 1, "fact_count": 1,
+                          "rounds": [{"round_id": 0, "case_id": "s", "fact_ids": ["s"],
+                                      "decision": "rejected", "final_model_dir": None}],
+                          "source_dataset": str(root / "cases.json"), "original_model": str(root / "base")}
+                write_json(root / "run_report.json", report)
+                config = {"device": "cpu", "output_root": str(root / "out"),
+                          "target_layers": [0], "torch_dtype": "float32"}
+                if failure == "empty_group":
+                    config["groups"] = ["persona"]
+                if failure == "bad_steps":
+                    config["generation"] = {"steps": 0}
+                write_json(root / "eval.json", config)
+                with patch("evaluation.inference.get_adapter") as loader:
+                    with self.assertRaises(SystemExit):
+                        run_evaluation(root / "eval.json", run_dir=root, eval_id="failed")
+                loader.assert_not_called()
+                summary = read_json(root / "out/failed/summary.json")
+                self.assertEqual(summary["status"], "failed")
+                self.assertTrue(summary["failure"])
+                self.assertEqual(summary["completed_tasks"], 0)
+                self.assertIsNone(summary["coverage"])
+                if failure == "failed_report":
+                    process = subprocess.run([sys.executable, "-B", str(ROOT / "evaluate.py"),
+                        "--config", str(root / "eval.json"), "--run-dir", str(root), "--eval-id", "cli_failed"],
+                        capture_output=True, text=True)
+                    self.assertNotEqual(process.returncode, 0)
+                    cli_summary = read_json(root / "out/cli_failed/summary.json")
+                    self.assertEqual(cli_summary["status"], "failed")
+
 
 class ReaderTests(unittest.TestCase):
+    def test_reader_semantic_errors_stop(self):
+        with self.assertRaises(SystemExit):
+            FEVERReader(options={"rephrase_policy": "single_fixd"})
+        with self.assertRaises(SystemExit):
+            ZSREReader(options={"target_filed": "alt"})
+        with tempfile.TemporaryDirectory(prefix="mdlm_duplicate_") as temporary:
+            path = Path(temporary) / "data.json"
+            row = {"case_id": 1, "subject": "Alice", "src": "Alice?", "ans": "A",
+                   "rephrase": "Alice again?", "loc": "Bob", "loc_ans": "B"}
+            write_json(path, [row, row])
+            with self.assertRaisesRegex(SystemExit, "重复案例"):
+                list(ZSREReader().iter_cases(path))
+
     def test_json_jsonl_bom_limits_and_text_preservation(self):
         rows = [{"case_id": 1, "text": " 中文🙂 "}, {"case_id": 2, "text": "é"}]
         with tempfile.TemporaryDirectory(prefix="mdlm_reader_") as temporary:
@@ -486,7 +588,7 @@ class ReaderTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 list(iter_records(path))
             for limit in (-1, "one"):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(SystemExit):
                     list(iter_records(path, limit=limit))
             path.write_text('{"id": 1}\n{"id": 2}\n', encoding="utf-8")
             opened, original_open = [], Path.open
