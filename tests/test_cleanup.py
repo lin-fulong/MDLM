@@ -119,6 +119,20 @@ class AlgorithmRegressionTests(unittest.TestCase):
             self.assertGreaterEqual(float(rows[0]["elapsed_seconds"]), 0)
             self.assertFalse((output / "result/resource_report.partial.csv").exists())
 
+    def test_edit_resource_cuda_reset_starts_after_device_initialization(self):
+        with tempfile.TemporaryDirectory(prefix="mdlm_resource_cuda_") as temporary:
+            calls = []
+            with patch.object(torch.cuda, "is_available", return_value=True), \
+                    patch.object(torch.cuda, "device_count", return_value=1), \
+                    patch.object(torch.cuda, "current_device", side_effect=lambda: calls.append("init")), \
+                    patch.object(torch.cuda, "reset_peak_memory_stats",
+                                 side_effect=lambda device: calls.append("reset")):
+                monitor = EditResourceUsage(Path(temporary), use_cuda=True)
+                self.assertEqual(calls, [])
+                monitor.start_gpu()
+                self.assertEqual(calls, ["init", "reset"])
+                self.assertEqual(monitor.devices, (0,))
+
     def test_no_explicit_exception_statements(self):
         paths = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.py"],
                                         cwd=ROOT).decode("utf-8").splitlines()

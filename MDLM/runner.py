@@ -147,6 +147,7 @@ def _run_dataset(choices, output, report, *, sequential=None, dataset_override=N
                   source_dataset=str(dataset), original_model=str(model_path),
                   dataset_reading=dataset_bundle.metadata, selected_case_ids=case_ids)
     with execution_context(execution):
+        resource_monitor.start_gpu()
         adapter = get_adapter(model_path=model_path, target_layers=layers)
         # 公式（6）（10）：算法提供 λ/ρ，具体模块名由模型适配器确定。
         names = adapter.target_module_names()

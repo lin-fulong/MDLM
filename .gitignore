@@ -30,9 +30,10 @@ tests/*
 !tests/test_evaluation.py
 !tests/test_cleanup.py
 
-# Experiment runs and generated intermediate data
+# 实验运行、评价及资源记录结果（仅保留在本地）
 runs/*
 evaluations/*
+result/
 
 # Logs and temporary files
 *.log
