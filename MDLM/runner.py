@@ -21,6 +21,7 @@ from model.registry import get_adapter
 from util.gpu_runtime import execution_context
 from util.experiment_log import ExperimentLog
 from util.io import choose_run_id, project_path, read_config, read_json, write_json
+from util.resource_usage import EditResourceUsage
 
 
 def select_cases(cases, case_ids):
@@ -52,6 +53,9 @@ def run_dataset(config_file: Path, **options) -> dict:
     run_id = choose_run_id(choices.get("run_id"), options.pop("run_id_override", None))
     output = project_path(choices.get("output_root", "runs")) / run_id
     output.mkdir(parents=True, exist_ok=False)
+    execution = choices.get("execution", {})
+    device = options.get("device_override") or execution.get("device", choices.get("device_map", "auto"))
+    monitor = EditResourceUsage(output, use_cuda=str(device).startswith("cuda") or device == "auto")
     report = {"editor": "mdlm", "status": "running", "run_id": run_id,
               "rounds": [], "current_case_id": None}
     mode = choices.get("mode", "independent") if options.get("sequential") is None else (
@@ -67,17 +71,19 @@ def run_dataset(config_file: Path, **options) -> dict:
                     "cases": options.get("max_cases_override") or choices.get("max_cases") or "all"})
     with log.capture():
         try:
-            return _run_dataset(choices, output, report, **options)
+            return _run_dataset(choices, output, report, resource_monitor=monitor, **options)
         finally:
             if report["status"] != "complete":
                 report.update(status="failed", failure=str(sys.exc_info()[1]))
+            report.update(monitor.finish(report["status"]))
             report["log_file"] = str(log.path)
             log.finish(report)
             write_json(output / "run_report.json", report)
 
 
 def _run_dataset(choices, output, report, *, sequential=None, dataset_override=None,
-                model_override=None, device_override=None, case_ids=None, max_cases_override=None) -> dict:
+                model_override=None, device_override=None, case_ids=None, max_cases_override=None,
+                resource_monitor=None) -> dict:
     """独立模式每案例从 theta_0 开始；连续模式接续上一案例的接受结果。
 
     每案例执行一次固定监督、残差优化与写回验收，不执行同一事实集的可选刷新。
@@ -166,6 +172,7 @@ def _run_dataset(choices, output, report, *, sequential=None, dataset_override=N
                 groups.items(), total=len(groups), desc="Editing", unit="case",
                 disable=not sys.stderr.isatty())):
             report["current_case_id"] = case_id
+            resource_monitor.start_case(case_id)
             # 文档 3.1（未编号）：theta_b 为当前模型；快照用于本轮恢复。
             baseline = adapter.snapshot_target_weights(model)
             round_complete = False
@@ -196,6 +203,7 @@ def _run_dataset(choices, output, report, *, sequential=None, dataset_override=N
             # 独立模式保存结果后恢复 theta_0；连续模式保留本轮接受模型，再处理下一案例。
             if not sequential:
                 adapter.restore_target_weights(model, baseline)
+            resource_monitor.finish_case()
         # 文档 11.2（未编号）：theta_final=theta_acc；只保存最终权重和运行摘要。
         final_dir = save_final_model(model, adapter, output / "final_model", model_path=model_path,
                                      torch_dtype=dtype, device_map=device) if sequential else None

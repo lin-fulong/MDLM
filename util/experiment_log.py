@@ -55,6 +55,12 @@ def _summary_lines(kind, result):
     if kind == "edit":
         lines.extend(f"{key}: {result[key]}" for key in
                      ("case_count", "fact_count", "accepted_count", "rejected_count") if key in result)
+        if result.get("resource_csv_file"):
+            lines.append(f"resource_csv_file: {result['resource_csv_file']}")
+            lines.append(f"elapsed_seconds: {result['elapsed_seconds']}")
+            lines.append(f"total_samples: {result['total_samples']}")
+            if result.get("peak_vram_gib") is not None:
+                lines.append(f"peak_vram_gib: {result['peak_vram_gib']}")
         for row in result.get("rounds", []):
             lines.append("round: " + json.dumps({key: row.get(key) for key in
                 ("round_id", "case_id", "fact_ids", "decision", "selected_alpha", "selected_step", "final_model_dir")},

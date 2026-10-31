@@ -1,6 +1,7 @@
 """清理异常语句后的算法回归：微型模型、已提交基线和失败恢复。"""
 
 import ast
+import csv
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 import importlib
@@ -22,6 +23,7 @@ from model.base import KeepModelInput, ModelAdapter
 from util.nethook import register_output_hooks
 from util.io import read_json, write_json
 from util.experiment_log import ExperimentLog
+from util.resource_usage import EditResourceUsage
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,6 +100,24 @@ class AlgorithmRegressionTests(unittest.TestCase):
             self.assertIn("[uncaught_exception]", failure_content)
             self.assertIn("ValueError", failure_content)
             self.assertIn("status: failed", failure_content)
+
+    def test_edit_resource_csv_cpu_and_failure(self):
+        with tempfile.TemporaryDirectory(prefix="mdlm_resource_") as temporary:
+            output = Path(temporary) / "runs" / "edit"
+            monitor = EditResourceUsage(output, use_cuda=False)
+            monitor.start_case("source_1")
+            monitor.finish_case()
+            self.assertTrue((output / "result/resource_report.partial.csv").is_file())
+            monitor.start_case("source_2")
+            result = monitor.finish("failed")
+            with Path(result["resource_csv_file"]).open(encoding="utf-8-sig", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual([row["item"] for row in rows], ["total", "source_1", "source_2"])
+            self.assertEqual([row["status"] for row in rows], ["failed", "complete", "failed"])
+            self.assertEqual(rows[0]["total_samples"], "2")
+            self.assertEqual(rows[0]["peak_vram_gib"], "")
+            self.assertGreaterEqual(float(rows[0]["elapsed_seconds"]), 0)
+            self.assertFalse((output / "result/resource_report.partial.csv").exists())
 
     def test_no_explicit_exception_statements(self):
         paths = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.py"],
@@ -245,6 +265,11 @@ class AlgorithmRegressionTests(unittest.TestCase):
                     main.main(["--config", str(config), "--run-id", "edit"])
                 report = read_json(root / "runs/edit/run_report.json")
                 self.assertEqual(report["status"], "complete")
+                with Path(report["resource_csv_file"]).open(encoding="utf-8-sig", newline="") as stream:
+                    resource_rows = list(csv.DictReader(stream))
+                self.assertEqual([row["item"] for row in resource_rows], ["total", "f0", "f1"])
+                self.assertEqual(resource_rows[0]["total_samples"], "2")
+                self.assertEqual(resource_rows[0]["status"], "complete")
                 self.assertEqual(report["case_count"], 2)
                 self.assertEqual(report["accepted_count"], 2)
                 self.assertEqual(read_json(root / "runs/edit/run_report.json"), report)

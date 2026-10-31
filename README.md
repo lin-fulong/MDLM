@@ -42,6 +42,8 @@ python -u main.py --config configs/main.json --mode independent --run-id "$RUN_I
 
 编辑报告保存在 `runs/<run_id>/run_report.json`。独立模式只为通过验收的案例保存 `case_<序号>/model.json` 与 `target_weights.safetensors`；连续模式在结束时保存 `final_model/`。报告中的 `accepted` 表示通过编辑器的内部验收门槛，最终答案表现需另行评价。
 
+编辑运行的用时与峰值显存保存在同次实验的 `runs/<run_id>/result/resource_report.csv`，路径也写入 `run_report.json` 的 `resource_csv_file`。CSV 首行记录总体用时、实际开始编辑的源案例轮次数及整次运行的峰值显存，后续每行记录一个源案例的编辑用时。同一源案例的多条事实联合编辑时计为一个样本；CPU 运行的显存列为空。峰值显存采用本进程 PyTorch 分配器保留显存的最高值。
+
 每次运行（包括失败）会自动写入 `logs/mdlm/<模型>/<数据集>/` 下的独立 `.log` 文件。终端的标准输出、标准错误、警告和进度条会在正常显示的同时写入日志，未捕获异常会额外保存完整 traceback，结束后再追加逐案例编辑决策或各题组评价摘要。编辑日志文件名包含模式、目标层、优化步数、ridge、rho、种子、案例上限和运行 ID；评价日志包含协议、生成步数、温度、种子和评价 ID。实际路径记录在 `run_report.json` 或 `summary.json` 的 `log_file` 字段中。
 
 ## 评价
